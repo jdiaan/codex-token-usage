@@ -219,6 +219,7 @@ CREATE TABLE IF NOT EXISTS quota_activation_job_accounts (
 );
 CREATE INDEX IF NOT EXISTS idx_quota_activation_accounts_job_status ON quota_activation_job_accounts(job_id, status);
 CREATE INDEX IF NOT EXISTS idx_quota_activation_accounts_auth ON quota_activation_job_accounts(auth_index, auth_id, auth_file);
+CREATE INDEX IF NOT EXISTS idx_quota_activation_accounts_account ON quota_activation_job_accounts(account_key);
 CREATE TABLE IF NOT EXISTS quota_activation_cycles (
   account_key TEXT NOT NULL,
   cycle_key TEXT NOT NULL,

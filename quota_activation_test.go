@@ -44,6 +44,39 @@ func freshActivationQuota() *quotaActivationQuota {
 	}
 }
 
+func TestQuotaActivationHistoryLookupUsesAccountIndex(t *testing.T) {
+	s := newTestStore(t)
+	db, _, err := s.open(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, err := db.Query(`
+EXPLAIN QUERY PLAN
+SELECT before_quota_json,after_quota_json
+FROM quota_activation_job_accounts
+WHERE account_key=? AND (before_quota_json<>'' OR after_quota_json<>'')`, "account")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var plan strings.Builder
+	for rows.Next() {
+		var id, parent, unused int
+		var detail string
+		if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
+			t.Fatal(err)
+		}
+		plan.WriteString(detail)
+		plan.WriteByte('\n')
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if got := plan.String(); !strings.Contains(got, "idx_quota_activation_accounts_account") {
+		t.Fatalf("quota activation history query plan does not use account index:\n%s", got)
+	}
+}
+
 func healthyActivationAccount() configuredAccount {
 	return configuredAccount{AuthIndex: "auth-index-1", AuthID: "auth-id-1", AuthFile: "seat-1.json", Provider: "codex"}
 }
