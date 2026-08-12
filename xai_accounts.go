@@ -3,8 +3,11 @@ package main
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -34,6 +37,30 @@ type xaiAccountStateRow struct {
 	LastStatusCode   int    `json:"last_status_code"`
 	AuthFile         string `json:"auth_file,omitempty"`
 	AuthFileMTime    int64  `json:"auth_file_mtime,omitempty"`
+}
+
+type xaiStateResolveRequest struct {
+	Items []xaiStateResolveRequestItem `json:"items"`
+}
+
+type xaiStateResolveRequestItem struct {
+	StateKey      string `json:"state_key"`
+	ExpectedState string `json:"expected_state,omitempty"`
+	Action        string `json:"action"`
+}
+
+type xaiStateResolveResponse struct {
+	Items           []xaiStateResolveResult `json:"items"`
+	Resolved        int                     `json:"resolved"`
+	AlreadyResolved int                     `json:"already_resolved"`
+	ReplacementKept int                     `json:"replacement_kept"`
+	Failed          int                     `json:"failed"`
+}
+
+type xaiStateResolveResult struct {
+	StateKey string `json:"state_key"`
+	Status   string `json:"status"`
+	Message  string `json:"message,omitempty"`
 }
 
 func isXAISchedulerRequest(req schedulerPickRequest) bool {
@@ -288,11 +315,15 @@ func applyXAIStates(accounts []accountRow, states []xaiAccountStateRow) {
 
 func clearReplacedOrMissingXAIStates(ctx context.Context, db *sql.DB) error {
 	configured := readConfiguredXAIAccounts()
-	if globalXAIAuthSource.authoritative() {
-		states, err := queryActiveXAIStates(ctx, db, time.Now().Unix())
-		if err != nil {
-			return err
-		}
+	return clearReplacedOrMissingXAIStatesForConfigured(ctx, db, configured, globalXAIAuthSource.authoritative(), time.Now().Unix())
+}
+
+func clearReplacedOrMissingXAIStatesForConfigured(ctx context.Context, db *sql.DB, configured []configuredAccount, authoritative bool, now int64) error {
+	states, err := queryActiveXAIStates(ctx, db, now)
+	if err != nil {
+		return err
+	}
+	if authoritative {
 		visible := filterMissingXAIStateRows(states, configured, true)
 		keep := make(map[string]struct{}, len(visible))
 		for _, state := range visible {
@@ -307,16 +338,298 @@ func clearReplacedOrMissingXAIStates(ctx context.Context, db *sql.DB) error {
 			}
 		}
 	}
-	for _, cfg := range configured {
-		if cfg.AuthFileMTime <= 0 {
+	for _, state := range states {
+		if state.AuthFile == "" {
 			continue
 		}
-		_, err := db.ExecContext(ctx, `UPDATE xai_account_states SET active=0 WHERE active=1 AND auth_file=? AND ?>observed_at`, cfg.AuthFile, cfg.AuthFileMTime)
-		if err != nil {
-			return err
+		baseline := state.AuthFileMTime
+		if baseline <= 0 {
+			baseline = state.ObservedAt
+		}
+		for _, cfg := range configured {
+			if !aliasesOverlap(normalizeAccountAliases(cfg.AuthFile), normalizeAccountAliases(state.AuthFile)) || cfg.AuthFileMTime <= baseline {
+				continue
+			}
+			if _, err := db.ExecContext(ctx, `UPDATE xai_account_states SET active=0 WHERE active=1 AND state_key=?`, state.StateKey); err != nil {
+				return err
+			}
+			break
 		}
 	}
 	return nil
+}
+
+func resolveXAIStates(ctx context.Context, db *sql.DB, req xaiStateResolveRequest) (xaiStateResolveResponse, error) {
+	globalXAIAuthSource.invalidate()
+	inventory, inventoryErr := globalXAIAuthSource.hostAccounts()
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return xaiStateResolveResponse{}, err
+	}
+	response := xaiStateResolveResponse{Items: make([]xaiStateResolveResult, 0, len(req.Items))}
+	changed := false
+	for _, item := range req.Items {
+		result, itemChanged, err := resolveXAIStateItem(ctx, tx, item, inventory, inventoryErr)
+		if err != nil {
+			_ = tx.Rollback()
+			return xaiStateResolveResponse{}, err
+		}
+		changed = changed || itemChanged
+		response.add(result)
+	}
+	if err := tx.Commit(); err != nil {
+		return xaiStateResolveResponse{}, err
+	}
+	if changed {
+		globalSchedulerState.invalidate()
+		if err := globalSchedulerState.refresh(ctx, db); err != nil {
+			globalSchedulerState.invalidate()
+		}
+	}
+	return response, nil
+}
+
+func (r *xaiStateResolveResponse) add(result xaiStateResolveResult) {
+	r.Items = append(r.Items, result)
+	switch result.Status {
+	case "resolved":
+		r.Resolved++
+	case "already_resolved":
+		r.AlreadyResolved++
+	case "replacement_kept":
+		r.ReplacementKept++
+	default:
+		r.Failed++
+	}
+}
+
+func resolveXAIStateItem(ctx context.Context, tx *sql.Tx, item xaiStateResolveRequestItem, inventory []configuredAccount, inventoryErr error) (xaiStateResolveResult, bool, error) {
+	stateKey := normalizeAccountAlias(item.StateKey)
+	result := xaiStateResolveResult{StateKey: stateKey}
+	if stateKey == "" {
+		result.Status = "failed"
+		result.Message = "state_key is required"
+		return result, false, nil
+	}
+	state, err := queryActiveXAIStateByKey(ctx, tx, stateKey)
+	if errors.Is(err, sql.ErrNoRows) {
+		result.Status = "already_resolved"
+		return result, false, nil
+	}
+	if err != nil {
+		return xaiStateResolveResult{}, false, err
+	}
+	if expected := strings.TrimSpace(item.ExpectedState); expected != "" && !strings.EqualFold(expected, state.State) {
+		result.Status = "failed"
+		result.Message = "xAI state changed while the management action was running"
+		return result, false, nil
+	}
+	action := strings.ToLower(strings.TrimSpace(item.Action))
+	switch action {
+	case "file_deleted", "file_absent":
+		present, currentMTime, stateErr := xaiStateAuthFileOnDisk(state)
+		if stateErr != nil {
+			result.Status = "failed"
+			result.Message = stateErr.Error()
+			return result, false, nil
+		}
+		if present {
+			baseline := normalizeUnixSeconds(state.AuthFileMTime)
+			if baseline <= 0 {
+				baseline = state.ObservedAt
+			}
+			replacedByIdentity := inventoryErr == nil && xaiStateFileIdentityChanged(state, inventory)
+			if !replacedByIdentity && (currentMTime <= 0 || currentMTime <= baseline) {
+				result.Status = "still_present"
+				result.Message = "the original xAI auth file is still present"
+				return result, false, nil
+			}
+			changed, err := deactivateXAIState(ctx, tx, state.StateKey)
+			if err != nil {
+				return xaiStateResolveResult{}, false, err
+			}
+			if !changed {
+				result.Status = "already_resolved"
+				return result, false, nil
+			}
+			result.Status = "replacement_kept"
+			result.Message = "a newer xAI auth file was preserved and the old state was cleared"
+			return result, true, nil
+		}
+		changed, err := deactivateXAIState(ctx, tx, state.StateKey)
+		if err != nil {
+			return xaiStateResolveResult{}, false, err
+		}
+		if !changed {
+			result.Status = "already_resolved"
+			return result, false, nil
+		}
+		result.Status = "resolved"
+		return result, true, nil
+	case "runtime_disabled":
+		if inventoryErr != nil {
+			result.Status = "failed"
+			result.Message = "fresh xAI host auth inventory is unavailable: " + sanitizeTriggerError(inventoryErr)
+			return result, false, nil
+		}
+		current, present, ambiguous := currentXAIStateInventoryEntry(state, inventory)
+		if ambiguous {
+			result.Status = "failed"
+			result.Message = "xAI runtime credential identity is ambiguous"
+			return result, false, nil
+		}
+		if present {
+			if normalizeAuthSourceKind(current.AuthSourceKind) != authSourceKindRuntimeOnly {
+				result.Status = "failed"
+				result.Message = "xAI state is not backed by a runtime-only credential"
+				return result, false, nil
+			}
+			if !runtimeAuthEntryDisabled(current) {
+				result.Status = "still_present"
+				result.Message = "xAI runtime credential is still enabled"
+				return result, false, nil
+			}
+		}
+		changed, err := deactivateXAIState(ctx, tx, state.StateKey)
+		if err != nil {
+			return xaiStateResolveResult{}, false, err
+		}
+		if !changed {
+			result.Status = "already_resolved"
+			return result, false, nil
+		}
+		result.Status = "resolved"
+		if !present {
+			result.Message = "runtime credential was already absent"
+		}
+		return result, true, nil
+	case "manual_release":
+		if state.State != xaiStateFreeExhausted && state.State != xaiStateRateLimited {
+			result.Status = "failed"
+			result.Message = "only xAI 429 states can be released without changing credentials"
+			return result, false, nil
+		}
+		changed, err := deactivateXAIState(ctx, tx, state.StateKey)
+		if err != nil {
+			return xaiStateResolveResult{}, false, err
+		}
+		if !changed {
+			result.Status = "already_resolved"
+			return result, false, nil
+		}
+		result.Status = "resolved"
+		return result, true, nil
+	default:
+		result.Status = "failed"
+		result.Message = "unsupported action"
+		return result, false, nil
+	}
+}
+
+func queryActiveXAIStateByKey(ctx context.Context, tx *sql.Tx, stateKey string) (xaiAccountStateRow, error) {
+	var row xaiAccountStateRow
+	var active int
+	err := tx.QueryRowContext(ctx, `
+SELECT state_key, auth_id, auth_index, source, provider, state, reason, observed_at, reset_at,
+active, last_status_code, auth_file, auth_file_mtime
+FROM xai_account_states
+WHERE active=1 AND state_key=?`, stateKey).Scan(
+		&row.StateKey, &row.AuthID, &row.AuthIndex, &row.Source, &row.Provider, &row.State,
+		&row.Reason, &row.ObservedAt, &row.ResetAt, &active, &row.LastStatusCode,
+		&row.AuthFile, &row.AuthFileMTime,
+	)
+	row.Active = active != 0
+	return row, err
+}
+
+func deactivateXAIState(ctx context.Context, tx *sql.Tx, stateKey string) (bool, error) {
+	result, err := tx.ExecContext(ctx, `UPDATE xai_account_states SET active=0 WHERE active=1 AND state_key=?`, stateKey)
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	return affected > 0, err
+}
+
+func xaiStateAuthFileOnDisk(state xaiAccountStateRow) (bool, int64, error) {
+	authFile := fileNameIfJSON(state.AuthFile)
+	if authFile == "" {
+		return false, 0, fmt.Errorf("xAI state has no safe physical JSON file name")
+	}
+	authDir := configuredAuthDir()
+	if authDir == "" {
+		return false, 0, fmt.Errorf("CPA auth directory is unavailable")
+	}
+	info, err := os.Stat(filepath.Join(authDir, authFile))
+	if err == nil {
+		return true, info.ModTime().Unix(), nil
+	}
+	if os.IsNotExist(err) {
+		return false, 0, nil
+	}
+	return false, 0, err
+}
+
+func currentXAIStateInventoryEntry(state xaiAccountStateRow, inventory []configuredAccount) (configuredAccount, bool, bool) {
+	matches := make([]configuredAccount, 0, 2)
+	for _, candidate := range inventory {
+		if !strings.EqualFold(strings.TrimSpace(candidate.Provider), "xai") {
+			continue
+		}
+		matched := false
+		for _, pair := range [][2]string{
+			{state.AuthID, candidate.AuthID},
+			{state.AuthIndex, candidate.AuthIndex},
+			{state.AuthFile, candidate.AuthFile},
+			{state.StateKey, candidate.AuthIndex},
+			{state.StateKey, candidate.AuthFile},
+		} {
+			left, right := normalizeAccountAlias(pair[0]), normalizeAccountAlias(pair[1])
+			if left != "" && left == right {
+				matched = true
+				break
+			}
+		}
+		if matched {
+			matches = append(matches, candidate)
+		}
+	}
+	if len(matches) == 1 {
+		return matches[0], true, false
+	}
+	return configuredAccount{}, false, len(matches) > 1
+}
+
+func xaiStateFileIdentityChanged(state xaiAccountStateRow, inventory []configuredAccount) bool {
+	authFile := normalizeAccountAlias(fileNameIfJSON(state.AuthFile))
+	if authFile == "" {
+		return false
+	}
+	matches := make([]configuredAccount, 0, 2)
+	for _, candidate := range inventory {
+		if !strings.EqualFold(strings.TrimSpace(candidate.Provider), "xai") || normalizeAccountAlias(fileNameIfJSON(candidate.AuthFile)) != authFile {
+			continue
+		}
+		matches = append(matches, candidate)
+	}
+	if len(matches) != 1 {
+		return false
+	}
+	current := matches[0]
+	for _, pair := range [][2]string{{state.AuthID, current.AuthID}, {state.AuthIndex, current.AuthIndex}} {
+		left, right := stableXAIAuthIdentity(pair[0]), stableXAIAuthIdentity(pair[1])
+		if left != "" && right != "" && left != right {
+			return true
+		}
+	}
+	return false
+}
+
+func stableXAIAuthIdentity(value string) string {
+	if fileNameIfJSON(value) != "" {
+		return ""
+	}
+	return normalizeAccountAlias(value)
 }
 
 func candidateMatchesXAIState(candidate schedulerAuthCandidate, states []xaiAccountStateRow) bool {

@@ -87,7 +87,7 @@ const (
 )
 
 var (
-	pluginVersion    = "0.1.42"
+	pluginVersion    = "0.1.43"
 	pluginAuthor     = "Codex Token Usage Contributors"
 	pluginRepository = "https://github.com/zhumengling/codex-token-usage"
 )
@@ -464,6 +464,7 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 				{Method: "GET", Path: "/plugins/codex-token-usage/export", Description: "Token usage CSV/JSON export."},
 				{Method: "POST", Path: "/plugins/codex-token-usage/autobans/release", Description: "Manually release active Codex 429 auto-bans."},
 				{Method: "POST", Path: "/plugins/codex-token-usage/invalid-auths/resolve", Description: "Resolve deleted, replaced, or runtime-disabled Codex 401 records."},
+				{Method: "POST", Path: "/plugins/codex-token-usage/xai-states/resolve", Description: "Resolve deleted, replaced, runtime-disabled, or manually released xAI account states."},
 				{Method: "POST", Path: "/plugins/codex-token-usage/auth-import/preview", Description: "Preview non-standard Codex auth JSON imports."},
 				{Method: "POST", Path: "/plugins/codex-token-usage/auth-import/commit", Description: "Convert and save non-standard Codex auth JSON imports."},
 				{Method: "POST", Path: "/plugins/codex-token-usage/quota-activation/preview", Description: "Preview one-shot Codex quota-window activation eligibility."},
@@ -637,6 +638,27 @@ func handleManagement(req managementRequest) managementResponse {
 			return jsonResponse(http.StatusBadRequest, map[string]any{"error": "bad_request", "message": "items must contain between 1 and 2000 entries"})
 		}
 		result, err := globalStore.resolveInvalidAuths(context.Background(), body)
+		if err != nil {
+			return jsonResponse(http.StatusInternalServerError, map[string]any{"error": "resolve_failed", "message": err.Error()})
+		}
+		return jsonResponse(http.StatusOK, result)
+	}
+	if req.Path == "/v0/management/plugins/"+pluginID+"/xai-states/resolve" {
+		if !strings.EqualFold(req.Method, http.MethodPost) {
+			return jsonResponse(http.StatusMethodNotAllowed, map[string]any{"error": "method_not_allowed"})
+		}
+		var body xaiStateResolveRequest
+		if err := json.Unmarshal(req.Body, &body); err != nil {
+			return jsonResponse(http.StatusBadRequest, map[string]any{"error": "bad_request", "message": err.Error()})
+		}
+		if len(body.Items) == 0 || len(body.Items) > 2000 {
+			return jsonResponse(http.StatusBadRequest, map[string]any{"error": "bad_request", "message": "items must contain between 1 and 2000 entries"})
+		}
+		db, _, err := globalStore.open(context.Background())
+		if err != nil {
+			return jsonResponse(http.StatusInternalServerError, map[string]any{"error": "resolve_failed", "message": err.Error()})
+		}
+		result, err := resolveXAIStates(context.Background(), db, body)
 		if err != nil {
 			return jsonResponse(http.StatusInternalServerError, map[string]any{"error": "resolve_failed", "message": err.Error()})
 		}

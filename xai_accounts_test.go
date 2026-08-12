@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -152,6 +153,168 @@ func TestXAITransientStateClearsAfterSuccess(t *testing.T) {
 	if len(states) != 0 {
 		t.Fatalf("states=%#v, want transient state cleared after success", states)
 	}
+}
+
+func TestXAI401MaintenanceUsesRecordedFileRevision(t *testing.T) {
+	db := newProtectionTestDB(t)
+	const observedAt int64 = 1_700_000_000
+	if _, err := db.Exec(`
+INSERT INTO xai_account_states (
+  state_key, auth_id, auth_index, provider, state, reason, observed_at, reset_at,
+  active, last_status_code, auth_file, auth_file_mtime
+) VALUES ('xai.json','stable-xai','xai.json','xai','unauthorized','401 invalid',?,0,1,401,'xai.json',?)`, observedAt, observedAt+10); err != nil {
+		t.Fatal(err)
+	}
+	configured := []configuredAccount{{
+		AuthID: "stable-xai", AuthIndex: "xai.json", AuthFile: "xai.json", Provider: "xai", AuthFileMTime: observedAt + 10,
+	}}
+	if err := clearReplacedOrMissingXAIStatesForConfigured(context.Background(), db, configured, true, observedAt+20); err != nil {
+		t.Fatal(err)
+	}
+	var active int
+	if err := db.QueryRow(`SELECT active FROM xai_account_states WHERE state_key='xai.json'`).Scan(&active); err != nil {
+		t.Fatal(err)
+	}
+	if active != 1 {
+		t.Fatal("xAI 401 state was cleared by the same file revision")
+	}
+
+	configured[0].AuthFileMTime++
+	if err := clearReplacedOrMissingXAIStatesForConfigured(context.Background(), db, configured, true, observedAt+21); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT active FROM xai_account_states WHERE state_key='xai.json'`).Scan(&active); err != nil {
+		t.Fatal(err)
+	}
+	if active != 0 {
+		t.Fatal("xAI 401 state remained active after a newer auth file revision")
+	}
+}
+
+func TestXAI401MaintenanceClearsMissingPhysicalFile(t *testing.T) {
+	db := newProtectionTestDB(t)
+	const observedAt int64 = 1_700_000_000
+	if _, err := db.Exec(`
+INSERT INTO xai_account_states (
+  state_key, auth_id, auth_index, provider, state, reason, observed_at, reset_at,
+  active, last_status_code, auth_file, auth_file_mtime
+) VALUES ('missing.json','stable-xai','missing.json','xai','unauthorized','401 invalid',?,0,1,401,'missing.json',?)`, observedAt, observedAt); err != nil {
+		t.Fatal(err)
+	}
+	if err := clearReplacedOrMissingXAIStatesForConfigured(context.Background(), db, nil, true, observedAt+1); err != nil {
+		t.Fatal(err)
+	}
+	var active int
+	if err := db.QueryRow(`SELECT active FROM xai_account_states WHERE state_key='missing.json'`).Scan(&active); err != nil {
+		t.Fatal(err)
+	}
+	if active != 0 {
+		t.Fatal("missing xAI auth file did not clear its stale 401 state")
+	}
+}
+
+func insertXAIResolveState(t *testing.T, db interface {
+	Exec(query string, args ...any) (sql.Result, error)
+}, stateKey, state, authFile string, observedAt, authFileMTime int64) {
+	t.Helper()
+	if _, err := db.Exec(`
+INSERT INTO xai_account_states (
+  state_key, auth_id, auth_index, source, provider, state, reason, observed_at, reset_at,
+  active, last_status_code, auth_file, auth_file_mtime
+) VALUES (?, ?, ?, ?, 'xai', ?, 'test', ?, 0, 1, ?, ?, ?)`,
+		stateKey, stateKey, stateKey, stateKey, state, observedAt,
+		map[string]int{xaiStateUnauthorized: 401, xaiStateForbidden: 403, xaiStateRateLimited: 429, xaiStateFreeExhausted: 429}[state],
+		authFile, authFileMTime); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestResolveXAIStateFileLifecycle(t *testing.T) {
+	const observedAt int64 = 1_700_000_000
+	t.Run("absent file resolves", func(t *testing.T) {
+		db := newProtectionTestDB(t)
+		t.Setenv("CPA_AUTH_DIR", t.TempDir())
+		insertXAIResolveState(t, db, "missing.json", xaiStateUnauthorized, "missing.json", observedAt, observedAt)
+		tx, err := db.Begin()
+		if err != nil { t.Fatal(err) }
+		result, changed, err := resolveXAIStateItem(context.Background(), tx, xaiStateResolveRequestItem{StateKey: "missing.json", ExpectedState: xaiStateUnauthorized, Action: "file_absent"}, nil, nil)
+		if err != nil { t.Fatal(err) }
+		if err := tx.Commit(); err != nil { t.Fatal(err) }
+		if !changed || result.Status != "resolved" { t.Fatalf("changed=%v result=%+v", changed, result) }
+	})
+
+	t.Run("same file revision is preserved", func(t *testing.T) {
+		db := newProtectionTestDB(t)
+		dir := t.TempDir(); t.Setenv("CPA_AUTH_DIR", dir)
+		path := filepath.Join(dir, "same.json")
+		if err := os.WriteFile(path, []byte(`{"type":"xai"}`), 0600); err != nil { t.Fatal(err) }
+		stamp := time.Unix(observedAt, 0)
+		if err := os.Chtimes(path, stamp, stamp); err != nil { t.Fatal(err) }
+		insertXAIResolveState(t, db, "same.json", xaiStateUnauthorized, "same.json", observedAt, observedAt)
+		tx, err := db.Begin(); if err != nil { t.Fatal(err) }
+		result, changed, err := resolveXAIStateItem(context.Background(), tx, xaiStateResolveRequestItem{StateKey: "same.json", Action: "file_deleted"}, nil, nil)
+		if err != nil { t.Fatal(err) }
+		_ = tx.Rollback()
+		if changed || result.Status != "still_present" { t.Fatalf("changed=%v result=%+v", changed, result) }
+	})
+
+	t.Run("newer replacement is kept", func(t *testing.T) {
+		db := newProtectionTestDB(t)
+		dir := t.TempDir(); t.Setenv("CPA_AUTH_DIR", dir)
+		path := filepath.Join(dir, "replaced.json")
+		if err := os.WriteFile(path, []byte(`{"type":"xai","new":true}`), 0600); err != nil { t.Fatal(err) }
+		stamp := time.Unix(observedAt+60, 0)
+		if err := os.Chtimes(path, stamp, stamp); err != nil { t.Fatal(err) }
+		insertXAIResolveState(t, db, "replaced.json", xaiStateUnauthorized, "replaced.json", observedAt, observedAt)
+		tx, err := db.Begin(); if err != nil { t.Fatal(err) }
+		result, changed, err := resolveXAIStateItem(context.Background(), tx, xaiStateResolveRequestItem{StateKey: "replaced.json", Action: "file_deleted"}, nil, nil)
+		if err != nil { t.Fatal(err) }
+		if err := tx.Commit(); err != nil { t.Fatal(err) }
+		if !changed || result.Status != "replacement_kept" { t.Fatalf("changed=%v result=%+v", changed, result) }
+		if _, err := os.Stat(path); err != nil { t.Fatalf("replacement file was removed: %v", err) }
+	})
+
+	t.Run("stable identity replacement is kept within same second", func(t *testing.T) {
+		db := newProtectionTestDB(t)
+		dir := t.TempDir(); t.Setenv("CPA_AUTH_DIR", dir)
+		path := filepath.Join(dir, "identity.json")
+		if err := os.WriteFile(path, []byte(`{"type":"xai","replacement":true}`), 0600); err != nil { t.Fatal(err) }
+		stamp := time.Unix(observedAt, 0)
+		if err := os.Chtimes(path, stamp, stamp); err != nil { t.Fatal(err) }
+		insertXAIResolveState(t, db, "identity.json", xaiStateUnauthorized, "identity.json", observedAt, observedAt)
+		if _, err := db.Exec(`UPDATE xai_account_states SET auth_id='old-id',auth_index='old-index' WHERE state_key='identity.json'`); err != nil { t.Fatal(err) }
+		inventory := []configuredAccount{{AuthID: "new-id", AuthIndex: "new-index", AuthFile: "identity.json", Provider: "xai", AuthSourceKind: authSourceKindFile}}
+		tx, err := db.Begin(); if err != nil { t.Fatal(err) }
+		result, changed, err := resolveXAIStateItem(context.Background(), tx, xaiStateResolveRequestItem{StateKey: "identity.json", Action: "file_deleted"}, inventory, nil)
+		if err != nil { t.Fatal(err) }
+		if err := tx.Commit(); err != nil { t.Fatal(err) }
+		if !changed || result.Status != "replacement_kept" { t.Fatalf("changed=%v result=%+v", changed, result) }
+		if _, err := os.Stat(path); err != nil { t.Fatalf("identity replacement file was removed: %v", err) }
+	})
+}
+
+func TestResolveXAIRuntimeAnd429States(t *testing.T) {
+	const observedAt int64 = 1_700_000_000
+	t.Run("disabled runtime credential resolves", func(t *testing.T) {
+		db := newProtectionTestDB(t)
+		insertXAIResolveState(t, db, "runtime-id", xaiStateForbidden, "", observedAt, 0)
+		inventory := []configuredAccount{{AuthID: "runtime-id", Provider: "xai", AuthSourceKind: authSourceKindRuntimeOnly, Disabled: true}}
+		tx, err := db.Begin(); if err != nil { t.Fatal(err) }
+		result, changed, err := resolveXAIStateItem(context.Background(), tx, xaiStateResolveRequestItem{StateKey: "runtime-id", ExpectedState: xaiStateForbidden, Action: "runtime_disabled"}, inventory, nil)
+		if err != nil { t.Fatal(err) }
+		if err := tx.Commit(); err != nil { t.Fatal(err) }
+		if !changed || result.Status != "resolved" { t.Fatalf("changed=%v result=%+v", changed, result) }
+	})
+
+	t.Run("429 can be manually released", func(t *testing.T) {
+		db := newProtectionTestDB(t)
+		insertXAIResolveState(t, db, "limited.json", xaiStateRateLimited, "limited.json", observedAt, observedAt)
+		tx, err := db.Begin(); if err != nil { t.Fatal(err) }
+		result, changed, err := resolveXAIStateItem(context.Background(), tx, xaiStateResolveRequestItem{StateKey: "limited.json", ExpectedState: xaiStateRateLimited, Action: "manual_release"}, nil, nil)
+		if err != nil { t.Fatal(err) }
+		if err := tx.Commit(); err != nil { t.Fatal(err) }
+		if !changed || result.Status != "resolved" { t.Fatalf("changed=%v result=%+v", changed, result) }
+	})
 }
 
 func TestXAISchedulerFiltersUnavailableCandidate(t *testing.T) {

@@ -61,6 +61,43 @@ func TestXAITierDisplayUsesMetadataFields(t *testing.T) {
 	}
 }
 
+func TestXAIStateCardsOpenManagementViews(t *testing.T) {
+	for _, marker := range []string{
+		"function xaiManagementRows(states)",
+		"xai?'xAI 401 失效账号':'管理 401 失效账号'",
+		"xai?'xAI 权限拒绝账号':'管理 402 工作区失效账号'",
+		"xai?'xAI 429 状态':'管理 429 禁用账号'",
+		"function manageXAIStateRows(rows,prefix,confirmText,runningText)",
+		"function releaseXAIStateRows(rows,confirmText,runningText)",
+		"managementXAIStateResolveApi",
+		"processInvalidAuthFileRows(fileRows,key,'xai')",
+		"function xaiAuthFiles(files)",
+		"data-workspace-delete=",
+		"data-autoban-release-one=",
+		"document.getElementById('invalid-auth-card').disabled=false",
+		"document.getElementById('workspace-deactivated-card').disabled=false",
+		"document.getElementById('autoban-release-card').disabled=false",
+	} {
+		if !strings.Contains(dashboardScripts, marker) {
+			t.Fatalf("xAI state management marker %q not found", marker)
+		}
+	}
+	for _, forbidden := range []string{"这里只读显示", "if(xai)invalidAuthSelected=new Set()", "if(xai)workspaceDeactivatedSelected=new Set()", "if(xai)autobanReleaseSelected=new Set()"} {
+		if strings.Contains(dashboardScripts, forbidden) {
+			t.Fatalf("xAI state management is still read-only via %q", forbidden)
+		}
+	}
+	for _, forbidden := range []string{
+		"function openInvalidAuthModal(){\n  if(isXAIPool())return;",
+		"function openWorkspaceDeactivatedModal(){\n  if(isXAIPool())return;",
+		"function openAutobanReleaseModal(){\n  if(isXAIPool())return;",
+	} {
+		if strings.Contains(dashboardScripts, forbidden) {
+			t.Fatalf("xAI state card is still blocked by %q", forbidden)
+		}
+	}
+}
+
 func TestCodexPoolDataCarriesForbiddenAuths(t *testing.T) {
 	if !strings.Contains(dashboardScripts, "forbidden_auths:data.forbidden_auths||[]") {
 		t.Fatal("Codex pool data must carry standalone 403 auth records into insights")
@@ -79,13 +116,57 @@ func TestInvalidAuthManagementUsesUnfilteredCountsAndPartialDeleteResults(t *tes
 	for _, marker := range []string{
 		"const allInvalidRows=",
 		"const allWorkspaceRows=",
-		"parseAuthFileDeleteResult(res,body,names)",
-		"HTTP 207 部分删除失败",
+		"deleteAuthFilesInBatches(names,key)",
+		"parseInvalidAuthFileDeleteOutcomes(res,body,batch)",
 		"/\\.json$/i.test(name)?name:''",
 	} {
 		if !strings.Contains(dashboardScripts, marker) {
 			t.Fatalf("401 management marker %q not found", marker)
 		}
+	}
+}
+
+func TestAuthFileDeleteUsesBoundedQueryBatches(t *testing.T) {
+	for _, marker := range []string{
+		"const authFileDeleteBatchSize=25",
+		"name='+encodeURIComponent(name)",
+		"fetch(authFileDeleteURL(batch),{method:'DELETE'",
+		"offset+=authFileDeleteBatchSize",
+		"res.status===207",
+		"res.status===404",
+		"失败原因：",
+	} {
+		if !strings.Contains(dashboardScripts, marker) {
+			t.Fatalf("auth file query delete marker %q not found", marker)
+		}
+	}
+	if strings.Contains(dashboardScripts, "body:JSON.stringify({names:names})") {
+		t.Fatal("auth-file DELETE must not send the legacy JSON names body")
+	}
+	parseStart := strings.Index(dashboardScripts, "function parseInvalidAuthFileDeleteOutcomes")
+	parseEnd := strings.Index(dashboardScripts[parseStart:], "\nconst authFileDeleteBatchSize")
+	if parseStart < 0 || parseEnd < 0 {
+		t.Fatal("auth-file delete outcome parser not found")
+	}
+	parser := dashboardScripts[parseStart : parseStart+parseEnd]
+	partialAt := strings.Index(parser, "res&&res.status===207")
+	okAt := strings.Index(parser, "res&&res.ok")
+	if partialAt < 0 || okAt < 0 || partialAt > okAt {
+		t.Fatal("HTTP 207 must be parsed before the generic 2xx success branch")
+	}
+}
+
+func TestInvalidAuthReplacementCheckUsesSecondPrecision(t *testing.T) {
+	for _, marker := range []string{
+		"const recordedSeconds=Math.floor(recorded>1e12?recorded/1000:recorded)",
+		"Math.floor(liveMs/1000)>recordedSeconds",
+	} {
+		if !strings.Contains(dashboardScripts, marker) {
+			t.Fatalf("replacement timestamp precision marker %q not found", marker)
+		}
+	}
+	if strings.Contains(dashboardScripts, "liveMs>0&&liveMs>recordedMs") {
+		t.Fatal("sub-second host timestamps must not mark an unchanged auth file as replaced")
 	}
 }
 

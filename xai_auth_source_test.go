@@ -148,3 +148,28 @@ func TestParseHostAuthUpdatedAtUnixMilliseconds(t *testing.T) {
 		t.Fatalf("parseHostAuthUpdatedAt()=%d, want %d", got, want)
 	}
 }
+
+func TestXAIHostAuthSourcePrefersPhysicalModTime(t *testing.T) {
+	oldCaller := hostAuthCaller
+	oldSource := globalXAIAuthSource
+	t.Cleanup(func() { hostAuthCaller = oldCaller; globalXAIAuthSource = oldSource })
+	t.Setenv("CPA_AUTH_DIR", t.TempDir())
+	globalXAIAuthSource = &xaiAuthSourceManager{}
+	hostAuthCaller = func(method string, _ any) (json.RawMessage, error) {
+		if method != "host.auth.list" {
+			return nil, os.ErrNotExist
+		}
+		return json.Marshal(hostAuthListResponse{Files: []hostAuthFileEntry{{
+			ID: "xai-id", Name: "mtime-preference.json", Provider: "xai", Status: "active",
+			ModTime: "2026-08-01T01:02:03Z", UpdatedAt: "2026-08-04T04:05:06Z",
+		}}})
+	}
+	accounts, err := globalXAIAuthSource.hostAccounts()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := time.Date(2026, 8, 1, 1, 2, 3, 0, time.UTC).Unix()
+	if len(accounts) != 1 || accounts[0].AuthFileMTime != want {
+		t.Fatalf("accounts=%+v, want physical modtime %d", accounts, want)
+	}
+}

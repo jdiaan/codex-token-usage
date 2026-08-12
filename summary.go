@@ -1199,7 +1199,8 @@ type accountRow struct {
 	Email                           string   `json:"email,omitempty"`
 	Name                            string   `json:"name,omitempty"`
 	AuthFile                        string   `json:"auth_file,omitempty"`
-	AuthFileMTime                   int64    `json:"-"`
+	AuthFileMTime                   int64    `json:"auth_file_mtime,omitempty"`
+	AuthSourceKind                 string   `json:"auth_source_kind,omitempty"`
 	ChatGPTAccountID                string   `json:"chatgpt_account_id,omitempty"`
 	Configured                      bool     `json:"configured"`
 	Priority                        int      `json:"priority,omitempty"`
@@ -2290,6 +2291,7 @@ func mergeConfiguredAccounts(accounts []accountRow, configured []configuredAccou
 			Name:               cfg.Name,
 			AuthFile:           cfg.AuthFile,
 			AuthFileMTime:      cfg.AuthFileMTime,
+			AuthSourceKind:     cfg.AuthSourceKind,
 			ChatGPTAccountID:   cfg.ChatGPTAccountID,
 			Configured:         true,
 			Priority:           cfg.Priority,
@@ -2394,6 +2396,7 @@ func enrichConfiguredAccount(row *accountRow, cfg configuredAccount) {
 	row.Email = firstNonEmptyString(row.Email, cfg.Email)
 	row.Name = firstNonEmptyString(row.Name, cfg.Name)
 	row.AuthFile = firstNonEmptyString(row.AuthFile, cfg.AuthFile)
+	row.AuthSourceKind = firstNonEmptyString(row.AuthSourceKind, cfg.AuthSourceKind)
 	if row.AuthFileMTime == 0 {
 		row.AuthFileMTime = cfg.AuthFileMTime
 	}

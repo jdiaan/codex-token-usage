@@ -5,6 +5,7 @@ const managementApi='/v0/management/plugins/__PLUGIN_ID__/summary';
 const managementExportApi='/v0/management/plugins/__PLUGIN_ID__/export';
 const managementAutobanReleaseApi='/v0/management/plugins/__PLUGIN_ID__/autobans/release';
 const managementInvalidAuthResolveApi='/v0/management/plugins/__PLUGIN_ID__/invalid-auths/resolve';
+const managementXAIStateResolveApi='/v0/management/plugins/__PLUGIN_ID__/xai-states/resolve';
 const managementAuthImportPreviewApi='/v0/management/plugins/__PLUGIN_ID__/auth-import/preview';
 const managementAuthImportCommitApi='/v0/management/plugins/__PLUGIN_ID__/auth-import/commit';
 const managementQuotaActivationPreviewApi='/v0/management/plugins/__PLUGIN_ID__/quota-activation/preview';
@@ -476,28 +477,25 @@ function clearAuthImport(){
 }
 function closeBatchProxyModal(){batchProxyModal.hidden=true}
 function openInvalidAuthModal(){
-  if(isXAIPool())return;
-  invalidAuthPage=1;
-  invalidAuthOAuthUrlEl.hidden=true;
-  renderInvalidAuthModal();
-  invalidAuthModal.hidden=false;
-  setTimeout(()=>document.getElementById('invalid-auth-delete-selected').focus(),0);
+	invalidAuthPage=1;
+	invalidAuthOAuthUrlEl.hidden=true;
+	renderInvalidAuthModal();
+	invalidAuthModal.hidden=false;
+	setTimeout(()=>document.getElementById(isXAIPool()?'invalid-auth-refresh':'invalid-auth-delete-selected').focus(),0);
 }
 function closeInvalidAuthModal(){invalidAuthModal.hidden=true}
 function openWorkspaceDeactivatedModal(){
-  if(isXAIPool())return;
-  workspaceDeactivatedPage=1;
-  renderWorkspaceDeactivatedModal();
-  workspaceDeactivatedModal.hidden=false;
-  setTimeout(()=>document.getElementById('workspace-deactivated-delete-selected').focus(),0);
+	workspaceDeactivatedPage=1;
+	renderWorkspaceDeactivatedModal();
+	workspaceDeactivatedModal.hidden=false;
+	setTimeout(()=>document.getElementById(isXAIPool()?'workspace-deactivated-refresh':'workspace-deactivated-delete-selected').focus(),0);
 }
 function closeWorkspaceDeactivatedModal(){workspaceDeactivatedModal.hidden=true}
 function openAutobanReleaseModal(){
-  if(isXAIPool())return;
-  autobanReleasePage=1;
-  renderAutobanReleaseModal();
-  autobanReleaseModal.hidden=false;
-  setTimeout(()=>document.getElementById('autoban-release-selected').focus(),0);
+	autobanReleasePage=1;
+	renderAutobanReleaseModal();
+	autobanReleaseModal.hidden=false;
+	setTimeout(()=>document.getElementById(isXAIPool()?'autoban-release-refresh':'autoban-release-selected').focus(),0);
 }
 function closeAutobanReleaseModal(){autobanReleaseModal.hidden=true}
 function batchProxyKey(){
@@ -631,7 +629,22 @@ function setAuthDeleteBusy(prefix,busy){
   setAuthDeleteButtonsDisabled(prefix,busy);
   document.querySelectorAll('#'+prefix+'-list button,#'+prefix+'-list input').forEach(el=>{el.disabled=busy});
 }
+function xaiManagementRows(states){
+  const data=poolData();
+  const accounts=data.accounts||[];
+  const wanted=new Set(states||[]);
+  return (data.autobans||[]).filter(row=>wanted.has(String(row&&row.state||''))).map(row=>{
+    const account=accounts.find(candidate=>sameAuthIdentity(row,candidate));
+    const merged=Object.assign({},account||{},row||{});
+    merged.auth_id=firstText(row&&row.auth_id,account&&account.auth_id);
+    merged.auth_index=firstText(row&&row.auth_index,account&&account.auth_index);
+    merged.source=firstText(row&&row.source,account&&account.source);
+    merged.auth_file=firstText(row&&row.auth_file,account&&account.auth_file);
+    return merged;
+  });
+}
 function invalidAuthRows(){
+  if(isXAIPool())return xaiManagementRows(['unauthorized']).map(row=>Object.assign({},row,{invalid_auth:true,invalid_auth_at:firstText(row.observed_at_text,row.banned_at_text),invalid_auth_reason:firstText(row.reason,'401 unauthorized'),last_status_code:Number(row.last_status_code||401),auth_source_kind:invalidAuthSourceKind(row)}));
   const accounts=(lastData&&lastData.accounts)||[];
   const invalids=(lastData&&lastData.invalid_auths)||[];
   const out=[];
@@ -663,6 +676,7 @@ function invalidAuthRows(){
   return out;
 }
 function workspaceDeactivatedRows(){
+  if(isXAIPool())return xaiManagementRows(['forbidden']).map(row=>Object.assign({},row,{workspace_deactivated:true,workspace_deactivated_at:firstText(row.observed_at_text,row.banned_at_text),workspace_deactivated_reason:firstText(row.reason,'xAI access denied')}));
   const accounts=(lastData&&lastData.accounts)||[];
   const rows=(lastData&&lastData.workspace_deactivated_auths)||[];
   const out=[];
@@ -687,6 +701,7 @@ function workspaceDeactivatedRows(){
   return out;
 }
 function autobanReleaseRows(){
+  if(isXAIPool())return sortAutobansByRemaining(xaiManagementRows(['free_usage_exhausted','rate_limited']));
   return sortAutobansByRemaining(((lastData&&lastData.autobans)||[]).filter(is429Autoban));
 }
 function sameAuthIdentity(a,b){
@@ -751,7 +766,7 @@ function is401InvalidAuthRow(r){
   const reason=String(firstText(r&&r.reason,r&&r.invalid_auth_reason)).toLowerCase();
   return !(/(^|\D)403(\D|$)/.test(reason)||reason.includes('forbidden')||reason.includes('permission denied'));
 }
-function invalidAuthKey(r){return firstText(r&&r.auth_id,r&&r.auth_file,r&&r.auth_index,r&&r.source,'invalid-auth')}
+function invalidAuthKey(r){return firstText(r&&r.state_key,r&&r.auth_id,r&&r.auth_file,r&&r.auth_index,r&&r.source,'invalid-auth')}
 function invalidAuthFileName(r){const name=fileNameOnly(firstText(r.auth_file));return /\.json$/i.test(name)?name:''}
 function invalidAuthResolveID(r){return firstText(r&&r.auth_id)}
 function invalidAuthActionKind(r){
@@ -764,6 +779,14 @@ function invalidAuthActionable(r){return invalidAuthActionKind(r)!=='legacy'}
 function workspaceDeactivatedKey(r){return firstText(r.auth_file,r.auth_id,r.auth_index,r.source,r.email,r.name,'workspace-deactivated')}
 function workspaceDeactivatedFileName(r){const name=fileNameOnly(firstText(r.auth_file));return /\.json$/i.test(name)?name:''}
 function autobanReleaseKey(r){return firstText(r.auth_file,r.auth_id,r.auth_index,r.source,'autoban-release')}
+function xaiStateKey(r){return firstText(r&&r.state_key)}
+function xaiStateActionKind(r){
+  const sourceKind=invalidAuthSourceKind(r);
+  if(sourceKind==='file'&&xaiStateKey(r)&&invalidAuthFileName(r))return 'file';
+  if(sourceKind==='runtime_only'&&xaiStateKey(r)&&firstText(r.auth_id,r.auth_index))return 'runtime_only';
+  return 'legacy';
+}
+function xaiStateActionable(r){return xaiStateActionKind(r)!=='legacy'}
 function fileNameOnly(value){value=String(value||'').trim();if(!value)return '';return value.split(/[\\/]/).pop()}
 function fileNameSet(names){return new Set((names||[]).map(fileNameOnly).filter(Boolean))}
 function removeAuthFilesFromCurrentData(names){
@@ -784,12 +807,26 @@ function removeAuthFilesFromCurrentData(names){
       return next;
     });
   }
+  if(Array.isArray(lastData.xai_states))lastData.xai_states=lastData.xai_states.filter(keep);
+  if(Array.isArray(lastData.xai_accounts))lastData.xai_accounts=lastData.xai_accounts.filter(keep);
 }
 function removeAutobansFromCurrentData(rows){
   if(!lastData||!Array.isArray(lastData.autobans))return;
   const removed=new Set((rows||[]).map(autobanReleaseKey).filter(Boolean));
   if(!removed.size)return;
   lastData.autobans=lastData.autobans.filter(r=>!removed.has(autobanReleaseKey(r)));
+}
+function removeXAIStatesFromCurrentData(rows){
+  if(!lastData)return;
+  const removed=new Set((rows||[]).map(xaiStateKey).filter(Boolean));
+  if(!removed.size)return;
+  if(Array.isArray(lastData.xai_states))lastData.xai_states=lastData.xai_states.filter(r=>!removed.has(xaiStateKey(r)));
+  if(Array.isArray(lastData.xai_accounts))lastData.xai_accounts=lastData.xai_accounts.map(row=>{
+    const next=Object.assign({},row);
+    const matched=(rows||[]).some(state=>sameAuthIdentity(state,row));
+    if(matched){next.xai_state='';next.xai_state_reason='';next.xai_last_status_code=0}
+    return next;
+  });
 }
 function normalizeEmail(value){return String(value||'').trim().toLowerCase()}
 function pagedInvalidAuthRows(){
@@ -802,13 +839,20 @@ function pagedInvalidAuthRows(){
 function renderInvalidAuthModal(){
   const page=pagedInvalidAuthRows();
   const rows=page.rows;
+  const xai=isXAIPool();
+  document.getElementById('invalid-auth-title').textContent=xai?'xAI 401 失效账号':'管理 401 失效账号';
+  document.getElementById('invalid-auth-delete-all').hidden=false;
+  document.getElementById('invalid-auth-select-page').hidden=false;
+  document.getElementById('invalid-auth-delete-selected').hidden=false;
+  document.getElementById('invalid-auth-delete-all').textContent=xai?'处理所有 xAI 401':'处理所有 401 账号';
+  document.getElementById('invalid-auth-delete-selected').textContent=xai?'处理选中 xAI 401':'处理选中';
   const actionable=rows.filter(invalidAuthActionable);
   const rowKeys=new Set(actionable.map(invalidAuthKey));
   invalidAuthSelected=new Set([...invalidAuthSelected].filter(k=>rowKeys.has(k)));
   const fileCount=rows.filter(r=>invalidAuthActionKind(r)==='file').length;
   const runtimeCount=rows.filter(r=>invalidAuthActionKind(r)==='runtime_only').length;
   const legacyCount=rows.length-fileCount-runtimeCount;
-  document.getElementById('invalid-auth-summary').textContent='已选 '+invalidAuthSelected.size+' · 文件 '+fileCount+' · 运行时 '+runtimeCount+' · 历史 '+legacyCount+' · 共 '+rows.length+' 个';
+  document.getElementById('invalid-auth-summary').textContent='已选 '+invalidAuthSelected.size+' · 文件 '+fileCount+' · 运行时 '+runtimeCount+' · 不可处理 '+legacyCount+' · 共 '+rows.length+' 个';
   document.getElementById('invalid-auth-page-label').textContent=invalidAuthPage+' / '+page.pages;
   document.getElementById('invalid-auth-prev').disabled=invalidAuthPage<=1;
   document.getElementById('invalid-auth-next').disabled=invalidAuthPage>=page.pages;
@@ -832,7 +876,7 @@ function renderInvalidAuthModal(){
     const loginBusy=invalidAuthOAuthKey===key?' busy':'';
     const rowClass=sourceKind==='runtime_only'?' is-runtime':(actionKind==='legacy'?' is-legacy':'');
     const sourceText=sourceKind==='file'?('物理 JSON · '+(file||'文件名缺失')):sourceKind==='runtime_only'?('运行时凭据 · '+firstText(r.auth_id,r.auth_index,'-')):'历史记录 · 无可操作认证源';
-    const firstAction=actionKind==='file'?'<button class="ghost" type="button" data-invalid-login="'+esc(key)+'"'+(invalidAuthDeleting?' disabled':'')+'>OAuth 登录</button>':'<button class="ghost" type="button" disabled>'+esc(sourceKind==='runtime_only'?'仅本次运行':'历史记录')+'</button>';
+    const firstAction=actionKind==='file'&&!xai?'<button class="ghost" type="button" data-invalid-login="'+esc(key)+'"'+(invalidAuthDeleting?' disabled':'')+'>OAuth 登录</button>':'<button class="ghost" type="button" disabled>'+esc(sourceKind==='runtime_only'?'仅本次运行':xai?'xAI 认证':'历史记录')+'</button>';
     const finalAction=actionKind==='file'?'<button class="ghost danger-ghost" type="button" data-invalid-delete="'+esc(key)+'"'+(invalidAuthDeleting?' disabled':'')+'>删除</button>':actionKind==='runtime_only'?'<button class="ghost danger-ghost" type="button" data-invalid-runtime-disable="'+esc(key)+'"'+(invalidAuthDeleting?' disabled':'')+'>本次运行禁用</button>':'<button class="ghost" type="button" disabled>不可删除</button>';
     return '<div class="invalid-auth-row'+rowClass+loginBusy+'" data-key="'+esc(key)+'" data-action-kind="'+esc(actionKind)+'">'+
       '<label class="invalid-auth-check"><input type="checkbox" data-invalid-check="'+esc(key)+'"'+checked+((invalidAuthDeleting||!actionableRow)?' disabled':'')+'></label>'+
@@ -842,6 +886,7 @@ function renderInvalidAuthModal(){
       firstAction+finalAction+
     '</div>';
   }).join('');
+	if(xai)setInvalidAuthStatus(rows.length+' 个 xAI 401 状态；可删除物理 JSON，运行时凭据仅本次运行禁用。',rows.length?'warn':'ok');
 	applyLocale();
 }
 function pagedWorkspaceDeactivatedRows(){
@@ -854,19 +899,42 @@ function pagedWorkspaceDeactivatedRows(){
 function renderWorkspaceDeactivatedModal(){
   const page=pagedWorkspaceDeactivatedRows();
   const rows=page.rows;
-  const rowKeys=new Set(rows.map(workspaceDeactivatedKey));
+  const xai=isXAIPool();
+  document.getElementById('workspace-deactivated-title').textContent=xai?'xAI 权限拒绝账号':'管理 402 工作区失效账号';
+  document.getElementById('workspace-deactivated-delete-all').hidden=false;
+  document.getElementById('workspace-deactivated-select-page').hidden=false;
+  document.getElementById('workspace-deactivated-delete-selected').hidden=false;
+  document.getElementById('workspace-deactivated-delete-all').textContent=xai?'处理所有权限拒绝':'删除所有 402 账号';
+  document.getElementById('workspace-deactivated-delete-selected').textContent=xai?'处理选中账号':'删除选中';
+  const actionable=xai?rows.filter(xaiStateActionable):rows.filter(r=>!!workspaceDeactivatedFileName(r));
+  const rowKeys=new Set(actionable.map(workspaceDeactivatedKey));
   workspaceDeactivatedSelected=new Set([...workspaceDeactivatedSelected].filter(k=>rowKeys.has(k)));
-  document.getElementById('workspace-deactivated-summary').textContent='已选 '+workspaceDeactivatedSelected.size+' / 共 '+rows.length+' 个';
+  document.getElementById('workspace-deactivated-summary').textContent='已选 '+workspaceDeactivatedSelected.size+' · 可处理 '+actionable.length+' · 共 '+rows.length+' 个';
   document.getElementById('workspace-deactivated-page-label').textContent=workspaceDeactivatedPage+' / '+page.pages;
   document.getElementById('workspace-deactivated-prev').disabled=workspaceDeactivatedPage<=1;
   document.getElementById('workspace-deactivated-next').disabled=workspaceDeactivatedPage>=page.pages;
-  document.getElementById('workspace-deactivated-select-page').disabled=rows.length===0;
-  document.getElementById('workspace-deactivated-delete-all').disabled=rows.length===0;
+  document.getElementById('workspace-deactivated-select-page').disabled=actionable.length===0;
+  document.getElementById('workspace-deactivated-delete-all').disabled=actionable.length===0;
   document.getElementById('workspace-deactivated-delete-selected').disabled=workspaceDeactivatedSelected.size===0;
   if(workspaceDeactivatedDeleting)setAuthDeleteButtonsDisabled('workspace-deactivated',true);
   if(!rows.length){
-    document.getElementById('workspace-deactivated-list').innerHTML='<div class="invalid-auth-empty">'+tr('当前没有 402 工作区失效账号。')+'</div>';
-    setWorkspaceDeactivatedStatus('当前没有 402 工作区失效账号。','ok');
+    document.getElementById('workspace-deactivated-list').innerHTML='<div class="invalid-auth-empty">'+tr(xai?'当前没有 xAI 权限拒绝账号。':'当前没有 402 工作区失效账号。')+'</div>';
+    setWorkspaceDeactivatedStatus(xai?'当前没有 xAI 权限拒绝账号。':'当前没有 402 工作区失效账号。','ok');
+    return;
+  }
+  if(xai){
+    document.getElementById('workspace-deactivated-list').innerHTML=page.pageRows.map(r=>{
+      const key=workspaceDeactivatedKey(r); const actionKind=xaiStateActionKind(r); const actionableRow=xaiStateActionable(r); const checked=workspaceDeactivatedSelected.has(key)?' checked':'';
+      const sourceText=actionKind==='file'?('物理 JSON · '+invalidAuthFileName(r)):actionKind==='runtime_only'?('运行时凭据 · '+firstText(r.auth_id,r.auth_index,'-')):'无可操作认证源';
+      const actionText=actionKind==='file'?'删除':actionKind==='runtime_only'?'本次运行禁用':'不可处理';
+      return '<div class="invalid-auth-row workspace-deactivated-row'+(actionKind==='runtime_only'?' is-runtime':actionKind==='legacy'?' is-legacy':'')+'" data-key="'+esc(key)+'" data-action-kind="'+esc(actionKind)+'">'+
+      '<label class="invalid-auth-check"><input type="checkbox" data-workspace-check="'+esc(key)+'"'+checked+((workspaceDeactivatedDeleting||!actionableRow)?' disabled':'')+'></label>'+
+      '<div class="invalid-auth-main"><b title="'+esc(accountName(r))+'">'+esc(accountName(r))+'</b><span title="'+esc(sourceText)+'">'+esc(sourceText)+'</span></div>'+
+      '<div class="invalid-auth-meta"><span>HTTP '+fmt(r.last_status_code||403)+'</span><span>'+esc(firstText(r.workspace_deactivated_at,'-'))+'</span></div>'+
+      '<div class="invalid-auth-reason" title="'+esc(r.workspace_deactivated_reason||'xAI access denied')+'">'+esc(r.workspace_deactivated_reason||'xAI access denied')+'</div>'+
+      '<button class="ghost danger-ghost" type="button" data-workspace-delete="'+esc(key)+'"'+((workspaceDeactivatedDeleting||!actionableRow)?' disabled':'')+'>'+esc(actionText)+'</button></div>';
+    }).join('');
+    setWorkspaceDeactivatedStatus(rows.length+' 个 xAI 权限拒绝状态；可删除物理 JSON，运行时凭据仅本次运行禁用。','warn');
     return;
   }
   document.getElementById('workspace-deactivated-list').innerHTML=page.pageRows.map(r=>{
@@ -893,6 +961,13 @@ function pagedAutobanReleaseRows(){
 function renderAutobanReleaseModal(){
   const page=pagedAutobanReleaseRows();
   const rows=page.rows;
+  const xai=isXAIPool();
+  document.getElementById('autoban-release-title').textContent=xai?'xAI 429 状态':'管理 429 禁用账号';
+  document.getElementById('autoban-release-all').hidden=false;
+  document.getElementById('autoban-release-select-page').hidden=false;
+  document.getElementById('autoban-release-selected').hidden=false;
+  document.getElementById('autoban-release-all').textContent=xai?'解除所有 xAI 429':'解除所有 429';
+  document.getElementById('autoban-release-selected').textContent=xai?'解除选中状态':'解除选中';
   const rowKeys=new Set(rows.map(autobanReleaseKey));
   autobanReleaseSelected=new Set([...autobanReleaseSelected].filter(k=>rowKeys.has(k)));
   document.getElementById('autoban-release-summary').textContent='已选 '+autobanReleaseSelected.size+' / 共 '+rows.length+' 个';
@@ -906,6 +981,20 @@ function renderAutobanReleaseModal(){
   if(!rows.length){
     document.getElementById('autoban-release-list').innerHTML='<div class="invalid-auth-empty">'+tr('当前没有 429 禁用账号。')+'</div>';
     setAutobanReleaseStatus('当前没有 429 禁用账号。','ok');
+    return;
+  }
+  if(xai){
+    document.getElementById('autoban-release-list').innerHTML=page.pageRows.map(r=>{
+      const key=autobanReleaseKey(r); const title=[firstText(r.window,'-'),firstText(r.reason,'-'),firstText(r.reset_at_text,'-')].join(' · ');
+      const checked=autobanReleaseSelected.has(key)?' checked':'';
+      return '<div class="invalid-auth-row autoban-release-row" data-key="'+esc(key)+'">'+
+        '<label class="invalid-auth-check"><input type="checkbox" data-autoban-release-check="'+esc(key)+'"'+checked+(autobanReleaseBusy?' disabled':'')+'></label>'+
+        '<div class="invalid-auth-main"><b title="'+esc(accountName(r))+'">'+esc(accountName(r))+'</b><span>'+esc(firstText(r.auth_file,r.auth_index,r.auth_id,'-'))+'</span></div>'+
+        '<div class="invalid-auth-meta"><span>HTTP '+fmt(r.last_status_code||429)+'</span><span>'+esc(firstText(r.observed_at_text,r.banned_at_text,'-'))+'</span></div>'+
+        '<div class="invalid-auth-reason" title="'+esc(title)+'"><b>'+esc(xaiStateLabel(r.state))+'</b><span>'+esc(firstText(r.reset_at_text,'自动恢复'))+'</span></div>'+
+        '<button class="ghost danger-ghost" type="button" data-autoban-release-one="'+esc(key)+'"'+(autobanReleaseBusy?' disabled':'')+'>解除状态</button></div>';
+    }).join('');
+    setAutobanReleaseStatus(rows.length+' 个 xAI 429 状态；可手工解除，也会按恢复时间自动解除。','warn');
     return;
   }
   document.getElementById('autoban-release-list').innerHTML=page.pageRows.map(r=>{
@@ -954,7 +1043,7 @@ function handleWorkspaceDeactivatedListClick(e){
   const del=e.target.closest('[data-workspace-delete]');
   if(del){workspaceDeactivatedSelected=new Set([del.dataset.workspaceDelete]);deleteSelectedWorkspaceDeactivatedAuths();return}
   const row=e.target.closest('.workspace-deactivated-row[data-key]');
-  if(row){
+  if(row&&row.dataset.actionKind!=='legacy'){
     const key=row.dataset.key;
     if(workspaceDeactivatedSelected.has(key))workspaceDeactivatedSelected.delete(key);else workspaceDeactivatedSelected.add(key);
     renderWorkspaceDeactivatedModal();
@@ -983,7 +1072,7 @@ function selectedInvalidAuthRows(){
 }
 function selectedWorkspaceDeactivatedRows(){
   const selected=workspaceDeactivatedSelected;
-  return workspaceDeactivatedRows().filter(r=>selected.has(workspaceDeactivatedKey(r)));
+  return workspaceDeactivatedRows().filter(r=>(!isXAIPool()||xaiStateActionable(r))&&selected.has(workspaceDeactivatedKey(r)));
 }
 function selectedAutobanReleaseRows(){
   const selected=autobanReleaseSelected;
@@ -997,9 +1086,9 @@ function selectCurrentInvalidAuthPage(){
 }
 function selectCurrentWorkspaceDeactivatedPage(){
   const page=pagedWorkspaceDeactivatedRows();
-  page.pageRows.forEach(r=>workspaceDeactivatedSelected.add(workspaceDeactivatedKey(r)));
+  page.pageRows.filter(r=>!isXAIPool()||xaiStateActionable(r)).forEach(r=>workspaceDeactivatedSelected.add(workspaceDeactivatedKey(r)));
   renderWorkspaceDeactivatedModal();
-  setWorkspaceDeactivatedStatus('已全选当前页 402 账号。','ok');
+  setWorkspaceDeactivatedStatus(isXAIPool()?'已全选当前页 xAI 权限拒绝账号。':'已全选当前页 402 账号。','ok');
 }
 function selectCurrentAutobanReleasePage(){
   const page=pagedAutobanReleaseRows();
@@ -1008,26 +1097,134 @@ function selectCurrentAutobanReleasePage(){
   setAutobanReleaseStatus('已全选当前页 429 账号。','ok');
 }
 function deleteAllInvalidAuths(){
+  if(isXAIPool())return manageXAIStateRows(invalidAuthRows(),'invalid-auth','确认处理所有 xAI 401 账号？物理 JSON 会删除，运行时凭据只在本次运行禁用。','正在处理所有 xAI 401 账号...');
   deleteInvalidAuthRows(null,'确认处理所有 401 账号？文件型会删除 JSON，运行时凭据只在本次运行禁用。','正在处理所有 401 账号...',true);
 }
 function deleteAllWorkspaceDeactivatedAuths(){
+  if(isXAIPool())return manageXAIStateRows(workspaceDeactivatedRows(),'workspace-deactivated','确认处理所有 xAI 权限拒绝账号？物理 JSON 会删除，运行时凭据只在本次运行禁用。','正在处理 xAI 权限拒绝账号...');
   deleteWorkspaceDeactivatedRows(workspaceDeactivatedRows(),'确认删除所有 402 认证文件？','正在删除所有 402 认证文件...');
 }
 function releaseAllAutobans(){
+  if(isXAIPool())return releaseXAIStateRows(autobanReleaseRows(),'确认解除所有 xAI 429 状态？账号认证文件会保留。','正在解除所有 xAI 429 状态...');
   releaseAutobanRows(autobanReleaseRows(),'确认解除所有 429 禁用账号？','正在解除所有 429 禁用账号...','all429');
 }
 async function deleteSelectedInvalidAuths(){
+  if(isXAIPool())return manageXAIStateRows(selectedInvalidAuthRows(),'invalid-auth','确认处理选中的 xAI 401 账号？物理 JSON 会删除，运行时凭据只在本次运行禁用。','正在处理选中的 xAI 401 账号...');
   return deleteInvalidAuthRows(selectedInvalidAuthRows(),'确认处理选中的 401 账号？文件型会删除 JSON，运行时凭据只在本次运行禁用。','正在处理选中的 401 账号...');
 }
 async function disableSelectedRuntimeInvalidAuths(){
   const rows=selectedInvalidAuthRows().filter(r=>invalidAuthActionKind(r)==='runtime_only');
+  if(isXAIPool())return manageXAIStateRows(rows,'invalid-auth','确认将选中的 xAI 运行时凭据在本次运行中禁用？','正在禁用 xAI 运行时凭据...');
   return deleteInvalidAuthRows(rows,'确认将选中的运行时凭据在本次运行中禁用？重启或凭据来源重新连接后可能再次出现。','正在禁用运行时凭据...');
 }
 async function deleteSelectedWorkspaceDeactivatedAuths(){
+  if(isXAIPool())return manageXAIStateRows(selectedWorkspaceDeactivatedRows(),'workspace-deactivated','确认处理选中的 xAI 权限拒绝账号？','正在处理选中的 xAI 权限拒绝账号...');
   return deleteWorkspaceDeactivatedRows(selectedWorkspaceDeactivatedRows(),'确认删除选中的 402 认证文件？','正在删除选中的 402 认证文件...');
 }
 async function releaseSelectedAutobans(){
+  if(isXAIPool())return releaseXAIStateRows(selectedAutobanReleaseRows(),'确认解除选中的 xAI 429 状态？账号认证文件会保留。','正在解除选中的 xAI 429 状态...');
   return releaseAutobanRows(selectedAutobanReleaseRows(),'确认解除选中的 429 禁用账号？','正在解除选中的 429 禁用账号...','selected');
+}
+function xaiManagementContext(prefix){
+  if(prefix==='invalid-auth')return {rows:invalidAuthRows,status:invalidAuthStatusEl,setStatus:setInvalidAuthStatus,render:renderInvalidAuthModal,clear:()=>invalidAuthSelected.clear()};
+  return {rows:workspaceDeactivatedRows,status:workspaceDeactivatedStatusEl,setStatus:setWorkspaceDeactivatedStatus,render:renderWorkspaceDeactivatedModal,clear:()=>workspaceDeactivatedSelected.clear()};
+}
+async function manageXAIStateRows(rows,prefix,confirmText,runningText){
+  const key=managementKey();
+  const ctx=xaiManagementContext(prefix);
+  if(!key){showFallbackKeyInput();ctx.setStatus('请在页面顶部填写 CPA 管理密钥后重试。','warn');return}
+  const requested=new Set((rows||[]).map(xaiStateKey).filter(Boolean));
+  if(!requested.size){ctx.setStatus('没有可处理的 xAI 状态。','warn');return}
+  let finalStatus=''; let finalTone='';
+  setAuthDeleteBusy(prefix,true);
+  setAuthDeleteProgress(ctx.status,'正在刷新并核对 xAI 账号...','',8);
+  try{
+    const fresh=await load(true,true,{keepExisting:true,abortPrevious:true});
+    if(!fresh)throw new Error('刷新 xAI 账号失败，未执行任何处理。');
+    const current=ctx.rows();
+    const targeted=current.filter(r=>requested.has(xaiStateKey(r)));
+    const alreadyGone=[...requested].filter(k=>!current.some(r=>xaiStateKey(r)===k)).length;
+    const unprocessable=targeted.filter(r=>!xaiStateActionable(r)).length;
+    const frozen=Object.freeze(targeted.filter(xaiStateActionable).map(r=>Object.freeze(Object.assign({},r))));
+    if(!frozen.length){
+      ctx.clear();
+      const empty={deleted:0,absent:0,replacement:0,runtimeDisabled:0,alreadyResolved:alreadyGone,unprocessable:unprocessable,failed:0};
+      finalStatus=formatInvalidAuthResult(empty); finalTone=unprocessable?'warn':'ok'; return;
+    }
+    if(!confirm(tr(confirmText))){finalStatus='已取消处理，未修改 xAI 认证。';return}
+    setAuthDeleteProgress(ctx.status,runningText,'',22);
+    const fileRows=frozen.filter(r=>xaiStateActionKind(r)==='file');
+    const runtimeRows=frozen.filter(r=>xaiStateActionKind(r)==='runtime_only');
+    const outcomes=(await processInvalidAuthFileRows(fileRows,key,'xai')).concat(await processRuntimeInvalidAuthRows(runtimeRows,key));
+    const resolvable=outcomes.filter(r=>r.action&&r.outcome!=='failed');
+    setAuthDeleteProgress(ctx.status,'正在同步解除 xAI 状态...','',68);
+    const resolved=await resolveXAIStateOutcomes(resolvable,key);
+    const result=summarizeXAIStateResults(outcomes,resolved,alreadyGone);
+    result.unprocessable=unprocessable;
+    const deletedNames=outcomes.filter(o=>o.outcome==='deleted'||o.outcome==='absent').map(o=>invalidAuthFileName(o.row)).filter(Boolean);
+    removeAuthFilesFromCurrentData(deletedNames);
+    removeXAIStatesFromCurrentData(resolvable.map(o=>o.row));
+    ctx.clear();
+    setAuthDeleteProgress(ctx.status,'处理完成，正在刷新统计...','ok',86);
+    const refreshed=await load(true,true,{keepExisting:true,abortPrevious:true});
+    finalStatus=formatInvalidAuthResult(result)+(refreshed?'':' 统计刷新失败，请手动刷新。');
+    finalTone=result.failed||result.unprocessable||!refreshed?'warn':'ok';
+  }catch(e){finalStatus='处理失败：'+e.message;finalTone='bad'}
+  finally{
+    setAuthDeleteBusy(prefix,false);ctx.render();if(finalStatus)ctx.setStatus(finalStatus,finalTone);
+  }
+}
+async function resolveXAIStateOutcomes(outcomes,key){
+  if(!outcomes.length)return new Map();
+  const items=outcomes.map(item=>({state_key:xaiStateKey(item.row),expected_state:firstText(item.row.state),action:item.action}));
+  const res=await fetch(managementXAIStateResolveApi,{method:'POST',headers:{Authorization:'Bearer '+key,'Content-Type':'application/json',Accept:'application/json'},body:JSON.stringify({items:items})});
+  const body=await readResponseBody(res);
+  if(res.status===401)rejectManagementKey(key);
+  if(!res.ok)throw new Error('同步 xAI 状态失败：HTTP '+res.status+' '+body);
+  const parsed=parseJSONBody(body);
+  return new Map((parsed.items||[]).map(item=>[String(firstText(item&&item.state_key)).toLowerCase(),item]));
+}
+function summarizeXAIStateResults(outcomes,resolved,alreadyGone){
+  const result={deleted:0,absent:0,replacement:0,runtimeDisabled:0,alreadyResolved:Number(alreadyGone||0),unprocessable:0,failed:0,failureMessages:[]};
+  outcomes.forEach(item=>{
+    if(item.outcome==='failed'){result.failed++;if(item.message)result.failureMessages.push(item.message);return}
+    const response=resolved.get(String(xaiStateKey(item.row)).toLowerCase());
+    const status=firstText(response&&response.status,'failed');
+    if(status==='already_resolved'){result.alreadyResolved++;return}
+    if(status==='replacement_kept'){result.replacement++;return}
+    if(status!=='resolved'){result.failed++;result.failureMessages.push(firstText(response&&response.error,response&&response.message,'插件状态同步失败'));return}
+    if(item.outcome==='deleted')result.deleted++;
+    else if(item.outcome==='absent')result.absent++;
+    else if(item.outcome==='replacement_candidate')result.replacement++;
+    else if(item.outcome==='runtime_disabled')result.runtimeDisabled++;
+    else if(item.outcome==='runtime_absent')result.alreadyResolved++;
+    else result.failed++;
+  });
+  return result;
+}
+async function releaseXAIStateRows(rows,confirmText,runningText){
+  const key=managementKey();
+  if(!key){showFallbackKeyInput();setAutobanReleaseStatus('请在页面顶部填写 CPA 管理密钥后重试。','warn');return}
+  const requested=new Set((rows||[]).map(xaiStateKey).filter(Boolean));
+  if(!requested.size){setAutobanReleaseStatus('没有可解除的 xAI 429 状态。','warn');return}
+  if(!confirm(tr(confirmText)))return;
+  let finalStatus='';let finalTone='';
+  setAuthDeleteBusy('autoban-release',true);
+  setAuthDeleteProgress(autobanReleaseStatusEl,runningText,'',18);
+  try{
+    const fresh=await load(true,true,{keepExisting:true,abortPrevious:true});
+    if(!fresh)throw new Error('刷新 xAI 429 状态失败。');
+    const current=autobanReleaseRows().filter(r=>requested.has(xaiStateKey(r)));
+    if(!current.length){autobanReleaseSelected.clear();finalStatus='所选 xAI 429 状态已经解除。';finalTone='ok';return}
+    const outcomes=current.map(row=>({row:row,action:'manual_release',outcome:'released'}));
+    const resolved=await resolveXAIStateOutcomes(outcomes,key);
+    let released=0,already=0,failed=0;
+    current.forEach(row=>{const status=firstText(resolved.get(String(xaiStateKey(row)).toLowerCase())?.status,'failed');if(status==='resolved')released++;else if(status==='already_resolved')already++;else failed++});
+    removeXAIStatesFromCurrentData(current);autobanReleaseSelected.clear();
+    const refreshed=await load(true,true,{keepExisting:true,abortPrevious:true});
+    finalStatus='解除完成：已解除 '+released+'，已经解除 '+already+'，失败 '+failed+'。'+(refreshed?'':' 统计刷新失败，请手动刷新。');finalTone=failed||!refreshed?'warn':'ok';
+  }catch(e){finalStatus='解除失败：'+e.message;finalTone='bad'}
+  finally{setAuthDeleteBusy('autoban-release',false);renderAutobanReleaseModal();if(finalStatus)setAutobanReleaseStatus(finalStatus,finalTone)}
 }
 async function deleteInvalidAuthRows(rows,confirmText,runningText,selectAll=false){
   const key=managementKey();
@@ -1080,10 +1277,10 @@ async function deleteInvalidAuthRows(rows,confirmText,runningText,selectAll=fals
     if(finalStatus)setInvalidAuthStatus(finalStatus,finalTone);
   }
 }
-async function processInvalidAuthFileRows(rows,key){
+async function processInvalidAuthFileRows(rows,key,provider='codex'){
   if(!rows.length)return [];
   let liveFiles=[];
-  try{liveFiles=await fetchAuthFilesForBatch(key)}catch(e){throw new Error('核对认证文件失败：'+e.message)}
+  try{liveFiles=await fetchAuthFilesForBatch(key,provider)}catch(e){throw new Error('核对认证文件失败：'+e.message)}
   const liveByName=new Map(liveFiles.map(f=>[fileNameOnly(f.name),f]));
   const outcomes=[];
   const deletable=[];
@@ -1096,10 +1293,7 @@ async function processInvalidAuthFileRows(rows,key){
   });
   if(!deletable.length)return outcomes;
   const names=[...new Set(deletable.map(invalidAuthFileName))];
-  const res=await fetch(managementAuthFilesApi,{method:'DELETE',headers:{Authorization:'Bearer '+key,'Content-Type':'application/json',Accept:'application/json'},body:JSON.stringify({names:names})});
-  const body=await readResponseBody(res);
-  if(res.status===401)rejectManagementKey(key);
-  const byName=parseInvalidAuthFileDeleteOutcomes(res,body,names);
+  const byName=await deleteAuthFilesInBatches(names,key);
   deletable.forEach(row=>{
     const result=byName.get(invalidAuthFileName(row))||{outcome:'failed',message:'删除结果缺少该文件'};
     outcomes.push({row:row,action:result.outcome==='deleted'?'file_deleted':result.outcome==='absent'?'file_absent':'',outcome:result.outcome,message:result.message||''});
@@ -1117,15 +1311,13 @@ function invalidAuthFileIdentityChanged(row,live){
 function invalidAuthFileWasReplaced(row,live){
   const recorded=Number(row&&row.auth_file_mtime||0);
   if(!recorded)return false;
-  const recordedMs=recorded>1e12?recorded:recorded*1000;
+  const recordedSeconds=Math.floor(recorded>1e12?recorded/1000:recorded);
   const liveMs=authFileTimestamp(live);
-	return liveMs>0&&liveMs>recordedMs;
+	return liveMs>0&&Math.floor(liveMs/1000)>recordedSeconds;
 }
 function parseInvalidAuthFileDeleteOutcomes(res,body,names){
   const out=new Map();
   const parsed=parseJSONBody(body);
-  if(res&&res.ok){names.forEach(name=>out.set(name,{outcome:'deleted'}));return out}
-  if(res&&res.status===404&&authFileDeleteAlreadyApplied(res,body)){names.forEach(name=>out.set(name,{outcome:'absent'}));return out}
   if(res&&res.status===207){
     const deleted=new Set((parsed.files||[]).map(fileNameOnly));
     deleted.forEach(name=>out.set(name,{outcome:'deleted'}));
@@ -1138,7 +1330,34 @@ function parseInvalidAuthFileDeleteOutcomes(res,body,names){
     names.forEach(name=>{if(!out.has(name))out.set(name,{outcome:'failed',message:'HTTP 207 未返回该文件结果'})});
     return out;
   }
+  if(res&&res.ok){names.forEach(name=>out.set(name,{outcome:'deleted'}));return out}
+  if(res&&res.status===404&&authFileDeleteAlreadyApplied(res,body)){names.forEach(name=>out.set(name,{outcome:'absent'}));return out}
   names.forEach(name=>out.set(name,{outcome:'failed',message:'HTTP '+(res&&res.status||0)+' '+body}));
+  return out;
+}
+const authFileDeleteBatchSize=25;
+function authFileDeleteURL(names){
+  const query=(names||[]).map(name=>'name='+encodeURIComponent(name)).join('&');
+  return managementAuthFilesApi+(query?'?'+query:'');
+}
+async function deleteAuthFilesInBatches(names,key){
+  const unique=[...new Set((names||[]).map(fileNameOnly).filter(Boolean))];
+  const out=new Map();
+  for(let offset=0;offset<unique.length;offset+=authFileDeleteBatchSize){
+    const batch=unique.slice(offset,offset+authFileDeleteBatchSize);
+    try{
+      const res=await fetch(authFileDeleteURL(batch),{method:'DELETE',headers:{Authorization:'Bearer '+key,Accept:'application/json'}});
+      const body=await readResponseBody(res);
+      if(res.status===401)rejectManagementKey(key);
+      parseInvalidAuthFileDeleteOutcomes(res,body,batch).forEach((value,name)=>out.set(name,value));
+      if(res.status===401){
+        unique.slice(offset+batch.length).forEach(name=>out.set(name,{outcome:'failed',message:'HTTP 401 管理密钥无效'}));
+        break;
+      }
+    }catch(e){
+      batch.forEach(name=>out.set(name,{outcome:'failed',message:firstText(e&&e.message,'删除请求失败')}));
+    }
+  }
   return out;
 }
 async function processRuntimeInvalidAuthRows(rows,key){
@@ -1168,14 +1387,14 @@ async function resolveInvalidAuthRows(outcomes,key){
   return new Map((parsed.items||[]).map(item=>[firstText(item&&item.auth_id),item]));
 }
 function summarizeInvalidAuthResults(outcomes,resolved,alreadyGone){
-	const result={deleted:0,absent:0,replacement:0,runtimeDisabled:0,alreadyResolved:Number(alreadyGone||0),unprocessable:0,failed:0};
+	const result={deleted:0,absent:0,replacement:0,runtimeDisabled:0,alreadyResolved:Number(alreadyGone||0),unprocessable:0,failed:0,failureMessages:[]};
   outcomes.forEach(item=>{
-    if(item.outcome==='failed'){result.failed++;return}
+    if(item.outcome==='failed'){result.failed++;if(item.message)result.failureMessages.push(item.message);return}
     const response=resolved.get(invalidAuthResolveID(item.row));
     const status=firstText(response&&response.status,'failed');
     if(status==='already_resolved'){result.alreadyResolved++;return}
     if(status==='replacement_kept'){result.replacement++;return}
-    if(status!=='resolved'){result.failed++;return}
+    if(status!=='resolved'){result.failed++;result.failureMessages.push(firstText(response&&response.error,response&&response.message,'插件状态同步失败'));return}
     if(item.outcome==='deleted')result.deleted++;
     else if(item.outcome==='absent')result.absent++;
     else if(item.outcome==='replacement_candidate')result.replacement++;
@@ -1186,7 +1405,9 @@ function summarizeInvalidAuthResults(outcomes,resolved,alreadyGone){
   return result;
 }
 function formatInvalidAuthResult(result){
-	return '处理完成：已删除 '+result.deleted+'，原本不存在 '+result.absent+'，替换文件已保留 '+result.replacement+'，临时禁用 '+result.runtimeDisabled+'，已经解除 '+result.alreadyResolved+'，不可处理 '+Number(result.unprocessable||0)+'，失败 '+result.failed+'。';
+	const messages=[...new Set((result.failureMessages||[]).map(v=>String(v||'').trim()).filter(Boolean))];
+	const detail=messages.length?' 失败原因：'+messages.slice(0,3).join('；')+(messages.length>3?'；另有 '+(messages.length-3)+' 类错误':'')+'。':'';
+	return '处理完成：已删除 '+result.deleted+'，原本不存在 '+result.absent+'，替换文件已保留 '+result.replacement+'，临时禁用 '+result.runtimeDisabled+'，已经解除 '+result.alreadyResolved+'，不可处理 '+Number(result.unprocessable||0)+'，失败 '+result.failed+'。'+detail;
 }
 async function deleteWorkspaceDeactivatedRows(rows,confirmText,runningText){
   const names=[...new Set(rows.map(workspaceDeactivatedFileName).filter(Boolean))];
@@ -1197,17 +1418,14 @@ async function deleteWorkspaceDeactivatedRows(rows,confirmText,runningText){
   setAuthDeleteBusy('workspace-deactivated',true);
   setAuthDeleteProgress(workspaceDeactivatedStatusEl,runningText,'',18);
   try{
-    const res=await fetch(managementAuthFilesApi,{method:'DELETE',headers:{Authorization:'Bearer '+key,'Content-Type':'application/json',Accept:'application/json'},body:JSON.stringify({names:names})});
-    const body=await readResponseBody(res);
-    const deleteResult=parseAuthFileDeleteResult(res,body,names);
-    if(!deleteResult.ok){
-      removeAuthFilesFromCurrentData(deleteResult.deleted);
-      if(res.status===401)rejectManagementKey(key);
-      throw new Error(deleteResult.message);
-	}
+    const outcomes=await deleteAuthFilesInBatches(names,key);
+    const deleted=names.filter(name=>outcomes.get(name)?.outcome==='deleted'||outcomes.get(name)?.outcome==='absent');
+    const failed=names.map(name=>outcomes.get(name)).filter(item=>!item||item.outcome==='failed');
+    removeAuthFilesFromCurrentData(deleted);
+    if(failed.length)throw new Error([...new Set(failed.map(item=>firstText(item&&item.message,'删除结果缺少该文件')))].slice(0,3).join('；'));
     setAuthDeleteProgress(workspaceDeactivatedStatusEl,'删除成功，正在刷新统计...','ok',72);
     workspaceDeactivatedSelected.clear();
-    removeAuthFilesFromCurrentData(deleteResult.deleted);
+    removeAuthFilesFromCurrentData(deleted);
     renderWorkspaceDeactivatedModal();
     await load(true,true);
     setAuthDeleteBusy('workspace-deactivated',false);
@@ -1483,7 +1701,15 @@ function codexAuthFiles(files){
     return provider==='codex' || provider.includes('codex');
   });
 }
-async function fetchAuthFilesForBatch(key){
+function xaiAuthFiles(files){
+  return (files||[]).filter(f=>{
+    if(f.runtime_only)return false;
+    const provider=String(f.provider||f.type||'').trim().toLowerCase();
+    const name=fileNameOnly(firstText(f.name,f.path,f.auth_index));
+    return provider==='xai'||provider.includes('xai')||provider.includes('grok')||/^xai[-_.]/i.test(name);
+  });
+}
+async function fetchAuthFilesForBatch(key,provider='codex'){
   if(!key)throw new Error('请填写 CPA 管理密钥。');
   const res=await fetch(managementAuthFilesApi,{headers:{Authorization:'Bearer '+key,Accept:'application/json'}});
   if(!res.ok){
@@ -1492,7 +1718,8 @@ async function fetchAuthFilesForBatch(key){
     throw new Error('HTTP '+res.status+' '+body);
   }
   const data=await res.json();
-  return codexAuthFiles(data.files||[]);
+  const files=data.files||[];
+  return provider==='xai'?xaiAuthFiles(files):provider==='all'?files.filter(f=>!f.runtime_only):codexAuthFiles(files);
 }
 async function previewBatchProxyTargets(){
   const key=batchProxyKey();
@@ -2457,9 +2684,9 @@ function renderPoolLabels(data){
   if(accountHeads[7])accountHeads[7].textContent=xai?'恢复时间':'窗口 2 / 额度预估';
   const quotaToggle=document.querySelector('#account-columns input[data-col="quota5h"]');
   if(quotaToggle&&quotaToggle.parentElement.lastChild)quotaToggle.parentElement.lastChild.textContent=xai?'错误':'窗口 1';
-  document.getElementById('invalid-auth-card').disabled=xai;
-  document.getElementById('workspace-deactivated-card').disabled=xai;
-  document.getElementById('autoban-release-card').disabled=xai;
+	document.getElementById('invalid-auth-card').disabled=false;
+	document.getElementById('workspace-deactivated-card').disabled=false;
+	document.getElementById('autoban-release-card').disabled=false;
   document.getElementById('invalid-auth-card').querySelector('span').textContent=xai?'401 失效':'401 失效';
   document.getElementById('workspace-deactivated-card').querySelector('span').textContent=xai?'403 拒绝':'402 工作区';
   document.getElementById('autoban-release-card').querySelector('span').textContent=xai?'429 状态':'429 禁用';
@@ -2593,11 +2820,11 @@ function renderAccounts(){
   const start=(accountPage-1)*accountPageSize;
   const pageRows=rows.slice(start,start+accountPageSize);
   const externalCount=rows.filter(r=>r.external_use_suspected).length;
-  const allInvalidRows=isXAIPool()?((data.accounts||[]).filter(r=>r.xai_state==='unauthorized')):invalidAuthRows();
-  const allWorkspaceRows=isXAIPool()?((data.accounts||[]).filter(r=>r.xai_state==='forbidden')):workspaceDeactivatedRows();
+  const allInvalidRows=invalidAuthRows();
+  const allWorkspaceRows=workspaceDeactivatedRows();
   const invalidCount=allInvalidRows.length;
   const workspaceDeactivatedCount=allWorkspaceRows.length;
-  const active429Count=isXAIPool()?rows.filter(r=>r.xai_state==='free_usage_exhausted'||r.xai_state==='rate_limited').length:autobanReleaseRows().length;
+  const active429Count=autobanReleaseRows().length;
   const triggerFailed=rows.filter(r=>r.quota_trigger_status&&r.quota_trigger_status!=='success'&&r.quota_trigger_status!=='skipped').length;
   const riskCount=rows.filter(r=>findBan(r)||r.invalid_auth||r.workspace_deactivated||r.xai_state||r.external_use_suspected||r.disabled||r.expired||r.waiting_runtime_load||triggerRisk(r)||maxQuota(r)>=90||((r.requests||0)>0&&successRate(r)<80)).length;
   const quotaHot=[...rows].sort((a,b)=>maxQuota(b)-maxQuota(a))[0];

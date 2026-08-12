@@ -144,10 +144,22 @@ func (m *xaiAuthSourceManager) hostAccounts() ([]configuredAccount, error) {
 		}
 		email := firstNonEmptyString(entry.Email, entry.Account)
 		authFile := firstNonEmptyString(fileNameIfJSON(entry.Name), fileNameIfJSON(entry.Path), fileNameIfJSON(entry.AuthIndex))
+		authFileMTime := parseHostAuthUpdatedAt(firstNonEmptyString(entry.ModTime, entry.UpdatedAt))
+		if authFile != "" {
+			if _, diskMTime := authFileStateForName(authFile); diskMTime > 0 {
+				authFileMTime = diskMTime
+			}
+		}
 		authIndex := firstNonEmptyString(entry.AuthIndex, authFile, entry.ID)
 		name := firstNonEmptyString(entry.Name, filepath.Base(entry.Path))
 		source := firstNonEmptyString(entry.Source, email, name, authIndex)
 		planType := firstNonEmptyString(entry.PlanType, entry.Plan, entry.Subscription)
+		sourceKind := authSourceKindLegacy
+		if entry.RuntimeOnly || strings.EqualFold(strings.TrimSpace(entry.Source), "memory") || strings.EqualFold(strings.TrimSpace(entry.Source), "runtime") {
+			sourceKind = authSourceKindRuntimeOnly
+		} else if authFile != "" {
+			sourceKind = authSourceKindFile
+		}
 		accounts = append(accounts, configuredAccount{
 			AuthIndex:          authIndex,
 			AuthID:             firstNonEmptyString(entry.ID, email),
@@ -156,7 +168,9 @@ func (m *xaiAuthSourceManager) hostAccounts() ([]configuredAccount, error) {
 			Email:              email,
 			Name:               name,
 			AuthFile:           authFile,
-			AuthFileMTime:      parseHostAuthUpdatedAt(entry.UpdatedAt),
+			AuthFileMTime:      authFileMTime,
+			AuthSourceKind:     sourceKind,
+			RuntimeRegistered:  strings.TrimSpace(entry.AuthIndex) != "",
 			Disabled:           entry.Disabled || strings.EqualFold(strings.TrimSpace(entry.Status), "disabled"),
 			Expired:            entry.Expired || strings.EqualFold(strings.TrimSpace(entry.Status), "expired"),
 			PlanType:           planType,
@@ -271,6 +285,12 @@ func (m *xaiAuthSourceManager) status() xaiAuthSourceDiagnostics {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.diagnostics
+}
+
+func (m *xaiAuthSourceManager) invalidate() {
+	m.mu.Lock()
+	m.fetchedAt = time.Time{}
+	m.mu.Unlock()
 }
 
 func cloneConfiguredAccounts(accounts []configuredAccount) []configuredAccount {
