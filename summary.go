@@ -1033,10 +1033,14 @@ func (s *store) summaryOnce(ctx context.Context, window string, limit int) (map[
 		return nil, err
 	}
 	if nativeScheduling() {
-		autobans = nil
+		autobans, err = queryLifecycleAutobans(ctx, db, now)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		autobans = filterMissingAutobanRows(autobans, configuredAccounts, authDirReadable)
+		autobans = mergeEffectiveAutobans(autobans, invalidAuths)
 	}
-	autobans = filterMissingAutobanRows(autobans, configuredAccounts, authDirReadable)
-	autobans = mergeEffectiveAutobans(autobans, invalidAuths)
 	applyAccountQuotaToAutobans(autobans, accounts)
 	diagnostics := buildDiagnostics(ctx, db, path, accounts, providers, unauthorizedInvalidAuths, autobans, externalUseAlerts)
 	if err := applyLifecycleSummary(ctx, db, accounts); err != nil {
@@ -1505,25 +1509,26 @@ type recentRow struct {
 }
 
 type autobanRow struct {
-	AuthID               string   `json:"auth_id"`
-	AuthIndex            string   `json:"auth_index"`
-	Source               string   `json:"source"`
-	Provider             string   `json:"provider"`
-	AuthFile             string   `json:"auth_file,omitempty"`
-	AuthFileMTime        int64    `json:"auth_file_mtime,omitempty"`
-	Window               string   `json:"window"`
-	Reason               string   `json:"reason"`
-	BannedAt             int64    `json:"banned_at"`
-	BannedAtText         string   `json:"banned_at_text"`
-	ResetAt              int64    `json:"reset_at"`
-	ResetAtText          string   `json:"reset_at_text"`
-	SecondsRemaining     int64    `json:"seconds_remaining"`
-	Active               bool     `json:"active"`
-	LastStatusCode       int      `json:"last_status_code"`
-	PrimaryUsedPercent   *float64 `json:"primary_used_percent,omitempty"`
-	PrimaryResetAt       *int64   `json:"primary_reset_at,omitempty"`
-	SecondaryUsedPercent *float64 `json:"secondary_used_percent,omitempty"`
-	SecondaryResetAt     *int64   `json:"secondary_reset_at,omitempty"`
+	Lifecycle            *authLifecycleState `json:"lifecycle,omitempty"`
+	AuthID               string              `json:"auth_id"`
+	AuthIndex            string              `json:"auth_index"`
+	Source               string              `json:"source"`
+	Provider             string              `json:"provider"`
+	AuthFile             string              `json:"auth_file,omitempty"`
+	AuthFileMTime        int64               `json:"auth_file_mtime,omitempty"`
+	Window               string              `json:"window"`
+	Reason               string              `json:"reason"`
+	BannedAt             int64               `json:"banned_at"`
+	BannedAtText         string              `json:"banned_at_text"`
+	ResetAt              int64               `json:"reset_at"`
+	ResetAtText          string              `json:"reset_at_text"`
+	SecondsRemaining     int64               `json:"seconds_remaining"`
+	Active               bool                `json:"active"`
+	LastStatusCode       int                 `json:"last_status_code"`
+	PrimaryUsedPercent   *float64            `json:"primary_used_percent,omitempty"`
+	PrimaryResetAt       *int64              `json:"primary_reset_at,omitempty"`
+	SecondaryUsedPercent *float64            `json:"secondary_used_percent,omitempty"`
+	SecondaryResetAt     *int64              `json:"secondary_reset_at,omitempty"`
 }
 
 type invalidAuthRow struct {

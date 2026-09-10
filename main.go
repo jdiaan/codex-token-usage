@@ -87,7 +87,7 @@ const (
 )
 
 var (
-	pluginVersion    = "0.1.44"
+	pluginVersion    = "0.1.46"
 	pluginAuthor     = "Codex Token Usage Contributors"
 	pluginRepository = "https://github.com/zhumengling/codex-token-usage"
 )
@@ -148,6 +148,8 @@ type lifecycleRequest struct {
 
 type pluginConfig struct {
 	SchedulingMode                          string
+	ManagementURL                           string
+	ManagementKey                           string
 	AccountProtectionEnabled                bool
 	AccountProtectionFreeConcurrency        int
 	AccountProtectionPlusConcurrency        int
@@ -526,6 +528,8 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 func pluginConfigFields() []configField {
 	return []configField{
 		{Name: "scheduling_mode", Type: "enum", Description: "native=CPA 原生调度及 API 账号管理（默认）；legacy=插件调度及强制账号保护。native 不执行插件并发硬限制或 Token 降级。"},
+		{Name: "management_url", Type: "string", Description: "CPA Management 根地址，例如 http://127.0.0.1:8317。native 自动禁用/启用账号必填；CPA_TOKEN_USAGE_MANAGEMENT_URL 环境变量优先。"},
+		{Name: "management_key", Type: "string", Description: "CPA Management 明文密钥（不是配置中的哈希）。native 自动禁用/启用账号必填；CPA_TOKEN_USAGE_MANAGEMENT_KEY 环境变量优先。该值会以明文保存在 CPA 插件配置中。"},
 		{Name: "开启定时额度触发（不建议账号多的情况下开启）", Type: "boolean", Description: "是否开启 Codex 账号定时额度触发。探测结果会参与 401、402、403、429 状态管理；已处于异常不可用状态的账号会跳过后续探测，429 到 reset_at 后再恢复探测。默认关闭。"},
 		{Name: "触发间隔分钟", Type: "number", Description: "每轮触发间隔，单位分钟。默认 10。"},
 		{Name: "触发模式", Type: "enum", Description: "probe=真实极小模型请求，会消耗少量 token；旧 quota 配置会自动按 probe 执行。默认 probe。"},
@@ -1097,7 +1101,7 @@ func configurePlugin(request []byte) error {
 	globalDBHealth.configure(cfg)
 	globalSummaryMaintenance.configure(cfg)
 	globalSummaryPrecomputer.configure(cfg)
-	globalAuthLifecycle.configure()
+	globalAuthLifecycle.configure(cfg)
 	if err := globalStore.refreshSchedulerState(context.Background()); err != nil {
 		globalSchedulerState.invalidate()
 	}
@@ -1126,6 +1130,12 @@ func parsePluginConfigYAML(raw []byte, cfg pluginConfig) pluginConfig {
 	values := yamlScalars(string(raw))
 	if value, ok := configValue(values, "scheduling_mode"); ok {
 		cfg.SchedulingMode = strings.ToLower(strings.TrimSpace(value))
+	}
+	if value, ok := configValue(values, "management_url"); ok {
+		cfg.ManagementURL = strings.TrimSpace(value)
+	}
+	if value, ok := configValue(values, "management_key"); ok {
+		cfg.ManagementKey = strings.TrimSpace(value)
 	}
 	if value, ok := configValue(values, "account_protection_enabled", "开启账号保护调度（可能会影响缓存）", "开启账号保护调度"); ok {
 		cfg.AccountProtectionEnabled = parseBoolString(value, cfg.AccountProtectionEnabled)
@@ -1325,7 +1335,7 @@ func yamlScalars(raw string) map[string]string {
 		}
 		key, value, _ := strings.Cut(line, ":")
 		key = strings.TrimSpace(key)
-		if key == "" || strings.ContainsAny(key, " \t") {
+		if key == "" {
 			continue
 		}
 		value = strings.TrimSpace(value)

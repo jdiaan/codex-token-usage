@@ -24,6 +24,32 @@ func TestDashboardCacheTokensDoesNotDoubleCountOverlappingFields(t *testing.T) {
 	}
 }
 
+func TestNativeLifecycleFailuresAreVisible(t *testing.T) {
+	markers := []string{
+		"function lifecycleAuthInvalid(r)",
+		"function lifecycleRisk(r)",
+		"lifecycleAccounts.filter(lifecycleAuthInvalid).length",
+		"最近列表已有 ",
+		"请在插件配置中填写 management_url / management_key",
+		"data-lifecycle-action=\"recheck\"",
+	}
+	for _, marker := range markers {
+		if !strings.Contains(dashboardScripts, marker) {
+			t.Fatalf("native lifecycle visibility missing %q", marker)
+		}
+	}
+	if !strings.Contains(dashboardStyles, "#lifecycle-banner.lifecycle-danger") {
+		t.Fatal("unconfigured lifecycle warning is not visually prominent")
+	}
+}
+
+func TestRecentRequestsShowLifecycleIdentityFields(t *testing.T) {
+	marker := "const who=[r.provider,r.auth_index,r.source]"
+	if !strings.Contains(dashboardScripts, marker) {
+		t.Fatalf("recent requests do not expose provider/auth_index/source identity: missing %q", marker)
+	}
+}
+
 func TestPoolTabSwitchReappliesLocale(t *testing.T) {
 	start := strings.Index(dashboardScripts, "function switchPage(page){")
 	if start < 0 {
@@ -108,6 +134,18 @@ func TestDashboardExplainsWaitingRuntimeAccountsAndStaleCandidates(t *testing.T)
 	for _, marker := range []string{"waiting_runtime_load", "等待 CPA 加载", "candidate_pool_stale", "CPA 候选缺少"} {
 		if !strings.Contains(dashboardScripts, marker) {
 			t.Fatalf("dashboard missing Issue #12 diagnostic marker %q", marker)
+		}
+	}
+}
+
+func TestDashboardShowsExternallyEnabledManualAuthAsPendingReview(t *testing.T) {
+	for _, marker := range []string{
+		"s.disable_reason==='external_enable'",
+		"Externally Enabled / 外部启用，待复查",
+		"esc(label)",
+	} {
+		if !strings.Contains(dashboardScripts, marker) {
+			t.Fatalf("dashboard external-enable status marker %q not found", marker)
 		}
 	}
 }

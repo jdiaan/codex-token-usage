@@ -36,8 +36,39 @@ type managementAuthClient struct {
 	client       *http.Client
 }
 
-func newManagementAuthClient() *managementAuthClient {
-	return &managementAuthClient{call: hostAuthCaller, baseURL: strings.TrimRight(os.Getenv("CPA_TOKEN_USAGE_MANAGEMENT_URL"), "/"), key: os.Getenv("CPA_TOKEN_USAGE_MANAGEMENT_KEY"), client: &http.Client{Timeout: 10 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}
+func newManagementAuthClient(cfg pluginConfig) *managementAuthClient {
+	baseURL := strings.TrimSpace(os.Getenv("CPA_TOKEN_USAGE_MANAGEMENT_URL"))
+	if baseURL == "" {
+		baseURL = strings.TrimSpace(cfg.ManagementURL)
+	}
+	key := strings.TrimSpace(os.Getenv("CPA_TOKEN_USAGE_MANAGEMENT_KEY"))
+	if key == "" {
+		key = strings.TrimSpace(cfg.ManagementKey)
+	}
+	return &managementAuthClient{call: hostAuthCaller, baseURL: strings.TrimRight(baseURL, "/"), key: key, client: &http.Client{Timeout: 10 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}
+}
+
+func managementAuthConfigStatus(cfg pluginConfig) map[string]any {
+	urlSource := "missing"
+	if strings.TrimSpace(os.Getenv("CPA_TOKEN_USAGE_MANAGEMENT_URL")) != "" {
+		urlSource = "environment"
+	} else if strings.TrimSpace(cfg.ManagementURL) != "" {
+		urlSource = "plugin_config"
+	}
+	keySource := "missing"
+	if strings.TrimSpace(os.Getenv("CPA_TOKEN_USAGE_MANAGEMENT_KEY")) != "" {
+		keySource = "environment"
+	} else if strings.TrimSpace(cfg.ManagementKey) != "" {
+		keySource = "plugin_config"
+	}
+	missing := make([]string, 0, 2)
+	if urlSource == "missing" {
+		missing = append(missing, "management_url")
+	}
+	if keySource == "missing" {
+		missing = append(missing, "management_key")
+	}
+	return map[string]any{"url_source": urlSource, "key_source": keySource, "missing_fields": missing}
 }
 
 func (c *managementAuthClient) Ready() bool {

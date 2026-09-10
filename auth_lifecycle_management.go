@@ -229,3 +229,51 @@ func applyLifecycleSummary(ctx context.Context, db *sql.DB, accounts []accountRo
 	}
 	return nil
 }
+
+// This list is independent of usage-window pagination: disabled credentials
+// must remain visible even if they have no requests in the selected window.
+func queryLifecycleAutobans(ctx context.Context, db *sql.DB, now int64) ([]autobanRow, error) {
+	states, err := listLifecycleStates(ctx, db)
+	if err != nil {
+		return nil, err
+	}
+	rows := []autobanRow{}
+	for _, s := range states {
+		if !s.Disabled && s.PendingAction == "" && (s.State == authHealthy || s.State == authManualDisabled) {
+			continue
+		}
+		if !s.Disabled && s.PendingAction == "" && s.State == authRateLimited && s.RecoverAt > 0 && s.RecoverAt <= now {
+			continue
+		}
+		copy := s
+		r := autobanRow{Lifecycle: &copy, AuthID: s.AuthID, AuthIndex: s.AuthIndex, AuthFile: s.Name, Source: s.Name, Provider: "codex", Active: true, Window: s.State, Reason: s.Reason, BannedAt: s.DisabledAt, ResetAt: s.RecoverAt, SecondsRemaining: -1}
+		state := s.State
+		if state == authManualDisabled && s.BlockedState != "" {
+			state = s.BlockedState
+		}
+		switch state {
+		case authInvalid:
+			r.Window, r.LastStatusCode = "401", 401
+		case authBillingBlocked:
+			r.Window, r.LastStatusCode = "402", 402
+		case authPermissionBlocked:
+			r.Window, r.LastStatusCode = "403", 403
+		case authQuotaCooldown:
+			r.Window, r.LastStatusCode = "quota", 429
+		case authRateLimited:
+			r.Window, r.LastStatusCode = "429", 429
+		}
+		if r.BannedAt > 0 {
+			r.BannedAtText = unixTime(r.BannedAt)
+		}
+		if r.ResetAt > 0 {
+			r.ResetAtText = unixTime(r.ResetAt)
+			r.SecondsRemaining = r.ResetAt - now
+			if r.SecondsRemaining < 0 {
+				r.SecondsRemaining = 0
+			}
+		}
+		rows = append(rows, r)
+	}
+	return rows, nil
+}

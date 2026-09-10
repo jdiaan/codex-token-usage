@@ -2,7 +2,7 @@
 
 CPA Token Usage is a CLIProxyAPI plugin for Codex account operation dashboards and AI provider usage analytics.
 
-Current version: `0.1.44`
+Current version: `0.1.46`
 
 ## Features
 
@@ -51,6 +51,8 @@ plugins:
       enabled: true
       priority: 120
       scheduling_mode: native # native (default) or legacy
+      management_url: http://127.0.0.1:8317
+      management_key: <your plaintext management key>
 
       开启定时额度触发（不建议账号多的情况下开启）: false
       触发间隔分钟: 10
@@ -87,6 +89,8 @@ plugins:
 English config keys are also accepted:
 
 ```yaml
+management_url: http://127.0.0.1:8317
+management_key: <your plaintext management key>
 quota_trigger_enabled: false
 quota_trigger_interval_minutes: 10
 quota_trigger_mode: probe
@@ -116,7 +120,7 @@ account_protection_token_window_seconds: 300
 account_protection_reservation_ttl_seconds: 900
 ```
 
-Quota trigger defaults to off and is not recommended for large account pools. `probe` sends a real minimal Codex model request and can consume tokens. In native mode its failures use the same classifier as normal Usage: explicit 401, 402, account/workspace 403 and quota-exhaustion 429 can request isolation; ordinary 429, unknown/model 403 and transient failures remain with CPA cooldown/retry. Success does not automatically clear isolation. Disabled accounts are checked through the state controller without temporarily enabling them. Legacy retains its existing probe, auto-ban and successful-probe recovery behavior. The old Chinese trigger key and `quota` mode remain accepted.
+Quota trigger defaults to off and is not recommended for large account pools. `probe` sends a real minimal Codex model request and can consume tokens. In native mode its failures use the same classifier as normal Usage: explicit 401, 402, account/workspace 403 and 429 request auth isolation; unknown/model 403 and transient failures remain with CPA cooldown/retry. Successful responses reporting an exhausted quota window also request isolation. A terminal `refresh_token_invalidated` exposed on an exact CPA runtime auth is also isolated even when refresh failed before CPA emitted a Usage event. Success does not automatically clear isolation. Disabled accounts are checked through the state controller without temporarily enabling them. Legacy retains its existing probe, auto-ban and successful-probe recovery behavior. The old Chinese trigger key and `quota` mode remain accepted.
 
 ## Native scheduling and account state
 
@@ -124,18 +128,18 @@ Quota trigger defaults to off and is not recommended for large account pools. `p
 
 Token windows and warnings remain available in native mode. Plugin concurrency hard limits and Token soft demotion are **not executed**. Select `legacy` to retain those older scheduling behaviors. xAI behavior is unchanged.
 
-Set these environment variables on the CPA process to enable status writes:
+Set the `management_url` and `management_key` plugin fields shown above, or set these environment variables on the CPA process, to enable status writes:
 
 ```text
 CPA_TOKEN_USAGE_MANAGEMENT_URL=http://127.0.0.1:8317
 CPA_TOKEN_USAGE_MANAGEMENT_KEY=<your plaintext management key>
 ```
 
-The URL is the CPA root URL. The key is read only from the environment; a configuration password hash is not a usable substitute. Missing configuration leaves statistics and native scheduling working and reports the controller as unconfigured. API errors never reactivate the old native candidate filters.
+The URL is the CPA root URL. Environment variables override the corresponding plugin fields. The key must be plaintext; a configuration password hash is not a usable substitute. CPA 7.2.145 does not provide a masked secret field for plugin configuration, so `management_key` is stored visibly in the CPA YAML and should only be used where access to that file and Management UI is trusted. Prefer the environment variable when the config must not contain the key. Missing or invalid configuration leaves statistics and native scheduling working, but the dashboard shows a prominent warning that 401/402/403/429 state writes cannot run. API errors never reactivate the old native candidate filters.
 
 The controller supports uniquely identified physical Codex OAuth auth files. It sends only `{name, auth_index, disabled}` to `PATCH /v0/management/auth-files/status`, then verifies both the file and runtime state and checks that credential/custom/routing fields were preserved. HTTP 200 alone is insufficient. SQLite stores fingerprints, intent, state versions and sanitized audit evidence. Existing disabled files are treated as manually disabled unless a completed plugin operation proves ownership.
 
-Only unchanged, plugin-owned quota isolation with a reliable expired reset is automatically enabled. Multiple exhausted windows use their latest reset; unknown reset times require read-only quota checks. 401 never has timer recovery. 402 and account-level 403 require manual review. External changes pause control, and Recheck never implicitly enables an account. CPA has no conditional update or operator marker, so a narrow concurrent external-write race remains possible.
+Only unchanged, plugin-owned quota or rate-limit isolation is automatically enabled when its recovery time is reached. Ordinary 429 uses the server retry/reset time, or a 60-second local backoff if none is provided; the local backoff is not a quota reset estimate. Multiple exhausted windows use their latest reset; unknown reset times require read-only quota checks. 401 never has timer recovery. 402 and account-level 403 require manual review. External changes pause control, and Recheck never implicitly enables an account. If an operator enables a manually disabled account outside the plugin, the lifecycle state stops reporting `MANUAL_DISABLED` but remains paused until reviewed. CPA has no conditional update or operator marker, so a narrow concurrent external-write race remains possible.
 
 Dashboard actions call the existing Management-authenticated endpoint:
 
@@ -153,6 +157,8 @@ The old release/resolve routes remain registered. Native callers must supply exa
 Before uninstalling or downgrading to an old binary, review every plugin-owned disabled account and either explicitly recover it after verification or hand responsibility to an operator using Disable/Clear. Keep the database for audit. Replacing a DLL alone does not undo disabled auth files. Switching to legacy stops new native isolation while continuing previously owned quota recovery.
 
 See [architecture audit](CODEX_ARCHITECTURE_AUDIT.md), [implementation report](CODEX_REFACTOR_REPORT.md), and [manual smoke test](MANUAL_SMOKE_TEST.md).
+
+The auto-disable table and 401/402/429 cards use the same native lifecycle records, including accounts without usage in the selected window. Pending status writes, confirmed plugin disables and manual disables remain visible. Recovery times and pending recovery are shown explicitly; recovered accounts are removed even if their last historical HTTP status was 429. Native card dialogs use versioned Recheck/Enable actions.
 
 ## One-shot quota-window activation
 
@@ -230,11 +236,11 @@ python3 integration/run_cpa_native.py # Go >=1.26; pinned CPA v7.2.145
 Release assets are named in the CLIProxyAPI plugin store format:
 
 ```text
-codex-token-usage_0.1.44_linux_amd64.zip
-codex-token-usage_0.1.44_linux_arm64.zip
-codex-token-usage_0.1.44_windows_amd64.zip
-codex-token-usage_0.1.44_darwin_amd64.zip
-codex-token-usage_0.1.44_darwin_arm64.zip
+codex-token-usage_0.1.46_linux_amd64.zip
+codex-token-usage_0.1.46_linux_arm64.zip
+codex-token-usage_0.1.46_windows_amd64.zip
+codex-token-usage_0.1.46_darwin_amd64.zip
+codex-token-usage_0.1.46_darwin_arm64.zip
 checksums.txt
 ```
 
@@ -250,7 +256,7 @@ checksums.txt
 
 - `未注册 / 未生效`: confirm the file is under the correct plugin directory and restart CLIProxyAPI.
 - Native `401`: isolation requires configured Management access; verify credentials with Recheck, then explicitly Enable. Replacement alone does not restore an ambiguous account.
-- Native `429`: ordinary rate limits stay with CPA cooldown; only confirmed quota exhaustion requests global isolation. Unknown resets do not get an invented recovery time.
+- Native `429`: ordinary rate limits and confirmed quota exhaustion both disable the auth through CPA. Unknown quota resets are queried without inventing a recovery time; ordinary 429 without retry metadata uses a 60-second local backoff.
 - Provider not visible: confirm the endpoint still exists in CPA config and refresh the dashboard.
 - Price missing: check `model_prices.cache` status in the summary JSON and the model price update error if present.
 

@@ -363,6 +363,9 @@ func buildAuthDiagnostics(accounts []accountRow, invalidAuths []invalidAuthRow, 
 func count429Autobans(autobans []autobanRow) int {
 	count := 0
 	for _, ban := range autobans {
+		if ban.Lifecycle != nil && ban.LastStatusCode != http.StatusTooManyRequests {
+			continue
+		}
 		window := strings.TrimSpace(ban.Window)
 		if strings.EqualFold(window, "401") || strings.EqualFold(window, "402") || strings.EqualFold(window, "403") ||
 			ban.LastStatusCode == http.StatusUnauthorized || ban.LastStatusCode == http.StatusPaymentRequired || ban.LastStatusCode == http.StatusForbidden {
@@ -475,12 +478,26 @@ func buildAlerts(data map[string]any) []dashboardAlert {
 	}
 	if rows, ok := data["autobans"].([]autobanRow); ok {
 		for _, row := range rows {
+			if row.Lifecycle != nil && row.LastStatusCode != http.StatusTooManyRequests {
+				continue
+			}
 			window := strings.TrimSpace(row.Window)
 			if strings.EqualFold(window, "401") || strings.EqualFold(window, "402") || strings.EqualFold(window, "403") ||
 				row.LastStatusCode == http.StatusUnauthorized || row.LastStatusCode == http.StatusPaymentRequired || row.LastStatusCode == http.StatusForbidden {
 				continue
 			}
-			alerts = append(alerts, dashboardAlert{ID: "autoban:" + firstNonEmptyString(row.AuthID, row.AuthIndex, row.Source), Severity: "warning", Type: "429", Scope: "account", Target: firstNonEmptyString(row.Source, row.AuthID, row.AuthIndex), Message: "账号 429 自动禁用中", Detail: "恢复时间 " + row.ResetAtText, CreatedAt: row.BannedAtText, Active: row.Active})
+			message, detail := "账号 429 自动禁用中", "恢复时间 "+row.ResetAtText
+			if row.Lifecycle != nil {
+				if !row.Lifecycle.Disabled {
+					message = "账号 429 等待禁用确认"
+				}
+				if !row.Lifecycle.DisabledByPlugin || row.Lifecycle.Paused {
+					detail = "等待状态同步或人工复查"
+				} else if row.ResetAt == 0 {
+					detail = "等待查询额度恢复时间"
+				}
+			}
+			alerts = append(alerts, dashboardAlert{ID: "autoban:" + firstNonEmptyString(row.AuthID, row.AuthIndex, row.Source), Severity: "warning", Type: "429", Scope: "account", Target: firstNonEmptyString(row.Source, row.AuthID, row.AuthIndex), Message: message, Detail: detail, CreatedAt: row.BannedAtText, Active: row.Active})
 		}
 	}
 	if rows, ok := data["external_use_alerts"].([]externalUseAlert); ok {

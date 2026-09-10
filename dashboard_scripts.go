@@ -481,21 +481,21 @@ function openInvalidAuthModal(){
 	invalidAuthOAuthUrlEl.hidden=true;
 	renderInvalidAuthModal();
 	invalidAuthModal.hidden=false;
-	setTimeout(()=>document.getElementById(isXAIPool()?'invalid-auth-refresh':'invalid-auth-delete-selected').focus(),0);
+	setTimeout(()=>document.getElementById((isXAIPool()||isNativeLifecycle())?'invalid-auth-refresh':'invalid-auth-delete-selected').focus(),0);
 }
 function closeInvalidAuthModal(){invalidAuthModal.hidden=true}
 function openWorkspaceDeactivatedModal(){
 	workspaceDeactivatedPage=1;
 	renderWorkspaceDeactivatedModal();
 	workspaceDeactivatedModal.hidden=false;
-	setTimeout(()=>document.getElementById(isXAIPool()?'workspace-deactivated-refresh':'workspace-deactivated-delete-selected').focus(),0);
+	setTimeout(()=>document.getElementById((isXAIPool()||isNativeLifecycle())?'workspace-deactivated-refresh':'workspace-deactivated-delete-selected').focus(),0);
 }
 function closeWorkspaceDeactivatedModal(){workspaceDeactivatedModal.hidden=true}
 function openAutobanReleaseModal(){
 	autobanReleasePage=1;
 	renderAutobanReleaseModal();
 	autobanReleaseModal.hidden=false;
-	setTimeout(()=>document.getElementById(isXAIPool()?'autoban-release-refresh':'autoban-release-selected').focus(),0);
+	setTimeout(()=>document.getElementById((isXAIPool()||isNativeLifecycle())?'autoban-release-refresh':'autoban-release-selected').focus(),0);
 }
 function closeAutobanReleaseModal(){autobanReleaseModal.hidden=true}
 function batchProxyKey(){
@@ -644,6 +644,7 @@ function xaiManagementRows(states){
   });
 }
 function invalidAuthRows(){
+  if(isNativeLifecycle())return nativeLifecycleRows().filter(lifecycleAuthInvalid);
   if(isXAIPool())return xaiManagementRows(['unauthorized']).map(row=>Object.assign({},row,{invalid_auth:true,invalid_auth_at:firstText(row.observed_at_text,row.banned_at_text),invalid_auth_reason:firstText(row.reason,'401 unauthorized'),last_status_code:Number(row.last_status_code||401),auth_source_kind:invalidAuthSourceKind(row)}));
   const accounts=(lastData&&lastData.accounts)||[];
   const invalids=(lastData&&lastData.invalid_auths)||[];
@@ -659,7 +660,7 @@ function invalidAuthRows(){
     merged.invalid_auth_reason=firstText(row&&row.reason,row&&row.invalid_auth_reason,account&&account.invalid_auth_reason,'401 unauthorized');
     merged.last_status_code=Number(firstText(row&&row.last_status_code,account&&account.invalid_auth_status_code,0));
     merged.auth_file=firstText(row&&row.auth_file,account&&account.auth_file);
-    merged.auth_source_kind=invalidAuthSourceKind(Object.assign({},account||{},row||{},merged));
+    merged.auth_source_kind=row&&row.lifecycle_managed?'lifecycle':invalidAuthSourceKind(Object.assign({},account||{},row||{},merged));
     if(!is401InvalidAuthRow(merged))return;
     const key=invalidAuthKey(merged);
     if(seen.has(key))return;
@@ -671,11 +672,19 @@ function invalidAuthRows(){
     add(row,account);
   });
   accounts.filter(r=>r.invalid_auth&&is401InvalidAuthRow(r)).forEach(row=>add(row,row));
-  const order={file:0,runtime_only:1,legacy:2};
+  const controller=(lastData&&lastData.auth_controller)||{};
+  if(controller.scheduling_mode==='native')accounts.filter(lifecycleAuthInvalid).forEach(account=>add({
+    auth_id:account.auth_id,auth_index:account.auth_index,source:account.source,auth_file:account.auth_file,
+    invalidated_at_text:account.lifecycle&&account.lifecycle.updated_at?new Date(Number(account.lifecycle.updated_at)*1000).toISOString():account.last_seen,
+    reason:firstText(account.lifecycle&&account.lifecycle.last_error_message,'401 authentication invalid'),
+    last_status_code:401,auth_source_kind:'lifecycle',lifecycle_managed:true
+  },account));
+  const order={lifecycle:0,file:1,runtime_only:2,legacy:3};
   out.sort((a,b)=>(order[invalidAuthSourceKind(a)]-order[invalidAuthSourceKind(b)])||(Date.parse(firstText(b.invalid_auth_at,b.invalidated_at_text,0))-Date.parse(firstText(a.invalid_auth_at,a.invalidated_at_text,0))));
   return out;
 }
 function workspaceDeactivatedRows(){
+  if(isNativeLifecycle())return nativeLifecycleRows().filter(lifecycleWorkspaceBlocked);
   if(isXAIPool())return xaiManagementRows(['forbidden']).map(row=>Object.assign({},row,{workspace_deactivated:true,workspace_deactivated_at:firstText(row.observed_at_text,row.banned_at_text),workspace_deactivated_reason:firstText(row.reason,'xAI access denied')}));
   const accounts=(lastData&&lastData.accounts)||[];
   const rows=(lastData&&lastData.workspace_deactivated_auths)||[];
@@ -754,7 +763,7 @@ function authAliasVariants(value){
 }
 function invalidAuthSourceKind(r){
   const explicit=String(firstText(r&&r.auth_source_kind,r&&r.source_kind)).trim().toLowerCase().replace(/-/g,'_');
-  if(explicit==='file'||explicit==='runtime_only'||explicit==='legacy')return explicit;
+  if(explicit==='lifecycle'||explicit==='file'||explicit==='runtime_only'||explicit==='legacy')return explicit;
   if(r&&r.runtime_only)return 'runtime_only';
   const source=String(r&&r.source||'').trim().toLowerCase();
   if(source==='memory'||source==='runtime'||source==='runtime_only')return 'runtime_only';
@@ -838,6 +847,7 @@ function pagedInvalidAuthRows(){
 }
 function renderInvalidAuthModal(){
   const page=pagedInvalidAuthRows();
+  if(renderNativeLifecycleModal('invalid-auth',page,invalidAuthPage,'管理 401 失效账号'))return;
   const rows=page.rows;
   const xai=isXAIPool();
   document.getElementById('invalid-auth-title').textContent=xai?'xAI 401 失效账号':'管理 401 失效账号';
@@ -874,10 +884,12 @@ function renderInvalidAuthModal(){
     const actionableRow=invalidAuthActionable(r);
     const checked=invalidAuthSelected.has(key)?' checked':'';
     const loginBusy=invalidAuthOAuthKey===key?' busy':'';
-    const rowClass=sourceKind==='runtime_only'?' is-runtime':(actionKind==='legacy'?' is-legacy':'');
-    const sourceText=sourceKind==='file'?('物理 JSON · '+(file||'文件名缺失')):sourceKind==='runtime_only'?('运行时凭据 · '+firstText(r.auth_id,r.auth_index,'-')):'历史记录 · 无可操作认证源';
-    const firstAction=actionKind==='file'&&!xai?'<button class="ghost" type="button" data-invalid-login="'+esc(key)+'"'+(invalidAuthDeleting?' disabled':'')+'>OAuth 登录</button>':'<button class="ghost" type="button" disabled>'+esc(sourceKind==='runtime_only'?'仅本次运行':xai?'xAI 认证':'历史记录')+'</button>';
-    const finalAction=actionKind==='file'?'<button class="ghost danger-ghost" type="button" data-invalid-delete="'+esc(key)+'"'+(invalidAuthDeleting?' disabled':'')+'>删除</button>':actionKind==='runtime_only'?'<button class="ghost danger-ghost" type="button" data-invalid-runtime-disable="'+esc(key)+'"'+(invalidAuthDeleting?' disabled':'')+'>本次运行禁用</button>':'<button class="ghost" type="button" disabled>不可删除</button>';
+    const lifecycle=sourceKind==='lifecycle'&&r.lifecycle;
+    const rowClass=sourceKind==='runtime_only'?' is-runtime':(actionKind==='legacy'&&!lifecycle?' is-legacy':'');
+    const sourceText=lifecycle?'生命周期控制器 · 需要重新登录':sourceKind==='file'?('物理 JSON · '+(file||'文件名缺失')):sourceKind==='runtime_only'?('运行时凭据 · '+firstText(r.auth_id,r.auth_index,'-')):'历史记录 · 无可操作认证源';
+    const firstAction=lifecycle?'<button class="ghost" type="button" data-lifecycle-action="recheck" data-auth-index="'+esc(r.auth_index)+'" data-version="'+Number(r.lifecycle.version||0)+'">Recheck</button>':actionKind==='file'&&!xai?'<button class="ghost" type="button" data-invalid-login="'+esc(key)+'"'+(invalidAuthDeleting?' disabled':'')+'>OAuth 登录</button>':'<button class="ghost" type="button" disabled>'+esc(sourceKind==='runtime_only'?'仅本次运行':xai?'xAI 认证':'历史记录')+'</button>';
+    const lifecycleConfigured=Boolean(((lastData||{}).auth_controller||{}).management_configured);
+    const finalAction=lifecycle?'<button class="ghost" type="button" data-lifecycle-action="enable" data-auth-index="'+esc(r.auth_index)+'" data-version="'+Number(r.lifecycle.version||0)+'"'+(lifecycleConfigured?'':' disabled title="请先配置 management_url / management_key"')+'>Enable</button>':actionKind==='file'?'<button class="ghost danger-ghost" type="button" data-invalid-delete="'+esc(key)+'"'+(invalidAuthDeleting?' disabled':'')+'>删除</button>':actionKind==='runtime_only'?'<button class="ghost danger-ghost" type="button" data-invalid-runtime-disable="'+esc(key)+'"'+(invalidAuthDeleting?' disabled':'')+'>本次运行禁用</button>':'<button class="ghost" type="button" disabled>不可删除</button>';
     return '<div class="invalid-auth-row'+rowClass+loginBusy+'" data-key="'+esc(key)+'" data-action-kind="'+esc(actionKind)+'">'+
       '<label class="invalid-auth-check"><input type="checkbox" data-invalid-check="'+esc(key)+'"'+checked+((invalidAuthDeleting||!actionableRow)?' disabled':'')+'></label>'+
       '<div class="invalid-auth-main"><b title="'+esc(accountName(r))+'">'+esc(accountName(r))+'</b><span title="'+esc(sourceText)+'">'+esc(sourceText)+'</span></div>'+
@@ -898,6 +910,7 @@ function pagedWorkspaceDeactivatedRows(){
 }
 function renderWorkspaceDeactivatedModal(){
   const page=pagedWorkspaceDeactivatedRows();
+  if(renderNativeLifecycleModal('workspace-deactivated',page,workspaceDeactivatedPage,'管理 402 工作区失效账号'))return;
   const rows=page.rows;
   const xai=isXAIPool();
   document.getElementById('workspace-deactivated-title').textContent=xai?'xAI 权限拒绝账号':'管理 402 工作区失效账号';
@@ -960,6 +973,7 @@ function pagedAutobanReleaseRows(){
 }
 function renderAutobanReleaseModal(){
   const page=pagedAutobanReleaseRows();
+  if(renderNativeLifecycleModal('autoban-release',page,autobanReleasePage,'管理 429 禁用账号'))return;
   const rows=page.rows;
   const xai=isXAIPool();
   document.getElementById('autoban-release-title').textContent=xai?'xAI 429 状态':'管理 429 禁用账号';
@@ -2519,8 +2533,8 @@ function isInvalidAuthBan(r){const w=String(r&&r.window||'').toLowerCase();const
 function isWorkspaceDeactivatedBan(r){return String(r&&r.window||'').toLowerCase()==='402'||Number(r&&r.last_status_code)===402}
 function is429Autoban(r){const w=String(r&&r.window||'').toLowerCase();const code=Number(r&&r.last_status_code);if(w==='401'||w==='402'||w==='403'||code===401||code===402||code===403)return false;return code===429||['429','5h','primary','7d','week','secondary'].includes(w)}
 function isPermanentAuthBan(r){return isInvalidAuthBan(r)||isWorkspaceDeactivatedBan(r)}
-function autobanResetText(r){return isWorkspaceDeactivatedBan(r)?'删除或替换认证文件后解除':isInvalidAuthBan(r)?'重新登录后解除':(r.reset_at_text||'-')}
-function autobanRemainingText(r){return isPermanentAuthBan(r)?'需处理':duration(r.seconds_remaining)}
+function autobanResetText(r){if(r.lifecycle){const s=r.lifecycle;if(!s.disabled)return s.pending_action==='disable'?'等待禁用确认':'尚未禁用';if(!s.disabled_by_plugin||s.paused)return '需人工复查后启用';if(isPermanentAuthBan(r))return '处理认证后复查并启用';return s.recover_at?(r.reset_at_text||new Date(s.recover_at*1000).toLocaleString()):'等待查询额度恢复时间'}return isWorkspaceDeactivatedBan(r)?'删除或替换认证文件后解除':isInvalidAuthBan(r)?'重新登录后解除':(r.reset_at_text||'-')}
+function autobanRemainingText(r){if(r.lifecycle){const s=r.lifecycle;if(!s.disabled)return '待禁用';if(!s.disabled_by_plugin||s.paused||isPermanentAuthBan(r))return '需处理';if(!s.recover_at)return '待查询';const seconds=Math.max(0,Number(s.recover_at)-Math.floor(Date.now()/1000));return seconds?duration(seconds):'等待启用确认'}return isPermanentAuthBan(r)?'需处理':duration(r.seconds_remaining)}
 function fmtLatencyMs(ms){ms=Number(ms||0); if(!ms)return '—'; if(ms>=1000)return (ms/1000).toFixed(1)+'s'; return Math.round(ms)+'ms'}
 function latencyTone(ms){ms=Number(ms||0); return ms>=12000?'slow':ms>0?'fast':''}
 function reliableThroughputSample(r){const latency=Number(r.latency_ms||0),ttft=Number(r.ttft_ms||0),ms=Math.max(latency,ttft),out=Number(r.output_tokens||0); return out>0&&ms>=1000&&!(latency===ttft&&out>=1000&&ms<5000)}
@@ -2600,6 +2614,13 @@ async function fetchSummary(win,key,forceRefresh=false,syncRefresh=false,signal=
 }
 function isXAIPool(){return activePage==='xai'}
 function xaiStateLabel(state){return state==='unauthorized'?'401 失效':state==='forbidden'?'403 拒绝':state==='free_usage_exhausted'?'免费额度耗尽':state==='rate_limited'?'短期限流':state||'-'}
+function isNativeLifecycle(){return !isXAIPool()&&((lastData||{}).auth_controller||{}).scheduling_mode==='native'}
+function nativeLifecycleRows(){return ((lastData||{}).autobans||[]).filter(r=>r.lifecycle)}
+function lifecycleCurrentState(r){const s=r&&r.lifecycle||{};return s.state==='MANUAL_DISABLED'&&s.blocked_state?s.blocked_state:s.state}
+function lifecycleAuthInvalid(r){return lifecycleCurrentState(r)==='AUTH_INVALID'}
+function lifecycleWorkspaceBlocked(r){return lifecycleCurrentState(r)==='BILLING_BLOCKED'}
+function lifecycleRateLimited(r){return ['QUOTA_COOLDOWN','RATE_LIMITED'].includes(lifecycleCurrentState(r))}
+function lifecycleRisk(r){const s=r&&r.lifecycle;if(!s)return false;return s.state!=='HEALTHY'||Boolean(s.paused||s.pending_action||s.sync_error)||(s.sync_status&&s.sync_status!=='synced')}
 function poolData(source){
   const data=source||lastData||{};
   if(!isXAIPool())return {totals:data.totals||{},accounts:data.accounts||[],models:data.models||[],trend:data.trend||[],recent:data.recent||[],autobans:data.autobans||[],forbidden_auths:data.forbidden_auths||[],quota_trigger:data.quota_trigger||{},provider:'codex'};
@@ -2633,7 +2654,11 @@ function renderPoolPage(source){
   let lifecycleBanner=document.getElementById('lifecycle-banner');
   if(!lifecycleBanner){lifecycleBanner=document.createElement('p');lifecycleBanner.id='lifecycle-banner';document.getElementById('pool-hero-hint').after(lifecycleBanner)}
   lifecycleBanner.hidden=data.provider==='xai';
-  lifecycleBanner.textContent=controller.scheduling_mode==='native'?'Native · CPA 原生调度；Token 统计/告警保留，插件并发硬限制及 Token 降级未执行。'+(controller.management_configured?'':' 自动启停未配置：需要 Management URL / KEY 环境变量。')+(controller.last_error?' '+controller.last_error:''):'Legacy · 插件调度与原有账号保护。';
+  const recent401=((source&&source.recent)||[]).filter(r=>Number(r.status_code)===401).length;
+  const managementConfig=controller.management_config||{};
+  const missing=(managementConfig.missing_fields||[]).join(' / ');
+  lifecycleBanner.className=controller.scheduling_mode==='native'&&(!controller.management_configured||controller.last_error)?'lifecycle-danger':'lifecycle-ok';
+  lifecycleBanner.textContent=controller.scheduling_mode==='native'?'Native · CPA 原生调度；Token 统计/告警保留，插件并发硬限制及 Token 降级未执行。'+(controller.management_configured?' 自动启停已配置。':(' 危险：账号状态写入不可用'+(recent401?('；最近列表已有 '+recent401+' 条 401，但无法自动禁用。'):'。')+' 请在插件配置中填写 management_url / management_key，或设置同名环境变量。'+(missing?(' 缺少：'+missing+'。'):'')))+(controller.last_error?' 控制器错误：'+controller.last_error:''):'Legacy · 插件调度与原有账号保护。';
 
   document.getElementById('m-requests').textContent=fmt(t.requests);
   document.getElementById('m-success').textContent='成功率 '+pct(ratio(okReq,t.requests));
@@ -2648,7 +2673,8 @@ function renderPoolPage(source){
   document.getElementById('m-cache').textContent=compact(cache);
   document.getElementById('m-cache-share').textContent='缓存率 '+pct(cacheRate(t))+' · 占总 '+pct(ratio(cache,total));
   document.getElementById('m-429').textContent=fmt(t.rate_limited);
-  document.getElementById('m-bans').textContent=fmt(data.autobans.length);
+  const nativeDisabled=isNativeLifecycle()?data.autobans.filter(r=>r.lifecycle&&r.lifecycle.disabled).length:data.autobans.length;
+  document.getElementById('m-bans').textContent=fmt(nativeDisabled);
   document.getElementById('m-accounts').textContent=fmt((data.accounts||[]).length);
   document.getElementById('m-7d-remaining').textContent=quotaValue(t.secondary_quota_remaining_estimate);
   document.getElementById('m-7d-remaining-sub').textContent=(t.secondary_quota_estimated_accounts||0)>0?'覆盖 '+fmt(t.secondary_quota_estimated_accounts)+' 个账号 · 总额 '+quotaValue(t.secondary_quota_total_estimate):'等待窗口 2 额度快照';
@@ -2819,7 +2845,7 @@ function bindTrendTooltip(svg,points,cfg){
 function renderAccounts(){
   const data=poolData(); const total=(data.totals||{}).total_tokens||0; const q=(document.getElementById('account-filter').value||'').toLowerCase(); const sort=document.getElementById('account-sort').value;
   let rows=(data.accounts||[]).filter(r=>(r.auth_index+' '+r.auth_id+' '+r.source+' '+r.provider+' '+r.email+' '+r.name+' '+r.auth_file+' '+r.chatgpt_account_id+' '+r.plan_type+' '+r.xai_tier+' '+r.xai_tier_source+' '+r.invalid_auth_reason+' '+r.workspace_deactivated_reason+' '+r.xai_state+' '+r.xai_state_reason+' '+r.external_use_reason+' '+r.quota_trigger_status+' '+r.quota_trigger_error).toLowerCase().includes(q));
-  rows.sort((a,b)=>sort==='cost'?(b.cost_usd||0)-(a.cost_usd||0):sort==='quotaRemain'?quotaRemainingSortValue(a)-quotaRemainingSortValue(b):sort==='quotaTotal'?quotaTotalSortValue(b)-quotaTotalSortValue(a):sort==='latency'?(b.avg_latency_ms||0)-(a.avg_latency_ms||0):sort==='invalid'?(Number(!!b.invalid_auth&&is401InvalidAuthRow(b))-Number(!!a.invalid_auth&&is401InvalidAuthRow(a)))||Date.parse(b.invalid_auth_at||0)-Date.parse(a.invalid_auth_at||0):sort==='workspace'?(Number(!!b.workspace_deactivated)-Number(!!a.workspace_deactivated))||Date.parse(b.workspace_deactivated_at||0)-Date.parse(a.workspace_deactivated_at||0):sort==='external'?(Number(!!b.external_use_suspected)-Number(!!a.external_use_suspected))||((b.external_use_delta_percent||0)-(a.external_use_delta_percent||0)):sort==='trigger'?triggerSortScore(b)-triggerSortScore(a):sort==='quota'?maxQuota(b)-maxQuota(a):sort==='cache'?cacheRate(b)-cacheRate(a):sort==='429'?(b.rate_limited||0)-(a.rate_limited||0):sort==='success'?successRate(a)-successRate(b):sort==='recent'?Date.parse(b.last_seen||0)-Date.parse(a.last_seen||0):(b.total_tokens||0)-(a.total_tokens||0));
+  rows.sort((a,b)=>sort==='cost'?(b.cost_usd||0)-(a.cost_usd||0):sort==='quotaRemain'?quotaRemainingSortValue(a)-quotaRemainingSortValue(b):sort==='quotaTotal'?quotaTotalSortValue(b)-quotaTotalSortValue(a):sort==='latency'?(b.avg_latency_ms||0)-(a.avg_latency_ms||0):sort==='invalid'?(Number(lifecycleAuthInvalid(b)||!!b.invalid_auth&&is401InvalidAuthRow(b))-Number(lifecycleAuthInvalid(a)||!!a.invalid_auth&&is401InvalidAuthRow(a)))||Date.parse(b.invalid_auth_at||0)-Date.parse(a.invalid_auth_at||0):sort==='workspace'?(Number(lifecycleWorkspaceBlocked(b)||!!b.workspace_deactivated)-Number(lifecycleWorkspaceBlocked(a)||!!a.workspace_deactivated))||Date.parse(b.workspace_deactivated_at||0)-Date.parse(a.workspace_deactivated_at||0):sort==='external'?(Number(!!b.external_use_suspected)-Number(!!a.external_use_suspected))||((b.external_use_delta_percent||0)-(a.external_use_delta_percent||0)):sort==='trigger'?triggerSortScore(b)-triggerSortScore(a):sort==='quota'?maxQuota(b)-maxQuota(a):sort==='cache'?cacheRate(b)-cacheRate(a):sort==='429'?(b.rate_limited||0)-(a.rate_limited||0):sort==='success'?successRate(a)-successRate(b):sort==='recent'?Date.parse(b.last_seen||0)-Date.parse(a.last_seen||0):(b.total_tokens||0)-(a.total_tokens||0));
   const allCount=(data.accounts||[]).length;
   const pages=Math.max(1,Math.ceil(rows.length/accountPageSize));
   accountPage=Math.max(1,Math.min(accountPage,pages));
@@ -2828,11 +2854,14 @@ function renderAccounts(){
   const externalCount=rows.filter(r=>r.external_use_suspected).length;
   const allInvalidRows=invalidAuthRows();
   const allWorkspaceRows=workspaceDeactivatedRows();
-  const invalidCount=allInvalidRows.length;
-  const workspaceDeactivatedCount=allWorkspaceRows.length;
-  const active429Count=autobanReleaseRows().length;
+  const controller=(lastData&&lastData.auth_controller)||{};
+  const nativeLifecycle=controller.scheduling_mode==='native'&&!isXAIPool();
+  const lifecycleAccounts=nativeLifecycleRows();
+  const invalidCount=nativeLifecycle?lifecycleAccounts.filter(lifecycleAuthInvalid).length:allInvalidRows.length;
+  const workspaceDeactivatedCount=nativeLifecycle?lifecycleAccounts.filter(lifecycleWorkspaceBlocked).length:allWorkspaceRows.length;
+  const active429Count=nativeLifecycle?lifecycleAccounts.filter(lifecycleRateLimited).length:autobanReleaseRows().length;
   const triggerFailed=rows.filter(r=>r.quota_trigger_status&&r.quota_trigger_status!=='success'&&r.quota_trigger_status!=='skipped').length;
-  const riskCount=rows.filter(r=>findBan(r)||r.invalid_auth||r.workspace_deactivated||r.xai_state||r.external_use_suspected||r.disabled||r.expired||r.waiting_runtime_load||triggerRisk(r)||maxQuota(r)>=90||((r.requests||0)>0&&successRate(r)<80)).length;
+  const riskCount=rows.filter(r=>findBan(r)||r.invalid_auth||r.workspace_deactivated||r.xai_state||r.external_use_suspected||r.disabled||r.expired||r.waiting_runtime_load||lifecycleRisk(r)||triggerRisk(r)||maxQuota(r)>=90||((r.requests||0)>0&&successRate(r)<80)).length;
   const quotaHot=[...rows].sort((a,b)=>maxQuota(b)-maxQuota(a))[0];
   const lowCache=[...rows].filter(r=>(r.input_tokens||0)>0).sort((a,b)=>cacheRate(a)-cacheRate(b))[0];
   const authDiag=lastData&&lastData.diagnostics&&lastData.diagnostics.codex_auth||{};
@@ -2878,15 +2907,28 @@ function triggerRisk(r){return r.quota_trigger_status&&r.quota_trigger_status!==
 function triggerSortScore(r){return triggerRisk(r)?3:(r.quota_trigger_status==='skipped'?2:(r.quota_trigger_status==='success'?1:0))}
 function lifecycleStatus(s){
   const labels={HEALTHY:'Healthy / 健康',AUTH_INVALID:'Login Required / 需要登录',QUOTA_COOLDOWN:'Quota Cooldown / 额度冷却',RATE_LIMITED:'Rate Limited / 短期限流',BILLING_BLOCKED:'Billing Blocked / 账单受限',PERMISSION_BLOCKED:'Permission Issue / 权限问题',MANUAL_DISABLED:'Manually Disabled / 人工禁用'};
+  const label=(s.disabled?'已禁用 · ':s.pending_action==='disable'?'待禁用 · ':'')+(!s.disabled&&s.paused&&s.disable_reason==='external_enable'?'Externally Enabled / 外部启用，待复查':(labels[s.state]||s.state));
   const remaining=Math.max(0,Number(s.recover_at||0)-Math.floor(Date.now()/1000));
   const details=['disabled='+Boolean(s.disabled),s.disabled_by_plugin?'插件禁用':'无自动恢复所有权',s.disable_reason||'',s.disabled_at?'禁用于 '+new Date(s.disabled_at*1000).toLocaleString():'',s.recover_at?'Recover at '+new Date(s.recover_at*1000).toLocaleString()+' ('+remaining+'s)':'',s.last_http_status?'HTTP '+s.last_http_status:'',s.last_error_message||'',s.sync_status||'',s.sync_error||''].filter(Boolean).join(' · ');
   let buttons='';
   for(const pair of [['recheck','Recheck'],['enable','Enable'],['disable','Disable'],['clear','Clear plugin state']])buttons+='<button type="button" class="btn" data-lifecycle-action="'+pair[0]+'" data-auth-index="'+esc(s.auth_index)+'" data-version="'+Number(s.version)+'">'+pair[1]+'</button> ';
-  return '<span class="status-pill '+(s.state==='HEALTHY'&&!s.paused?'ok':'warn')+'">'+esc(labels[s.state]||s.state)+'</span><details><summary>状态与操作</summary><div>'+esc(details)+'</div>'+buttons+'</details>';
+  return '<span class="status-pill '+(s.state==='HEALTHY'&&!s.paused?'ok':'warn')+'">'+esc(label)+'</span><details><summary>状态与操作</summary><div>'+esc(details)+'</div>'+buttons+'</details>';
+}
+function renderNativeLifecycleModal(prefix,page,pageNumber,title){
+  if(!isNativeLifecycle())return false;
+  document.getElementById(prefix+'-title').textContent=title;
+  for(const suffix of ['-delete-all','-select-page','-delete-selected','-all','-selected']){const el=document.getElementById(prefix+suffix);if(el)el.hidden=true}
+  document.getElementById(prefix+'-summary').textContent='共 '+page.rows.length+' 个账号';
+  document.getElementById(prefix+'-page-label').textContent=pageNumber+' / '+page.pages;
+  document.getElementById(prefix+'-prev').disabled=pageNumber<=1;
+  document.getElementById(prefix+'-next').disabled=pageNumber>=page.pages;
+  document.getElementById(prefix+'-status').textContent='已禁用与待禁用账号同步显示；429 到期自动启用，401/402 处理认证后复查并启用。';
+  document.getElementById(prefix+'-list').innerHTML=page.pageRows.map(r=>'<div class="lifecycle-management-row"><b>'+esc(accountName(r))+'</b><div>'+esc(r.auth_index)+' · '+esc(autobanResetText(r))+' · '+esc(autobanRemainingText(r))+'</div>'+lifecycleStatus(r.lifecycle)+'</div>').join('')||'<div class="invalid-auth-empty">当前没有此类账号。</div>';
+  return true;
 }
 document.addEventListener('click',async event=>{
   const button=event.target.closest('[data-lifecycle-action]');if(!button)return;
-  const row=((lastData||{}).accounts||[]).find(r=>r.lifecycle&&r.lifecycle.auth_index===button.dataset.authIndex);if(!row)return;
+  const row=[...((lastData||{}).accounts||[]),...nativeLifecycleRows()].find(r=>r.lifecycle&&r.lifecycle.auth_index===button.dataset.authIndex);if(!row)return;
   const action=button.dataset.lifecycleAction;
   const modelProbe=action==='recheck'&&(row.lifecycle.blocked_state==='BILLING_BLOCKED'||row.lifecycle.blocked_state==='PERMISSION_BLOCKED');
   const message=modelProbe?'Recheck 将发送一次真实极小 Codex 模型请求，可能消耗少量额度，且不会自动启用账号。继续？':action==='clear'?'仅清理插件管理所有权，不会启用账号；该账号不再自动恢复。继续？':action==='enable'?'确认通过 CPA API 启用当前账号？':action==='disable'?'确认人工禁用当前账号？插件不会自动恢复。':'执行只读额度/认证 Recheck？不会自动启用账号。';
@@ -3013,7 +3055,7 @@ function renderKeySummaries(rows){
 }
 function costCell(r){return r.cost_available||Number(r.cost_usd||0)>0?'<span class="'+(r.cost_available?'ok':'muted')+'">'+money(r.cost_usd)+'</span>':'<span class="muted">缺价格</span>'}
 function renderInsights(data){
-  const accounts=[...(data.accounts||[])]; const t=data.totals||{}; const total=t.total_tokens||0; const bans=data.autobans||[];
+  const accounts=[...(data.accounts||[])]; const t=data.totals||{}; const total=t.total_tokens||0; const nativeLifecycle=((lastData||{}).auth_controller||{}).scheduling_mode==='native'; const bans=nativeLifecycle?(data.autobans||[]).filter(r=>r.lifecycle&&r.lifecycle.disabled):(data.autobans||[]);
   if(data.provider==='xai'){
     const top=accounts[0]; const unauthorized=accounts.find(r=>r.xai_state==='unauthorized'); const forbidden=accounts.find(r=>r.xai_state==='forbidden'); const exhausted=accounts.find(r=>r.xai_state==='free_usage_exhausted'); const limited=accounts.find(r=>r.xai_state==='rate_limited'); const noisy=[...accounts].sort((a,b)=>(b.rate_limited||0)-(a.rate_limited||0))[0];const tierCounts={free:0,super:0,heavy:0};accounts.forEach(r=>{const tier=String(r.xai_tier||'free').toLowerCase();tierCounts[tier]=(tierCounts[tier]||0)+1});
     const items=[
@@ -3030,13 +3072,13 @@ function renderInsights(data){
     return;
   }
   const forbiddenRows=(data.forbidden_auths||[]).map(row=>Object.assign({},accounts.find(account=>sameStableAuthIdentity(row,account))||{},row));
-  const top=accounts[0]; const quota=[...accounts].sort((a,b)=>maxQuota(b)-maxQuota(a))[0]; const lowCache=[...accounts].filter(r=>(r.input_tokens||0)>0).sort((a,b)=>cacheRate(a)-cacheRate(b))[0]; const noisy=[...accounts].sort((a,b)=>(b.rate_limited||0)-(a.rate_limited||0))[0]; const external=[...accounts].filter(r=>r.external_use_suspected).sort((a,b)=>(b.external_use_delta_percent||0)-(a.external_use_delta_percent||0))[0]; const invalid=[...accounts].filter(r=>r.invalid_auth&&is401InvalidAuthRow(r))[0]; const forbidden=forbiddenRows[0]||[...accounts].filter(r=>r.invalid_auth&&Number(r.invalid_auth_status_code)===403)[0]; const workspace=[...accounts].filter(r=>r.workspace_deactivated)[0];
+  const top=accounts[0]; const quota=[...accounts].sort((a,b)=>maxQuota(b)-maxQuota(a))[0]; const lowCache=[...accounts].filter(r=>(r.input_tokens||0)>0).sort((a,b)=>cacheRate(a)-cacheRate(b))[0]; const noisy=[...accounts].sort((a,b)=>(b.rate_limited||0)-(a.rate_limited||0))[0]; const external=[...accounts].filter(r=>r.external_use_suspected).sort((a,b)=>(b.external_use_delta_percent||0)-(a.external_use_delta_percent||0))[0]; const invalid=[...accounts].filter(r=>lifecycleAuthInvalid(r)||(r.invalid_auth&&is401InvalidAuthRow(r)))[0]; const forbidden=forbiddenRows[0]||[...accounts].filter(r=>(r.lifecycle&&(r.lifecycle.state==='PERMISSION_BLOCKED'||r.lifecycle.blocked_state==='PERMISSION_BLOCKED'))||(r.invalid_auth&&Number(r.invalid_auth_status_code)===403))[0]; const workspace=[...accounts].filter(r=>lifecycleWorkspaceBlocked(r)||r.workspace_deactivated)[0];
   const qt=data.quota_trigger||{}; const triggerLine=qt.enabled?('最近 '+fmt(qt.last_success||0)+' 成功 / '+fmt(qt.last_failed||0)+' 失败 / '+fmt(qt.last_skipped||0)+' 跳过'):'默认关闭';
   const items=[
     ['Token 集中度',top?accountName(top):'-',top?'Top 占 '+pct(ratio(top.total_tokens,total)):'暂无账号',ratio(top?.total_tokens||0,total)>50?'tone-orange':''],
     ['额度触发',qt.enabled?((qt.mode||'probe')+' · '+(qt.interval_minutes||10)+'m'):'已关闭',triggerLine,qt.last_failed?'tone-orange':qt.enabled?'tone-green':''],
     ['自动禁用',fmt(bans.length)+' 个账号',bans.length?'429 等待 reset_at，401/402 需处理认证文件':'当前没有自动禁用',bans.length?'tone-red':'tone-green'],
-    ['401 失效',invalid?accountName(invalid):'0 个账号',invalid?'已停止使用，替换或删除 json 后解除':'当前没有失效 json',invalid?'tone-red':'tone-green'],
+    ['401 失效',invalid?accountName(invalid):'0 个账号',invalid?(invalid.lifecycle&&!invalid.lifecycle.disabled?'已识别；当前尚未禁用，请检查控制器配置':'已停止使用，重新登录后 Recheck / Enable'):'当前没有认证失效',invalid?'tone-red':'tone-green'],
     ['403 拒绝',forbidden?accountName(forbidden):'0 个账号',forbidden?'权限被拒绝，需检查账号权限或认证':'当前没有权限拒绝',forbidden?'tone-red':'tone-green'],
     ['402 工作区',workspace?accountName(workspace):'0 个账号',workspace?'Team 工作区失效，删除或替换 json 后解除':'当前没有工作区失效',workspace?'tone-orange':'tone-green'],
     ['外部消耗',external?accountName(external):'0 个账号',external?external.external_use_window+' +'+pct(external.external_use_delta_percent)+' · 本地 '+compact(external.external_use_local_tokens)+' tok':'未发现一号多卖迹象',external?'tone-red':'tone-green'],
@@ -3068,7 +3110,7 @@ function renderAutobans(rows){
   document.getElementById('autoban-next').disabled=autobanPage>=pages;
   const heads=document.getElementById('autobans').closest('table').querySelectorAll('thead th'); if(heads[4])heads[4].textContent=isXAIPool()?'检测时间':'封禁时间'; if(heads[5])heads[5].textContent=isXAIPool()?'恢复时间':'解禁时间'; if(heads[7])heads[7].textContent=isXAIPool()?'HTTP':'窗口 1'; if(heads[8])heads[8].textContent=isXAIPool()?'类型':'窗口 2';
   document.getElementById('autobans').innerHTML=pageRows.map(r=>'<tr>'+
-    td(esc(r.source||r.auth_id||'-'))+td(esc(r.auth_index||'-'))+td(esc(r.window||'-'))+td(esc(r.reason||'-'))+
+    td(esc(r.source||r.auth_id||'-'))+td(esc(r.auth_index||'-'))+td(esc(r.window||'-'))+td(r.lifecycle?lifecycleStatus(r.lifecycle):esc(r.reason||'-'),r.lifecycle?'lifecycle-state-cell':'')+
     td(esc(r.banned_at_text||'-'))+td(esc(isXAIPool()?r.reset_at_text:autobanResetText(r)))+td(esc(isXAIPool()?(Number(r.seconds_remaining)>=0?duration(r.seconds_remaining):'需处理'):autobanRemainingText(r)),'num')+
     td(isXAIPool()?fmt(r.last_status_code||0):pct(r.primary_used_percent),'num')+td(isXAIPool()?esc(xaiStateLabel(r.state)):pct(r.secondary_used_percent),'num')+'</tr>').join('') || '<tr><td colspan="9" class="muted">'+(isXAIPool()?'当前没有 xAI 异常账号':'当前没有被自动禁用的 Codex 账号')+'</td></tr>';
 }
@@ -3077,7 +3119,7 @@ function renderModels(target,rows){
 }
 function renderRecent(target,rows,mode){
   document.getElementById(target).innerHTML=rows.map(r=>{
-    const who=mode==='provider'?firstText(r.provider,r.source,r.auth_index,'unknown'):firstText(r.auth_index,r.source,'unknown');
+    const who=[r.provider,r.auth_index,r.source].map(v=>String(v||'').trim()).filter((v,i,all)=>v&&all.indexOf(v)===i).join(' / ')||'unknown';
     const model=firstText(r.alias,r.model,'-');
     const cache=cacheTokens(r),cacheWrite=cacheWriteTokens(r);
     const price=r.cost_available||Number(r.cost_usd||0)>0?'<span class="cost-pill">'+money(r.cost_usd)+'</span>':'<span class="cost-weak">缺价格</span>';

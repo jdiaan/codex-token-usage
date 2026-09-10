@@ -66,6 +66,91 @@ func TestNativeLateFailureAfterExternalEnable(t *testing.T) {
 	}
 }
 
+func TestNativeRuntimeRefreshInvalidationIsolatesWithoutUsageEvent(t *testing.T) {
+	c, host, _ := nativeTestController(t)
+	snapshot := host.accounts["a"]
+	snapshot.Entry.Status = "error"
+	snapshot.Entry.StatusMessage = `Token refresh attempt 3 failed: {"error":{"message":"Your session has ended. Please log in again.","code":"refresh_token_invalidated"}}`
+	snapshot.Entry.Unavailable = true
+	host.accounts["a"] = snapshot
+
+	c.reconcile(context.Background())
+	s := lifecycleStateForTest(t, c, "a")
+	if !host.accounts["a"].Entry.Disabled || !s.DisabledByPlugin || s.State != authInvalid || s.LastHTTPStatus != http.StatusUnauthorized || s.LastErrorCode != "refresh_token_invalidated" {
+		t.Fatalf("runtime refresh failure was not isolated: %+v", s)
+	}
+	db, _, err := c.store.open(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var events int
+	if err = db.QueryRow(`SELECT count(*) FROM auth_lifecycle_events WHERE auth_index='a'`).Scan(&events); err != nil {
+		t.Fatal(err)
+	}
+	if events != 0 {
+		t.Fatalf("runtime-only failure unexpectedly required a Usage event: %d", events)
+	}
+	var raw string
+	if err = db.QueryRow(`SELECT payload FROM auth_lifecycle_states WHERE auth_index='a'`).Scan(&raw); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(raw, "session has ended") || strings.Contains(raw, "Token refresh attempt") {
+		t.Fatal("raw runtime error was persisted")
+	}
+}
+
+func TestNativeRuntimeRefreshClassifierIgnoresTransientErrors(t *testing.T) {
+	for _, entry := range []hostAuthFileEntry{
+		{Status: "error", StatusMessage: "token refresh temporarily unavailable", Unavailable: true},
+		{Status: "active", StatusMessage: "", Unavailable: false},
+	} {
+		if decision, terminal := classifyRuntimeAuthFailure(entry); terminal || decision.Disable {
+			t.Fatalf("transient runtime error classified as terminal: %+v", decision)
+		}
+	}
+}
+
+func TestNativeExternalEnableClearsManualDisabledState(t *testing.T) {
+	c, host, _ := nativeTestController(t)
+	s := lifecycleStateForTest(t, c, "a")
+	if _, err := c.action(context.Background(), lifecycleActionRequest{AuthIndex: "a", Version: s.Version, Action: "disable"}); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := host.accounts["a"]
+	snapshot.Entry.Disabled = false
+	snapshot.FileDisabled = false
+	host.accounts["a"] = snapshot
+
+	c.reconcile(context.Background())
+	s = lifecycleStateForTest(t, c, "a")
+	if s.State != authHealthy || s.Disabled || !s.Paused || s.SyncStatus != "conflict" || s.Reason != "external_enable" {
+		t.Fatalf("external enable left a stale manual-disabled state: %+v", s)
+	}
+}
+
+func TestNativeRepairsPersistedManualDisabledAfterExternalEnable(t *testing.T) {
+	c, _, _ := nativeTestController(t)
+	db, _, err := c.store.open(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := lifecycleStateForTest(t, c, "a")
+	s.State = authManualDisabled
+	s.Disabled = false
+	s.Paused = true
+	s.Reason = "manual_disabled"
+	s.SyncStatus = "conflict"
+	if err = saveLifecycleState(context.Background(), db, &s, c.clock.Now(), "legacy_stale_state"); err != nil {
+		t.Fatal(err)
+	}
+
+	c.reconcile(context.Background())
+	s = lifecycleStateForTest(t, c, "a")
+	if s.State != authHealthy || s.Reason != "external_enable" || !s.Paused {
+		t.Fatalf("persisted stale manual-disabled state was not repaired: %+v", s)
+	}
+}
+
 func TestLifecycleEventRetryColumnMigration(t *testing.T) {
 	c, _, _ := nativeTestController(t)
 	ctx := context.Background()
@@ -229,6 +314,58 @@ func TestNativeDefaultAndInvalidMode(t *testing.T) {
 	raw, _ := json.Marshal(lifecycleRequest{ConfigYAML: json.RawMessage(`"scheduling_mode: invalid"`)})
 	if err := configurePlugin(raw); err == nil || !strings.Contains(err.Error(), "scheduling_mode") {
 		t.Fatal("invalid mode accepted")
+	}
+}
+
+func TestManagementConfigFieldsAndEnvironmentPrecedence(t *testing.T) {
+	fields := pluginConfigFields()
+	seen := map[string]bool{}
+	for _, field := range fields {
+		seen[field.Name] = true
+	}
+	if !seen["management_url"] || !seen["management_key"] {
+		t.Fatalf("management fields missing from plugin registration: %+v", seen)
+	}
+
+	cfg := parsePluginConfigYAML([]byte("management_url: http://127.0.0.1:8317\nmanagement_key: plugin-secret\nFree 5 分钟 Token 上限: 12345\n"), defaultPluginConfig())
+	if cfg.ManagementURL != "http://127.0.0.1:8317" || cfg.ManagementKey != "plugin-secret" {
+		t.Fatalf("management plugin config was not parsed: url=%q key=%q", cfg.ManagementURL, cfg.ManagementKey)
+	}
+	if cfg.AccountProtectionFreeTokenLimit != 12345 {
+		t.Fatalf("config key containing spaces was ignored: %d", cfg.AccountProtectionFreeTokenLimit)
+	}
+
+	t.Setenv("CPA_TOKEN_USAGE_MANAGEMENT_URL", "")
+	t.Setenv("CPA_TOKEN_USAGE_MANAGEMENT_KEY", "")
+	client := newManagementAuthClient(cfg)
+	if !client.Ready() || client.baseURL != cfg.ManagementURL || client.key != cfg.ManagementKey {
+		t.Fatalf("plugin config did not configure management client: ready=%v url=%q", client.Ready(), client.baseURL)
+	}
+	t.Setenv("CPA_TOKEN_USAGE_MANAGEMENT_URL", "http://127.0.0.1:9999/")
+	t.Setenv("CPA_TOKEN_USAGE_MANAGEMENT_KEY", "environment-secret")
+	client = newManagementAuthClient(cfg)
+	if client.baseURL != "http://127.0.0.1:9999" || client.key != "environment-secret" {
+		t.Fatalf("environment did not override plugin config: url=%q", client.baseURL)
+	}
+	status := managementAuthConfigStatus(cfg)
+	if status["url_source"] != "environment" || status["key_source"] != "environment" {
+		t.Fatalf("management source status = %+v", status)
+	}
+	encoded, _ := json.Marshal(status)
+	if strings.Contains(string(encoded), "secret") {
+		t.Fatalf("management status leaked a key: %s", encoded)
+	}
+}
+
+func TestCodexLifecycleAcceptsExecutorWhenProviderIsEmpty(t *testing.T) {
+	if !isCodexUsage(usageRecord{ExecutorType: "codex", AuthType: "oauth"}) {
+		t.Fatal("Codex executor usage was ignored when Provider was empty")
+	}
+	if !isCodexUsage(usageRecord{ExecutorType: "openai-codex-executor", AuthType: "oauth"}) {
+		t.Fatal("Codex executor variant was ignored")
+	}
+	if isCodexUsage(usageRecord{ExecutorType: "openai", AuthType: "oauth"}) {
+		t.Fatal("non-Codex executor was accepted")
 	}
 }
 

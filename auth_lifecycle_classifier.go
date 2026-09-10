@@ -38,7 +38,7 @@ func classifyAuthFailure(rec usageRecord, now time.Time) authDecision {
 	code, _ := e["code"].(string)
 	known := func(v string) string {
 		switch v {
-		case "usage_limit_reached", "rate_limit_exceeded", "model_not_allowed", "model_not_found", "model_access_denied", "permission_denied", "deactivated_workspace", "workspace_deactivated", "account_deactivated", "account_disabled", "workspace_disabled", "invalid_api_key", "invalid_token":
+		case "usage_limit_reached", "rate_limit_exceeded", "model_not_allowed", "model_not_found", "model_access_denied", "permission_denied", "deactivated_workspace", "workspace_deactivated", "account_deactivated", "account_disabled", "workspace_disabled", "invalid_api_key", "invalid_token", "refresh_token_invalidated":
 			return v
 		}
 		return ""
@@ -78,11 +78,6 @@ func classifyAuthFailure(rec usageRecord, now time.Time) authDecision {
 				d.RecoverAt = t
 			}
 		}
-		// An explicit short rate-limit classification is not quota exhaustion.
-		if strings.Contains(signal, "rate_limit_exceeded") {
-			quota = false
-			d.RecoverAt = 0
-		}
 		if quota {
 			d.State, d.Disable, d.Reason = authQuotaCooldown, true, "usage_limit_reached"
 			if reset, ok := lifecycleReset(e, now); ok && reset > d.RecoverAt {
@@ -92,7 +87,7 @@ func classifyAuthFailure(rec usageRecord, now time.Time) authDecision {
 				d.RecoverAt = 0
 			}
 		} else {
-			d.State, d.Reason = authRateLimited, "rate_limited"
+			d.State, d.Disable, d.Reason = authRateLimited, true, "rate_limited"
 			v := headerValue(rec.ResponseHeaders, "Retry-After")
 			if seconds, err := strconv.ParseInt(v, 10, 64); err == nil && seconds >= 0 && seconds < 31536000 {
 				d.RecoverAt = now.Unix() + seconds
@@ -104,11 +99,38 @@ func classifyAuthFailure(rec usageRecord, now time.Time) authDecision {
 					d.RecoverAt = now.Unix() + seconds
 				}
 			}
+			if reset, ok := lifecycleReset(e, now); ok && reset > d.RecoverAt {
+				d.RecoverAt = reset
+			}
+			if d.RecoverAt == 0 {
+				// A short local retry policy, not a claimed quota reset time.
+				d.RecoverAt = now.Add(time.Minute).Unix()
+				d.Reason = "rate_limit_backoff"
+			}
 		}
 	default:
 		d.Reason = "transient_failure"
 	}
 	return d
+}
+
+// CPA can reject an expired Codex credential while refreshing it before an
+// upstream request is dispatched. That path does not always produce a Usage
+// event, but the terminal error is exposed on the exact runtime auth entry.
+// Only consume the machine-readable terminal code; never infer a permanent
+// credential failure from generic status text or persist the provider message.
+func classifyRuntimeAuthFailure(entry hostAuthFileEntry) (authDecision, bool) {
+	signal := strings.ToLower(entry.StatusMessage)
+	if !strings.Contains(signal, "refresh_token_invalidated") {
+		return authDecision{}, false
+	}
+	return authDecision{
+		State:     authInvalid,
+		Disable:   true,
+		Reason:    "auth_invalid",
+		Status:    http.StatusUnauthorized,
+		ErrorCode: "refresh_token_invalidated",
+	}, true
 }
 
 func lifecycleReset(window map[string]any, now time.Time) (int64, bool) {

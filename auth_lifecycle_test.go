@@ -117,8 +117,8 @@ func TestNativeClassifier(t *testing.T) {
 		{"quota-relative", 429, `{"error":{"type":"usage_limit_reached","resets_in_seconds":3600}}`, authQuotaCooldown, true, false, now.Unix() + 3600},
 		{"quota-absolute", 429, `{"error":{"type":"usage_limit_reached","resets_at":2000000100}}`, authQuotaCooldown, true, false, 2000000100},
 		{"quota-unknown", 429, `{"error":{"type":"usage_limit_reached"}}`, authQuotaCooldown, true, false, 0},
-		{"rate", 429, `{"error":{"type":"rate_limit_exceeded","retry_after":30}}`, authRateLimited, false, false, now.Unix() + 30},
-		{"unknown429", 429, `{}`, authRateLimited, false, false, 0},
+		{"rate", 429, `{"error":{"type":"rate_limit_exceeded","retry_after":30}}`, authRateLimited, true, false, now.Unix() + 30},
+		{"unknown429", 429, `{}`, authRateLimited, true, false, now.Unix() + 60},
 		{"model403", 403, `{"error":{"code":"model_not_allowed"}}`, authHealthy, false, true, 0},
 		{"unknown403", 403, `{"error":{"message":"not allowed"}}`, authHealthy, false, true, 0},
 		{"workspace403", 403, `{"error":{"code":"deactivated_workspace"}}`, authPermissionBlocked, true, false, 0},
@@ -223,13 +223,13 @@ func TestNativeFieldMutationDoesNotOverwriteNewAuth(t *testing.T) {
 	}
 }
 
-func TestNativeNoGlobalDisableForModel403RateOr5xx(t *testing.T) {
+func TestNativeDisablesRateButNotModel403Or5xx(t *testing.T) {
 	c, host, _ := nativeTestController(t)
 	lifecycleFailure(t, c, "a", 403, `{"error":{"code":"model_not_allowed"}}`)
 	lifecycleFailure(t, c, "b", 429, `{"error":{"type":"rate_limit_exceeded","retry_after":30}}`)
 	lifecycleFailure(t, c, "c", 503, `{"error":{"message":"secret-token-not-for-storage"}}`)
-	if len(host.writes) != 0 {
-		t.Fatal("unexpected global disable")
+	if len(host.writes) != 1 || !host.accounts["b"].Entry.Disabled || host.accounts["a"].Entry.Disabled || host.accounts["c"].Entry.Disabled {
+		t.Fatal("only rate-limited auth should be disabled")
 	}
 	db, _, _ := c.store.open(context.Background())
 	var count int
