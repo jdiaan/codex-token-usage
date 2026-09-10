@@ -92,7 +92,7 @@ func TestSchedulerWithoutSessionKeepsRoundRobin(t *testing.T) {
 func TestProtectionAffinityPreservesSessionUntilConcurrencyLimit(t *testing.T) {
 	resetSchedulerSelectionState(t)
 	db := newProtectionTestDB(t)
-	cfg := defaultPluginConfig()
+	cfg := legacyPluginConfig()
 	cfg.AccountProtectionEnabled = true
 	cfg.AccountProtectionFreeConcurrency = 2
 	request := affinityTestRequest("protected-session")
@@ -116,7 +116,7 @@ func TestProtectionAffinityPreservesSessionUntilConcurrencyLimit(t *testing.T) {
 func TestProtectionTokenDemotionDoesNotMoveExistingSession(t *testing.T) {
 	resetSchedulerSelectionState(t)
 	db := newProtectionTestDB(t)
-	cfg := defaultPluginConfig()
+	cfg := legacyPluginConfig()
 	cfg.AccountProtectionEnabled = true
 	cfg.AccountProtectionFreeTokenLimit = 100
 	request := affinityTestRequest("token-sticky-session")
@@ -185,7 +185,7 @@ func TestCodexSchedulerKeepsSessionAfterFilteringUnavailableCandidate(t *testing
 	t.Setenv("CPA_TOKEN_USAGE_DIR", t.TempDir())
 	t.Setenv("CPA_CONFIG_PATH", filepath.Join(t.TempDir(), "missing-config.yaml"))
 	oldCfg := globalAccountProtection.config()
-	globalAccountProtection.configure(defaultPluginConfig())
+	globalAccountProtection.configure(legacyPluginConfig())
 	t.Cleanup(func() { globalAccountProtection.configure(oldCfg) })
 	s := &store{}
 	t.Cleanup(s.close)
@@ -232,7 +232,7 @@ func TestCodexSchedulerCanDisableSessionAffinity(t *testing.T) {
 	t.Setenv("CPA_TOKEN_USAGE_DIR", t.TempDir())
 	t.Setenv("CPA_CONFIG_PATH", filepath.Join(t.TempDir(), "missing-config.yaml"))
 	oldCfg := globalAccountProtection.config()
-	cfg := defaultPluginConfig()
+	cfg := legacyPluginConfig()
 	cfg.SchedulerSessionAffinityEnabled = false
 	globalAccountProtection.configure(cfg)
 	t.Cleanup(func() { globalAccountProtection.configure(oldCfg) })

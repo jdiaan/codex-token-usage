@@ -1,0 +1,231 @@
+package main
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"path"
+	"strings"
+	"time"
+)
+
+type lifecycleActionRequest struct {
+	AuthIndex         string `json:"auth_index"`
+	Version           int64  `json:"version"`
+	Action            string `json:"action"`
+	ConfirmModelProbe bool   `json:"confirm_model_probe"`
+	ProbeModel        string `json:"probe_model,omitempty"`
+}
+
+func handleLifecycleAction(req managementRequest) managementResponse {
+	if req.Method != http.MethodPost {
+		return jsonResponse(http.StatusMethodNotAllowed, map[string]any{"error": "method_not_allowed"})
+	}
+	var action lifecycleActionRequest
+	if json.Unmarshal(req.Body, &action) != nil || action.AuthIndex == "" || action.Version < 1 {
+		return jsonResponse(http.StatusBadRequest, map[string]any{"error": "auth_index and current version are required"})
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	s, err := globalAuthLifecycle.action(ctx, action)
+	if err != nil {
+		status := http.StatusBadGateway
+		if errors.Is(err, errLifecycleConflict) {
+			status = http.StatusConflict
+		}
+		if errors.Is(err, errLifecycleAction) {
+			status = http.StatusBadRequest
+		}
+		return jsonResponse(status, map[string]any{"error": err.Error()})
+	}
+	return jsonResponse(http.StatusOK, map[string]any{"account": s})
+}
+
+var errLifecycleAction = errors.New("invalid lifecycle action or required probe acknowledgement missing")
+
+func (c *authLifecycleController) action(ctx context.Context, req lifecycleActionRequest) (authLifecycleState, error) {
+	var s authLifecycleState
+	if err := lockMutexWithContext(ctx, &c.opMu); err != nil {
+		return s, err
+	}
+	defer c.opMu.Unlock()
+	if !tryAcquireQuotaProbeGate() {
+		return s, errors.New("quota operation in progress; retry after completion")
+	}
+	defer releaseQuotaProbeGate()
+	if c.host == nil {
+		return s, errors.New("lifecycle controller is not initialized")
+	}
+	db, _, err := c.store.open(ctx)
+	if err != nil {
+		return s, errors.New("lifecycle database unavailable")
+	}
+	s, err = loadLifecycleState(ctx, db, req.AuthIndex)
+	if err != nil {
+		return s, errors.New("account state unavailable")
+	}
+	if s.Version != req.Version {
+		return s, errLifecycleConflict
+	}
+	if req.Action == "clear" {
+		if s.PendingAction != "" {
+			return s, errors.New("pending status write must be reconciled before clearing ownership")
+		}
+		s.DisabledByPlugin = false
+		s.Paused = true
+		s.RecoverAt = 0
+		s.CheckOK = false
+		s.SyncStatus = "cleared"
+		s.SyncError = ""
+		s.IgnoreBefore = c.clock.Now().Unix()
+		if s.Disabled {
+			s.State = authManualDisabled
+		} else {
+			s.State = authHealthy
+		}
+		s.Reason = "manual_clear"
+		err = saveLifecycleState(ctx, db, &s, c.clock.Now(), "manual_clear")
+		return s, err
+	}
+	snapshot, err := c.host.Read(ctx, req.AuthIndex)
+	if err != nil {
+		return s, err
+	}
+	if req.Action == "recheck" {
+		// Explicit recheck adopts the *current* exact auth, but never enables it.
+		s.AuthID = snapshot.Entry.ID
+		s.Name = snapshot.Entry.Name
+		s.Identity = snapshot.Identity
+		s.Fingerprint = snapshot.Fingerprint
+		s.ContentHash = snapshot.ContentHash
+		s.RuntimeUpdated = snapshot.Entry.UpdatedAt
+		s.Disabled = snapshot.Entry.Disabled
+		modelProbe := s.BlockedState == authBillingBlocked || s.BlockedState == authPermissionBlocked
+		if modelProbe && !req.ConfirmModelProbe {
+			return s, errLifecycleAction
+		}
+		probeModel := firstNonEmptyString(req.ProbeModel, codexProbeModel)
+		if modelProbe && !lifecycleProbeModelAllowed(snapshot.Data, probeModel) {
+			return s, errors.New("probe model is excluded by this auth; select an allowed probe_model")
+		}
+		account := triggerAuthAccount{configuredAccount: configuredAccount{AuthID: s.AuthID, AuthIndex: s.AuthIndex, AuthFile: s.Name, Provider: "codex"}, AccessToken: lifecycleString(snapshot.Data, "access_token"), ChatGPTAccountID: lifecycleString(snapshot.Data, "account_id")}
+		var run quotaTriggerRun
+		if modelProbe {
+			run = executeQuotaProbeRequestWithModel(ctx, db, account, defaultPluginConfig(), probeModel)
+		} else {
+			run = executeQuotaUsageRequest(ctx, db, account, defaultPluginConfig())
+		}
+		after, readErr := c.host.Read(ctx, req.AuthIndex)
+		if readErr != nil {
+			return s, readErr
+		}
+		if snapshot.ContentHash != after.ContentHash || snapshot.Entry.UpdatedAt != after.Entry.UpdatedAt || snapshot.Entry.Disabled != after.Entry.Disabled || after.Entry.Disabled != after.FileDisabled {
+			c.conflict(ctx, db, &s, after, "auth changed during recheck")
+			return s, errLifecycleConflict
+		}
+		s.CheckedAt = c.clock.Now().Unix()
+		s.CheckOK = successfulStatusCode(run.HTTPStatus)
+		s.LastHTTPStatus = run.HTTPStatus
+		s.PendingAction = ""
+		s.PendingOwner = false
+		s.RetryAt = 0
+		s.SyncStatus = "rechecked"
+		s.SyncError = ""
+		if s.CheckOK {
+			s.LastErrorMessage = "probe succeeded; explicit enable required"
+		} else {
+			s.LastErrorMessage = "probe failed; account remains unchanged"
+			d := classifyAuthFailure(usageRecord{Failed: true, Failure: usageFailure{StatusCode: run.HTTPStatus, Body: run.FailureBody}, ResponseHeaders: run.ResponseHeaders}, c.clock.Now())
+			if d.Disable {
+				s.BlockedState = d.State
+			}
+		}
+		// No automatic ownership is granted by a probe.
+		s.DisabledByPlugin = false
+		s.Paused = true
+		if err = saveLifecycleState(ctx, db, &s, c.clock.Now(), "manual_recheck"); err != nil {
+			return s, err
+		}
+		return s, nil
+	}
+	if req.Action != "enable" && req.Action != "disable" {
+		return s, errLifecycleAction
+	}
+	if snapshotChanged(s, snapshot) {
+		c.conflict(ctx, db, &s, snapshot, "auth changed before manual action")
+		return s, errLifecycleConflict
+	}
+	needsRecheck := s.LastHTTPStatus >= 400 || s.BlockedState != "" || s.SyncStatus == "conflict"
+	if req.Action == "enable" && needsRecheck && (!s.CheckOK || c.clock.Now().Unix()-s.CheckedAt > 300) {
+		return s, errors.New("successful fresh Recheck is required before enabling a blocked account")
+	}
+	if req.Action == "disable" {
+		s.State = authManualDisabled
+		s.Reason = "manual_disabled"
+		s.Paused = true
+		s.DisabledByPlugin = false
+		s.RecoverAt = 0
+	}
+	err = c.transition(ctx, db, &s, snapshot, req.Action == "disable", false)
+	return s, err
+}
+
+func lifecycleProbeModelAllowed(data map[string]json.RawMessage, model string) bool {
+	if strings.TrimSpace(model) == "" || len(model) > 256 {
+		return false
+	}
+	for _, key := range []string{"excluded_models", "excluded-models"} {
+		raw, exists := data[key]
+		if !exists {
+			continue
+		}
+		var patterns []string
+		if json.Unmarshal(raw, &patterns) != nil {
+			return false
+		}
+		for _, pattern := range patterns {
+			match, err := path.Match(pattern, model)
+			if err != nil || match {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// Old routes remain callable with explicit current preconditions. Unversioned
+// release-all must not acquire the new and stronger power of enabling CPA auths.
+func handleLifecycleCompatibility(req managementRequest) managementResponse {
+	var action lifecycleActionRequest
+	if json.Unmarshal(req.Body, &action) != nil || action.AuthIndex == "" || action.Version < 1 {
+		return jsonResponse(http.StatusConflict, map[string]any{"error": "refresh_required", "message": "Native mode requires auth_index and current lifecycle version; use auth-states/action. No auth or plugin state was changed."})
+	}
+	if strings.HasSuffix(req.Path, "/autobans/release") {
+		action.Action = "enable"
+	} else if action.Action == "" {
+		action.Action = "recheck"
+	}
+	req.Body, _ = json.Marshal(action)
+	return handleLifecycleAction(req)
+}
+
+func applyLifecycleSummary(ctx context.Context, db *sql.DB, accounts []accountRow) error {
+	states, err := listLifecycleStates(ctx, db)
+	if err != nil {
+		return err
+	}
+	byIndex := map[string]authLifecycleState{}
+	for _, s := range states {
+		byIndex[s.AuthIndex] = s
+	}
+	for i := range accounts {
+		r := &accounts[i]
+		if state, ok := byIndex[r.AuthIndex]; ok && state.AuthID == r.AuthID {
+			copy := state
+			r.Lifecycle = &copy
+		}
+	}
+	return nil
+}

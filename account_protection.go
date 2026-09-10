@@ -734,6 +734,11 @@ func applyAccountProtectionState(ctx context.Context, db *sql.DB, accounts []acc
 		account.ProtectionConcurrencyLimit = state.Limit
 		account.ProtectionWindowTokens = tokens
 		account.ProtectionTokenLimit = state.Threshold
-		account.ProtectionTokenDemoted = state.Threshold > 0 && tokens >= state.Threshold
+		account.ProtectionEnforced = !nativeScheduling()
+		account.ProtectionTokenWarning = state.Threshold > 0 && tokens >= state.Threshold
+		account.ProtectionTokenDemoted = account.ProtectionEnforced && account.ProtectionTokenWarning
+		if !account.ProtectionEnforced {
+			account.ProtectionInFlight = 0
+		}
 	}
 }

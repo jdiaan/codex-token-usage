@@ -87,7 +87,7 @@ const (
 )
 
 var (
-	pluginVersion    = "0.1.43"
+	pluginVersion    = "0.1.44"
 	pluginAuthor     = "Codex Token Usage Contributors"
 	pluginRepository = "https://github.com/zhumengling/codex-token-usage"
 )
@@ -147,6 +147,7 @@ type lifecycleRequest struct {
 }
 
 type pluginConfig struct {
+	SchedulingMode                          string
 	AccountProtectionEnabled                bool
 	AccountProtectionFreeConcurrency        int
 	AccountProtectionPlusConcurrency        int
@@ -385,6 +386,7 @@ func cliproxyPluginFree(ptr unsafe.Pointer, len C.size_t) {
 
 //export cliproxyPluginShutdown
 func cliproxyPluginShutdown() {
+	globalAuthLifecycle.stop()
 	globalQuotaActivation.stop()
 	globalQuotaTrigger.stop()
 	globalModelPriceUpdater.stop()
@@ -460,6 +462,7 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 	case "management.register":
 		return okJSON(managementRegistrationResponse{
 			Routes: []managementRoute{
+				{Method: "POST", Path: "/plugins/codex-token-usage/auth-states/action", Description: "Versioned Codex account lifecycle action."},
 				{Method: "GET", Path: "/plugins/codex-token-usage/summary", Description: "Token usage summary JSON."},
 				{Method: "GET", Path: "/plugins/codex-token-usage/export", Description: "Token usage CSV/JSON export."},
 				{Method: "POST", Path: "/plugins/codex-token-usage/autobans/release", Description: "Manually release active Codex 429 auto-bans."},
@@ -522,6 +525,7 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 
 func pluginConfigFields() []configField {
 	return []configField{
+		{Name: "scheduling_mode", Type: "enum", Description: "native=CPA 原生调度及 API 账号管理（默认）；legacy=插件调度及强制账号保护。native 不执行插件并发硬限制或 Token 降级。"},
 		{Name: "开启定时额度触发（不建议账号多的情况下开启）", Type: "boolean", Description: "是否开启 Codex 账号定时额度触发。探测结果会参与 401、402、403、429 状态管理；已处于异常不可用状态的账号会跳过后续探测，429 到 reset_at 后再恢复探测。默认关闭。"},
 		{Name: "触发间隔分钟", Type: "number", Description: "每轮触发间隔，单位分钟。默认 10。"},
 		{Name: "触发模式", Type: "enum", Description: "probe=真实极小模型请求，会消耗少量 token；旧 quota 配置会自动按 probe 执行。默认 probe。"},
@@ -559,6 +563,13 @@ func pluginConfigFields() []configField {
 }
 
 func handleManagement(req managementRequest) managementResponse {
+	if req.Path == "/v0/management/plugins/"+pluginID+"/auth-states/action" {
+		return handleLifecycleAction(req)
+	}
+	if nativeScheduling() && (req.Path == "/v0/management/plugins/"+pluginID+"/autobans/release" || req.Path == "/v0/management/plugins/"+pluginID+"/invalid-auths/resolve") {
+		return handleLifecycleCompatibility(req)
+	}
+
 	if strings.HasPrefix(req.Path, "/v0/management/plugins/"+pluginID+"/quota-activation/") {
 		return handleQuotaActivationManagement(req)
 	}
@@ -1018,6 +1029,7 @@ func parseInt(value string, fallback, min, max int) int {
 
 func defaultPluginConfig() pluginConfig {
 	return pluginConfig{
+		SchedulingMode:                          "native",
 		AccountProtectionEnabled:                false,
 		AccountProtectionFreeConcurrency:        2,
 		AccountProtectionPlusConcurrency:        5,
@@ -1070,6 +1082,10 @@ func configurePlugin(request []byte) error {
 		cfg = parsePluginConfigYAML(raw, cfg)
 	}
 	cfg = normalizePluginConfig(cfg)
+	if cfg.SchedulingMode != "native" && cfg.SchedulingMode != "legacy" {
+		return errors.New("scheduling_mode must be native or legacy")
+	}
+	globalAuthLifecycle.stop()
 	if !cfg.SchedulerSessionAffinityEnabled {
 		globalSchedulerAffinity.reset()
 	}
@@ -1081,6 +1097,7 @@ func configurePlugin(request []byte) error {
 	globalDBHealth.configure(cfg)
 	globalSummaryMaintenance.configure(cfg)
 	globalSummaryPrecomputer.configure(cfg)
+	globalAuthLifecycle.configure()
 	if err := globalStore.refreshSchedulerState(context.Background()); err != nil {
 		globalSchedulerState.invalidate()
 	}
@@ -1107,6 +1124,9 @@ func lifecycleConfigYAML(raw json.RawMessage) ([]byte, error) {
 
 func parsePluginConfigYAML(raw []byte, cfg pluginConfig) pluginConfig {
 	values := yamlScalars(string(raw))
+	if value, ok := configValue(values, "scheduling_mode"); ok {
+		cfg.SchedulingMode = strings.ToLower(strings.TrimSpace(value))
+	}
 	if value, ok := configValue(values, "account_protection_enabled", "开启账号保护调度（可能会影响缓存）", "开启账号保护调度"); ok {
 		cfg.AccountProtectionEnabled = parseBoolString(value, cfg.AccountProtectionEnabled)
 	}
@@ -1219,6 +1239,9 @@ func configValue(values map[string]string, keys ...string) (string, bool) {
 }
 
 func normalizePluginConfig(cfg pluginConfig) pluginConfig {
+	if cfg.SchedulingMode == "" {
+		cfg.SchedulingMode = "native"
+	}
 	cfg.AccountProtectionFreeConcurrency = clampInt(cfg.AccountProtectionFreeConcurrency, 1, 100)
 	cfg.AccountProtectionPlusConcurrency = clampInt(cfg.AccountProtectionPlusConcurrency, 1, 100)
 	cfg.AccountProtectionK12Concurrency = clampInt(cfg.AccountProtectionK12Concurrency, 1, 100)
@@ -1428,7 +1451,7 @@ func initializeSQLiteStore(ctx context.Context, db *sql.DB) error {
 	if err := cleanupExternalCodexInvalidAuths(ctx, db); err != nil {
 		return err
 	}
-	return nil
+	return migrateAuthLifecycle(ctx, db)
 }
 
 func ensureSummaryCacheColumns(ctx context.Context, db *sql.DB) error {
@@ -2166,6 +2189,15 @@ func (s *store) runSummaryMaintenanceMode(ctx context.Context, mode string) erro
 			return struct{}{}, err
 		}
 		now := time.Now().Unix()
+		if nativeScheduling() {
+			if err := expireXAIStates(ctx, db, now); err != nil {
+				return struct{}{}, err
+			}
+			if err := clearReplacedOrMissingXAIStates(ctx, db); err != nil {
+				return struct{}{}, err
+			}
+			return struct{}{}, globalSchedulerState.refresh(ctx, db)
+		}
 		if err := expireAutobans(ctx, db, now); err != nil {
 			return struct{}{}, err
 		}
@@ -2617,6 +2649,9 @@ func (s *store) recordUsage(ctx context.Context, rec usageRecord) error {
 	}
 	if err := recordXAIStateIfNeeded(ctx, db, rec, status); err != nil {
 		return err
+	}
+	if nativeScheduling() {
+		return observeAuthLifecycle(ctx, db, rec)
 	}
 	if err := recordInvalidAuthIfNeeded(ctx, db, rec, status); err != nil {
 		return err
@@ -3545,6 +3580,10 @@ func selectQuotaTriggerCandidates(ctx context.Context, db *sql.DB, cfg pluginCon
 		// queried again only after expireAutobans deactivates it at reset_at; 401,
 		// 402, and 403 remain out until their authentication/workspace state is
 		// explicitly cleared or replaced.
+		if nativeScheduling() {
+			isBanned = false
+			isInvalid = false
+		}
 		if isBanned || isInvalid {
 			skipped++
 			continue
@@ -3575,6 +3614,10 @@ func executeQuotaTrigger(ctx context.Context, db *sql.DB, account triggerAuthAcc
 }
 
 func executeQuotaProbeRequest(ctx context.Context, _ *sql.DB, account triggerAuthAccount, cfg pluginConfig) quotaTriggerRun {
+	return executeQuotaProbeRequestWithModel(ctx, nil, account, cfg, codexProbeModel)
+}
+
+func executeQuotaProbeRequestWithModel(ctx context.Context, _ *sql.DB, account triggerAuthAccount, cfg pluginConfig, model string) quotaTriggerRun {
 	run := quotaTriggerRunFromAccount(account, cfg.QuotaTriggerMode, "failed", 0, "")
 	started := time.Now()
 	run.StartedAt = started.Unix()
@@ -3582,7 +3625,7 @@ func executeQuotaProbeRequest(ctx context.Context, _ *sql.DB, account triggerAut
 	reqCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	body, err := codexProbeRequestBody(codexProbeModel)
+	body, err := codexProbeRequestBody(model)
 	if err != nil {
 		run.Error = sanitizeTriggerError(err)
 		run.FinishedAt = time.Now().Unix()
@@ -3606,7 +3649,7 @@ func executeQuotaProbeRequest(ctx context.Context, _ *sql.DB, account triggerAut
 		return run
 	}
 	if shouldRetryMinimalCodexProbe(resp.StatusCode, respBody) {
-		body, err = codexProbeMinimalRequestBody(codexProbeModel)
+		body, err = codexProbeMinimalRequestBody(model)
 		if err != nil {
 			run.Error = sanitizeTriggerError(err)
 			run.FinishedAt = time.Now().Unix()
@@ -3625,6 +3668,7 @@ func executeQuotaProbeRequest(ctx context.Context, _ *sql.DB, account triggerAut
 	mergeCodexQuotaPayload(responseHeaders, respBody)
 	populateQuotaTriggerRunWindows(&run, responseHeaders)
 	run.ResponseHeaders = responseHeaders
+	run.FailureBody = string(respBody)
 	run.FinishedAt = time.Now().Unix()
 
 	switch {
@@ -3764,6 +3808,7 @@ func executeQuotaUsageRequest(ctx context.Context, _ *sql.DB, account triggerAut
 	mergeCodexQuotaPayload(headers, body)
 	populateQuotaTriggerRunWindows(&run, headers)
 	run.ResponseHeaders = headers
+	run.FailureBody = string(body)
 	run.FinishedAt = time.Now().Unix()
 
 	switch {
@@ -3859,6 +3904,11 @@ func applyQuotaTriggerAccountState(ctx context.Context, db *sql.DB, run quotaTri
 		Source:          run.Source,
 		RequestedAt:     time.Unix(requestedAt, 0),
 		ResponseHeaders: cloneHeaders(run.ResponseHeaders),
+	}
+	if nativeScheduling() {
+		rec.Failed = !successfulStatusCode(run.HTTPStatus)
+		rec.Failure = usageFailure{StatusCode: run.HTTPStatus, Body: run.FailureBody}
+		return observeAuthLifecycle(ctx, db, rec)
 	}
 	if successfulStatusCode(run.HTTPStatus) && strings.EqualFold(run.Status, "success") {
 		return clearRecoveredAuthStateIfNeeded(ctx, db, rec, run.HTTPStatus)
@@ -4214,6 +4264,12 @@ func mergeCodexWindowPayload(headers map[string][]string, prefix string, window 
 }
 
 func resetAtFromWindow(window map[string]any) (int64, bool) {
+	if _, ok := window["resets_at"]; ok {
+		return lifecycleReset(window, time.Now())
+	}
+	if _, ok := window["resets_in_seconds"]; ok {
+		return lifecycleReset(window, time.Now())
+	}
 	if raw, present := firstPresentAnyIncludingNil(window, "reset_at", "resetAt"); present {
 		value, valid := exactInt64FromAny(raw)
 		if !valid || value <= 0 {
@@ -4421,12 +4477,18 @@ func headerQuotaWindowSeconds(headers map[string][]string, prefix string) sql.Nu
 }
 
 func (s *store) pickAuth(ctx context.Context, req schedulerPickRequest) (schedulerPickResponse, error) {
+	if nativeScheduling() && isCodexSchedulerRequest(req) && !isXAISchedulerRequest(req) {
+		return schedulerPickResponse{Handled: false}, nil
+	}
 	return withSQLiteAutoRepair(ctx, s, "pick auth", func() (schedulerPickResponse, error) {
 		return s.pickAuthOnce(ctx, req)
 	})
 }
 
 func (s *store) pickAuthOnce(ctx context.Context, req schedulerPickRequest) (schedulerPickResponse, error) {
+	if nativeScheduling() && isCodexSchedulerRequest(req) && !isXAISchedulerRequest(req) {
+		return schedulerPickResponse{Handled: false}, nil
+	}
 	if isXAISchedulerRequest(req) {
 		if s == globalStore && !globalSchedulerState.needsDatabase("xai", false) {
 			return schedulerPickResponse{Handled: false}, nil
@@ -4782,6 +4844,9 @@ func isCodexSchedulerRequest(req schedulerPickRequest) bool {
 }
 
 func schedulerPickRequiresPlugin(req schedulerPickRequest) bool {
+	if nativeScheduling() && isCodexSchedulerRequest(req) && !isXAISchedulerRequest(req) {
+		return false
+	}
 	if isXAISchedulerRequest(req) {
 		return globalSchedulerState.needsDatabase("xai", false)
 	}
@@ -4792,6 +4857,9 @@ func schedulerPickRequiresPlugin(req schedulerPickRequest) bool {
 }
 
 func expireAutobans(ctx context.Context, db *sql.DB, now int64) error {
+	if nativeScheduling() {
+		return nil
+	}
 	res, err := db.ExecContext(ctx, `UPDATE autoban_bans SET active=0, released_at=?, release_reason='reset_at reached' WHERE active=1 AND reset_at <= ?`, now, now)
 	if err == nil {
 		if affected, rowsErr := res.RowsAffected(); rowsErr == nil && affected > 0 {
@@ -4802,6 +4870,9 @@ func expireAutobans(ctx context.Context, db *sql.DB, now int64) error {
 }
 
 func reconcileAutobansWithQuotaSnapshots(ctx context.Context, db *sql.DB, now int64) error {
+	if nativeScheduling() {
+		return nil
+	}
 	bans, err := queryActiveAutobans(ctx, db, now)
 	if err != nil {
 		return err
@@ -4851,6 +4922,9 @@ WHERE active=1 AND auth_id=?`, nullFloatPtr(primary.Percent), nullIntPtr(primary
 }
 
 func backfillAutobansFromUsage(ctx context.Context, db *sql.DB, now int64) error {
+	if nativeScheduling() {
+		return nil
+	}
 	configured := readConfiguredAuthAccounts()
 	authSourceAuthoritative := globalCodexAuthSource.authoritative()
 	rows, err := db.QueryContext(ctx, `
@@ -4960,6 +5034,9 @@ WHERE (autoban_bans.active=0 OR excluded.reset_at >= autoban_bans.reset_at)
 }
 
 func backfillWorkspaceDeactivatedAuthsFromUsage(ctx context.Context, db *sql.DB) error {
+	if nativeScheduling() {
+		return nil
+	}
 	configured := readConfiguredAuthAccounts()
 	authDirReadable := globalCodexAuthSource.authoritative()
 	rows, err := db.QueryContext(ctx, `
@@ -5013,6 +5090,9 @@ LIMIT 1000`)
 }
 
 func backfillWorkspaceDeactivatedAuthsFromQuotaTriggerRuns(ctx context.Context, db *sql.DB) error {
+	if nativeScheduling() {
+		return nil
+	}
 	configured := readConfiguredAuthAccounts()
 	authDirReadable := globalCodexAuthSource.authoritative()
 	rows, err := db.QueryContext(ctx, `
@@ -5162,6 +5242,9 @@ WHERE provider='codex'
 }
 
 func clearRecoveredAuthStatesFromUsage(ctx context.Context, db *sql.DB) error {
+	if nativeScheduling() {
+		return nil
+	}
 	changed := false
 	invalids, err := queryActiveInvalidAuths(ctx, db)
 	if err != nil {
@@ -5394,6 +5477,9 @@ func clearReplacedInvalidAuths(ctx context.Context, db *sql.DB) error {
 }
 
 func clearReplacedInvalidAuthsForConfigured(ctx context.Context, db *sql.DB, configured []configuredAccount) error {
+	if nativeScheduling() {
+		return nil
+	}
 	if len(configured) == 0 {
 		return nil
 	}
@@ -5446,6 +5532,9 @@ func clearReplacedAutobans(ctx context.Context, db *sql.DB) error {
 }
 
 func clearReplacedAutobansForConfigured(ctx context.Context, db *sql.DB, configured []configuredAccount) error {
+	if nativeScheduling() {
+		return nil
+	}
 	if len(configured) == 0 {
 		return nil
 	}
@@ -5590,6 +5679,9 @@ func nonFileAccountIdentityAliases(values ...string) []string {
 }
 
 func clearMissingConfiguredAuthState(ctx context.Context, db *sql.DB, configured []configuredAccount, authDirReadable bool) error {
+	if nativeScheduling() {
+		return nil
+	}
 	if !authDirReadable {
 		return nil
 	}

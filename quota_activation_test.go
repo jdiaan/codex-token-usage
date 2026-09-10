@@ -1334,7 +1334,7 @@ func TestQuotaActivationProbeAllowsOnlyDefiniteCompatibilityRetry(t *testing.T) 
 	defer server.Close()
 	codexResponsesURLOverrideForTest = server.URL
 	account := healthyActivationAccount()
-	run := executeQuotaProbeRequest(context.Background(), nil, triggerAuthAccount{configuredAccount: account, AccessToken: "fixture-access"}, defaultPluginConfig())
+	run := executeQuotaProbeRequest(context.Background(), nil, triggerAuthAccount{configuredAccount: account, AccessToken: "fixture-access"}, legacyPluginConfig())
 	if run.Status != "success" || run.HTTPStatus != http.StatusOK || calls.Load() != 2 {
 		t.Fatalf("compatibility probe status=%q http=%d calls=%d", run.Status, run.HTTPStatus, calls.Load())
 	}
@@ -1417,7 +1417,7 @@ func TestQuotaActivationManagementFlowUsesFixturesOnly(t *testing.T) {
 	defer server.Close()
 	codexQuotaURLOverrideForTest = server.URL
 	codexResponsesURLOverrideForTest = server.URL
-	globalQuotaActivation.configure(defaultPluginConfig())
+	globalQuotaActivation.configure(legacyPluginConfig())
 
 	// Seed the predecessor shape observed in live data: an ambiguous HTTP 200
 	// cycle with durable active evidence and a future scheduled boundary. The

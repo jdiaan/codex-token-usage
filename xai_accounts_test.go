@@ -373,7 +373,7 @@ func TestXAISchedulerUsesFillFirstWhenAffinityDisabled(t *testing.T) {
 	resetCPASchedulerStrategyCache()
 	t.Cleanup(resetCPASchedulerStrategyCache)
 	oldCfg := globalAccountProtection.config()
-	cfg := defaultPluginConfig()
+	cfg := legacyPluginConfig()
 	cfg.SchedulerSessionAffinityEnabled = false
 	globalAccountProtection.configure(cfg)
 	t.Cleanup(func() { globalAccountProtection.configure(oldCfg) })

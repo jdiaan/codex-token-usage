@@ -788,8 +788,14 @@ FROM autoban_bans
 WHERE active=1 OR released_at > 0`).Scan(&r.BanActive, &r.BanMaxChanged, &r.NextBanResetAt); err != nil {
 		return storeRevision{}, err
 	}
+	var lifecycleRevision int64
+	if err := db.QueryRowContext(ctx, `SELECT COALESCE(MAX(id),0) FROM auth_lifecycle_operations`).Scan(&lifecycleRevision); err != nil {
+		return storeRevision{}, err
+	}
 	r.AuthFilesRevision = authFilesRevision()
 	r.Revision = strings.Join([]string{
+		"l:" + strconv.FormatInt(lifecycleRevision, 10),
+		"mode:" + globalAccountProtection.config().SchedulingMode,
 		"u:" + strconv.FormatInt(r.UsageMaxID, 10),
 		"q:" + strconv.FormatInt(r.QuotaMaxID, 10),
 		"i:" + strconv.FormatInt(r.InvalidActive, 10) + ":" + strconv.FormatInt(r.InvalidMaxChanged, 10),
@@ -934,6 +940,9 @@ func (s *store) summaryOnce(ctx context.Context, window string, limit int) (map[
 	if err != nil {
 		return nil, err
 	}
+	if nativeScheduling() {
+		invalidAuths = nil
+	}
 	invalidAuths = classifyInvalidAuthRows(invalidAuths, hostAuthInventory)
 	invalidAuths = filterMissingInvalidAuthRows(invalidAuths, hostAuthInventory, hostAuthInventoryAuthoritative)
 	applyInvalidAuths(accounts, invalidAuths)
@@ -1023,11 +1032,18 @@ func (s *store) summaryOnce(ctx context.Context, window string, limit int) (map[
 	if err != nil {
 		return nil, err
 	}
+	if nativeScheduling() {
+		autobans = nil
+	}
 	autobans = filterMissingAutobanRows(autobans, configuredAccounts, authDirReadable)
 	autobans = mergeEffectiveAutobans(autobans, invalidAuths)
 	applyAccountQuotaToAutobans(autobans, accounts)
 	diagnostics := buildDiagnostics(ctx, db, path, accounts, providers, unauthorizedInvalidAuths, autobans, externalUseAlerts)
+	if err := applyLifecycleSummary(ctx, db, accounts); err != nil {
+		return nil, err
+	}
 	result := map[string]any{
+		"auth_controller":             globalAuthLifecycle.status(),
 		"plugin":                      pluginID,
 		"version":                     pluginVersion,
 		"generated_at":                time.Now().Format(time.RFC3339),
@@ -1192,106 +1208,109 @@ type totalsRow struct {
 }
 
 type accountRow struct {
-	AuthIndex                       string   `json:"auth_index"`
-	AuthID                          string   `json:"auth_id"`
-	Source                          string   `json:"source"`
-	Provider                        string   `json:"provider"`
-	Email                           string   `json:"email,omitempty"`
-	Name                            string   `json:"name,omitempty"`
-	AuthFile                        string   `json:"auth_file,omitempty"`
-	AuthFileMTime                   int64    `json:"auth_file_mtime,omitempty"`
-	AuthSourceKind                 string   `json:"auth_source_kind,omitempty"`
-	ChatGPTAccountID                string   `json:"chatgpt_account_id,omitempty"`
-	Configured                      bool     `json:"configured"`
-	Priority                        int      `json:"priority,omitempty"`
-	RuntimeRegistered               bool     `json:"runtime_registered,omitempty"`
-	WaitingRuntimeLoad              bool     `json:"waiting_runtime_load,omitempty"`
-	Disabled                        bool     `json:"disabled,omitempty"`
-	Expired                         bool     `json:"expired,omitempty"`
-	InvalidAuth                     bool     `json:"invalid_auth,omitempty"`
-	InvalidAuthAt                   string   `json:"invalid_auth_at,omitempty"`
-	InvalidAuthReason               string   `json:"invalid_auth_reason,omitempty"`
-	InvalidAuthStatusCode           int      `json:"invalid_auth_status_code,omitempty"`
-	WorkspaceDeactivated            bool     `json:"workspace_deactivated,omitempty"`
-	WorkspaceDeactivatedAt          string   `json:"workspace_deactivated_at,omitempty"`
-	WorkspaceDeactivatedReason      string   `json:"workspace_deactivated_reason,omitempty"`
-	PlanType                        string   `json:"plan_type,omitempty"`
-	XAITier                         string   `json:"xai_tier,omitempty"`
-	XAITierSource                   string   `json:"xai_tier_source,omitempty"`
-	XAITierDetail                   string   `json:"xai_tier_detail,omitempty"`
-	RuntimeStatus                   string   `json:"runtime_status,omitempty"`
-	RuntimeMessage                  string   `json:"runtime_message,omitempty"`
-	RuntimeUnavailable              bool     `json:"runtime_unavailable,omitempty"`
-	XAIState                        string   `json:"xai_state,omitempty"`
-	XAIStateReason                  string   `json:"xai_state_reason,omitempty"`
-	XAIStateObservedAt              string   `json:"xai_state_observed_at,omitempty"`
-	XAIStateResetAt                 int64    `json:"xai_state_reset_at,omitempty"`
-	XAIStateResetAtText             string   `json:"xai_state_reset_at_text,omitempty"`
-	XAIStateSecondsRemaining        int64    `json:"xai_state_seconds_remaining,omitempty"`
-	XAILastStatusCode               int      `json:"xai_last_status_code,omitempty"`
-	ProtectionPlan                  string   `json:"protection_plan,omitempty"`
-	ProtectionInFlight              int      `json:"protection_in_flight,omitempty"`
-	ProtectionConcurrencyLimit      int      `json:"protection_concurrency_limit,omitempty"`
-	ProtectionWindowTokens          int64    `json:"protection_window_tokens,omitempty"`
-	ProtectionTokenLimit            int64    `json:"protection_token_limit,omitempty"`
-	ProtectionTokenDemoted          bool     `json:"protection_token_demoted,omitempty"`
-	Requests                        int64    `json:"requests"`
-	Failed                          int64    `json:"failed"`
-	RateLimited                     int64    `json:"rate_limited"`
-	InputTokens                     int64    `json:"input_tokens"`
-	OutputTokens                    int64    `json:"output_tokens"`
-	ReasoningTokens                 int64    `json:"reasoning_tokens"`
-	CachedTokens                    int64    `json:"cached_tokens"`
-	CacheReadTokens                 int64    `json:"cache_read_tokens"`
-	CacheCreationTokens             int64    `json:"cache_creation_tokens"`
-	TotalTokens                     int64    `json:"total_tokens"`
-	CostUSD                         float64  `json:"cost_usd"`
-	CostAvailable                   bool     `json:"cost_available"`
-	UnpricedTokens                  int64    `json:"unpriced_tokens,omitempty"`
-	AverageLatencyMs                float64  `json:"avg_latency_ms"`
-	AverageTTFTMs                   float64  `json:"avg_ttft_ms"`
-	OutputTokensPerSecond           float64  `json:"output_tokens_per_second"`
-	SlowRequests                    int64    `json:"slow_requests"`
-	SlowTTFTRequests                int64    `json:"slow_ttft_requests"`
-	LastSeen                        string   `json:"last_seen"`
-	PrimaryUsedPercent              *float64 `json:"primary_used_percent,omitempty"`
-	PrimaryResetAt                  *int64   `json:"primary_reset_at,omitempty"`
-	PrimaryQuotaWindow              string   `json:"primary_quota_window,omitempty"`
-	PrimaryQuotaWindowPresence      string   `json:"primary_quota_window_presence,omitempty"`
-	PrimaryQuotaSource              string   `json:"primary_quota_source,omitempty"`
-	PrimaryQuotaObservedFrom        string   `json:"primary_quota_observed_from,omitempty"`
-	PrimaryQuotaWindowSeconds       int64    `json:"primary_quota_window_seconds,omitempty"`
-	PrimaryQuotaResetAfterSeconds   int64    `json:"primary_quota_reset_after_seconds,omitempty"`
-	PrimaryWindowTokens             int64    `json:"primary_window_tokens"`
-	SecondaryUsedPercent            *float64 `json:"secondary_used_percent,omitempty"`
-	SecondaryResetAt                *int64   `json:"secondary_reset_at,omitempty"`
-	SecondaryWindowTokens           int64    `json:"secondary_window_tokens"`
-	SecondaryQuotaWindow            string   `json:"secondary_quota_window,omitempty"`
-	SecondaryQuotaWindowPresence    string   `json:"secondary_quota_window_presence,omitempty"`
-	SecondaryQuotaWindowSeconds     int64    `json:"secondary_quota_window_seconds,omitempty"`
-	SecondaryQuotaResetAfterSeconds int64    `json:"secondary_quota_reset_after_seconds,omitempty"`
-	QuotaWindowSource               string   `json:"quota_window_source,omitempty"`
-	SecondaryQuotaSource            string   `json:"secondary_quota_source,omitempty"`
-	SecondaryQuotaObservedFrom      string   `json:"secondary_quota_observed_from,omitempty"`
-	SecondaryQuotaTotalEstimate     int64    `json:"secondary_quota_total_estimate"`
-	SecondaryQuotaRemainingEstimate int64    `json:"secondary_quota_remaining_estimate"`
-	SecondaryQuotaEstimateSource    string   `json:"secondary_quota_estimate_source,omitempty"`
-	SecondaryQuotaEstimateMethod    string   `json:"secondary_quota_estimate_method,omitempty"`
-	QuotaSource                     string   `json:"quota_source,omitempty"`
-	QuotaCredibility                string   `json:"quota_credibility,omitempty"`
-	QuotaEstimateNote               string   `json:"quota_estimate_note,omitempty"`
-	ExternalUseSuspected            bool     `json:"external_use_suspected,omitempty"`
-	ExternalUseCount                int      `json:"external_use_count,omitempty"`
-	ExternalUseWindow               string   `json:"external_use_window,omitempty"`
-	ExternalUseDeltaPct             float64  `json:"external_use_delta_percent,omitempty"`
-	ExternalUseLocalTokens          int64    `json:"external_use_local_tokens,omitempty"`
-	ExternalUseDetectedAt           string   `json:"external_use_detected_at,omitempty"`
-	ExternalUseReason               string   `json:"external_use_reason,omitempty"`
-	QuotaTriggerLastAt              string   `json:"quota_trigger_last_at,omitempty"`
-	QuotaTriggerStatus              string   `json:"quota_trigger_status,omitempty"`
-	QuotaTriggerMode                string   `json:"quota_trigger_mode,omitempty"`
-	QuotaTriggerHTTPStatus          int      `json:"quota_trigger_http_status,omitempty"`
-	QuotaTriggerError               string   `json:"quota_trigger_error,omitempty"`
+	Lifecycle                       *authLifecycleState `json:"lifecycle,omitempty"`
+	ProtectionEnforced              bool                `json:"protection_enforced"`
+	ProtectionTokenWarning          bool                `json:"protection_token_warning,omitempty"`
+	AuthIndex                       string              `json:"auth_index"`
+	AuthID                          string              `json:"auth_id"`
+	Source                          string              `json:"source"`
+	Provider                        string              `json:"provider"`
+	Email                           string              `json:"email,omitempty"`
+	Name                            string              `json:"name,omitempty"`
+	AuthFile                        string              `json:"auth_file,omitempty"`
+	AuthFileMTime                   int64               `json:"auth_file_mtime,omitempty"`
+	AuthSourceKind                  string              `json:"auth_source_kind,omitempty"`
+	ChatGPTAccountID                string              `json:"chatgpt_account_id,omitempty"`
+	Configured                      bool                `json:"configured"`
+	Priority                        int                 `json:"priority,omitempty"`
+	RuntimeRegistered               bool                `json:"runtime_registered,omitempty"`
+	WaitingRuntimeLoad              bool                `json:"waiting_runtime_load,omitempty"`
+	Disabled                        bool                `json:"disabled,omitempty"`
+	Expired                         bool                `json:"expired,omitempty"`
+	InvalidAuth                     bool                `json:"invalid_auth,omitempty"`
+	InvalidAuthAt                   string              `json:"invalid_auth_at,omitempty"`
+	InvalidAuthReason               string              `json:"invalid_auth_reason,omitempty"`
+	InvalidAuthStatusCode           int                 `json:"invalid_auth_status_code,omitempty"`
+	WorkspaceDeactivated            bool                `json:"workspace_deactivated,omitempty"`
+	WorkspaceDeactivatedAt          string              `json:"workspace_deactivated_at,omitempty"`
+	WorkspaceDeactivatedReason      string              `json:"workspace_deactivated_reason,omitempty"`
+	PlanType                        string              `json:"plan_type,omitempty"`
+	XAITier                         string              `json:"xai_tier,omitempty"`
+	XAITierSource                   string              `json:"xai_tier_source,omitempty"`
+	XAITierDetail                   string              `json:"xai_tier_detail,omitempty"`
+	RuntimeStatus                   string              `json:"runtime_status,omitempty"`
+	RuntimeMessage                  string              `json:"runtime_message,omitempty"`
+	RuntimeUnavailable              bool                `json:"runtime_unavailable,omitempty"`
+	XAIState                        string              `json:"xai_state,omitempty"`
+	XAIStateReason                  string              `json:"xai_state_reason,omitempty"`
+	XAIStateObservedAt              string              `json:"xai_state_observed_at,omitempty"`
+	XAIStateResetAt                 int64               `json:"xai_state_reset_at,omitempty"`
+	XAIStateResetAtText             string              `json:"xai_state_reset_at_text,omitempty"`
+	XAIStateSecondsRemaining        int64               `json:"xai_state_seconds_remaining,omitempty"`
+	XAILastStatusCode               int                 `json:"xai_last_status_code,omitempty"`
+	ProtectionPlan                  string              `json:"protection_plan,omitempty"`
+	ProtectionInFlight              int                 `json:"protection_in_flight,omitempty"`
+	ProtectionConcurrencyLimit      int                 `json:"protection_concurrency_limit,omitempty"`
+	ProtectionWindowTokens          int64               `json:"protection_window_tokens,omitempty"`
+	ProtectionTokenLimit            int64               `json:"protection_token_limit,omitempty"`
+	ProtectionTokenDemoted          bool                `json:"protection_token_demoted,omitempty"`
+	Requests                        int64               `json:"requests"`
+	Failed                          int64               `json:"failed"`
+	RateLimited                     int64               `json:"rate_limited"`
+	InputTokens                     int64               `json:"input_tokens"`
+	OutputTokens                    int64               `json:"output_tokens"`
+	ReasoningTokens                 int64               `json:"reasoning_tokens"`
+	CachedTokens                    int64               `json:"cached_tokens"`
+	CacheReadTokens                 int64               `json:"cache_read_tokens"`
+	CacheCreationTokens             int64               `json:"cache_creation_tokens"`
+	TotalTokens                     int64               `json:"total_tokens"`
+	CostUSD                         float64             `json:"cost_usd"`
+	CostAvailable                   bool                `json:"cost_available"`
+	UnpricedTokens                  int64               `json:"unpriced_tokens,omitempty"`
+	AverageLatencyMs                float64             `json:"avg_latency_ms"`
+	AverageTTFTMs                   float64             `json:"avg_ttft_ms"`
+	OutputTokensPerSecond           float64             `json:"output_tokens_per_second"`
+	SlowRequests                    int64               `json:"slow_requests"`
+	SlowTTFTRequests                int64               `json:"slow_ttft_requests"`
+	LastSeen                        string              `json:"last_seen"`
+	PrimaryUsedPercent              *float64            `json:"primary_used_percent,omitempty"`
+	PrimaryResetAt                  *int64              `json:"primary_reset_at,omitempty"`
+	PrimaryQuotaWindow              string              `json:"primary_quota_window,omitempty"`
+	PrimaryQuotaWindowPresence      string              `json:"primary_quota_window_presence,omitempty"`
+	PrimaryQuotaSource              string              `json:"primary_quota_source,omitempty"`
+	PrimaryQuotaObservedFrom        string              `json:"primary_quota_observed_from,omitempty"`
+	PrimaryQuotaWindowSeconds       int64               `json:"primary_quota_window_seconds,omitempty"`
+	PrimaryQuotaResetAfterSeconds   int64               `json:"primary_quota_reset_after_seconds,omitempty"`
+	PrimaryWindowTokens             int64               `json:"primary_window_tokens"`
+	SecondaryUsedPercent            *float64            `json:"secondary_used_percent,omitempty"`
+	SecondaryResetAt                *int64              `json:"secondary_reset_at,omitempty"`
+	SecondaryWindowTokens           int64               `json:"secondary_window_tokens"`
+	SecondaryQuotaWindow            string              `json:"secondary_quota_window,omitempty"`
+	SecondaryQuotaWindowPresence    string              `json:"secondary_quota_window_presence,omitempty"`
+	SecondaryQuotaWindowSeconds     int64               `json:"secondary_quota_window_seconds,omitempty"`
+	SecondaryQuotaResetAfterSeconds int64               `json:"secondary_quota_reset_after_seconds,omitempty"`
+	QuotaWindowSource               string              `json:"quota_window_source,omitempty"`
+	SecondaryQuotaSource            string              `json:"secondary_quota_source,omitempty"`
+	SecondaryQuotaObservedFrom      string              `json:"secondary_quota_observed_from,omitempty"`
+	SecondaryQuotaTotalEstimate     int64               `json:"secondary_quota_total_estimate"`
+	SecondaryQuotaRemainingEstimate int64               `json:"secondary_quota_remaining_estimate"`
+	SecondaryQuotaEstimateSource    string              `json:"secondary_quota_estimate_source,omitempty"`
+	SecondaryQuotaEstimateMethod    string              `json:"secondary_quota_estimate_method,omitempty"`
+	QuotaSource                     string              `json:"quota_source,omitempty"`
+	QuotaCredibility                string              `json:"quota_credibility,omitempty"`
+	QuotaEstimateNote               string              `json:"quota_estimate_note,omitempty"`
+	ExternalUseSuspected            bool                `json:"external_use_suspected,omitempty"`
+	ExternalUseCount                int                 `json:"external_use_count,omitempty"`
+	ExternalUseWindow               string              `json:"external_use_window,omitempty"`
+	ExternalUseDeltaPct             float64             `json:"external_use_delta_percent,omitempty"`
+	ExternalUseLocalTokens          int64               `json:"external_use_local_tokens,omitempty"`
+	ExternalUseDetectedAt           string              `json:"external_use_detected_at,omitempty"`
+	ExternalUseReason               string              `json:"external_use_reason,omitempty"`
+	QuotaTriggerLastAt              string              `json:"quota_trigger_last_at,omitempty"`
+	QuotaTriggerStatus              string              `json:"quota_trigger_status,omitempty"`
+	QuotaTriggerMode                string              `json:"quota_trigger_mode,omitempty"`
+	QuotaTriggerHTTPStatus          int                 `json:"quota_trigger_http_status,omitempty"`
+	QuotaTriggerError               string              `json:"quota_trigger_error,omitempty"`
 }
 
 type configuredAccount struct {
@@ -1328,6 +1347,7 @@ type triggerAuthAccount struct {
 }
 
 type quotaTriggerRun struct {
+	FailureBody                 string `json:"-"` // in-memory only; classification must precede discarding the provider response
 	AuthID                      string
 	AuthIndex                   string
 	Source                      string

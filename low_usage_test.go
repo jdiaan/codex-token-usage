@@ -88,7 +88,7 @@ func TestSummarySQLiteCacheIsCanonicalAndBounded(t *testing.T) {
 func TestSummarySyncRefreshesAfterUsageRevisionChange(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStore(t)
-	cfg := normalizePluginConfig(defaultPluginConfig())
+	cfg := normalizePluginConfig(legacyPluginConfig())
 	cfg.SummaryPrecomputeMode = "active_dirty"
 
 	m := &summaryPrecomputeManager{}
@@ -170,7 +170,7 @@ func TestSummaryReturnsStaleCacheWhileRevisionRefreshRuns(t *testing.T) {
 }
 
 func TestSummaryAsyncRefreshIsThrottledWithinPrecomputeInterval(t *testing.T) {
-	cfg := normalizePluginConfig(defaultPluginConfig())
+	cfg := normalizePluginConfig(legacyPluginConfig())
 	key := normalizeSummaryCacheKey(summaryCacheKey{Window: "24h", Limit: 50})
 	m := &summaryPrecomputeManager{
 		entries: map[summaryCacheKey]summaryCacheEntry{
@@ -257,7 +257,7 @@ func TestSummaryMaintenanceUsesLightModeAfterNewUsageWithoutAuthFileChange(t *te
 }
 
 func TestParseLowUsageConfigDefaultsAndOverrides(t *testing.T) {
-	cfg := normalizePluginConfig(defaultPluginConfig())
+	cfg := normalizePluginConfig(legacyPluginConfig())
 	if cfg.SummaryPrecomputeMode != "active_dirty" {
 		t.Fatalf("default precompute mode = %q, want active_dirty", cfg.SummaryPrecomputeMode)
 	}
@@ -296,7 +296,7 @@ func TestQuotaTriggerWarningLabelAndConfigCompatibility(t *testing.T) {
 		t.Fatalf("plugin config fields do not contain %q", warningName)
 	}
 	for _, key := range []string{"quota_trigger_enabled", warningName, "开启定时额度触发"} {
-		cfg := defaultPluginConfig()
+		cfg := legacyPluginConfig()
 		cfg.QuotaTriggerEnabled = false
 		cfg = parsePluginConfigYAML([]byte(key+": true\n"), cfg)
 		if !cfg.QuotaTriggerEnabled {
@@ -321,11 +321,11 @@ func TestSessionAffinityConfigLabelAndCompatibility(t *testing.T) {
 	if index+1 >= len(fields) || fields[index+1].Name != "自动更新模型价格表" {
 		t.Fatalf("session affinity field should be immediately above model price auto-update field, got %q", fields[index+1].Name)
 	}
-	if !defaultPluginConfig().SchedulerSessionAffinityEnabled {
+	if !legacyPluginConfig().SchedulerSessionAffinityEnabled {
 		t.Fatal("session affinity should remain enabled by default for compatibility")
 	}
 	for _, key := range []string{"scheduler_session_affinity_enabled", "session_affinity_enabled", label} {
-		cfg := defaultPluginConfig()
+		cfg := legacyPluginConfig()
 		cfg = parsePluginConfigYAML([]byte(key+": false\n"), cfg)
 		if cfg.SchedulerSessionAffinityEnabled {
 			t.Fatalf("session affinity config key %q was not accepted", key)
@@ -361,7 +361,7 @@ func TestAccountProtectionWarningLabelIsLastConfigGroupAndKeepsCompatibility(t *
 		}
 	}
 	for _, key := range []string{"account_protection_enabled", warningName, "开启账号保护调度"} {
-		cfg := defaultPluginConfig()
+		cfg := legacyPluginConfig()
 		cfg.AccountProtectionEnabled = false
 		cfg = parsePluginConfigYAML([]byte(key+": true\n"), cfg)
 		if !cfg.AccountProtectionEnabled {
@@ -490,6 +490,13 @@ func TestInvalidAuthUsesEventTimeSoNewAuthFileClearsOld401(t *testing.T) {
 	}
 }
 
+func legacyPluginConfig() pluginConfig {
+	cfg := defaultPluginConfig()
+	cfg.SchedulingMode = "legacy"
+	return cfg
+}
+
 func TestMain(m *testing.M) {
+	globalAccountProtection.configure(legacyPluginConfig())
 	os.Exit(m.Run())
 }

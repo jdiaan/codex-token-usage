@@ -2,14 +2,14 @@
 
 CPA Token Usage is a CLIProxyAPI plugin for Codex account operation dashboards and AI provider usage analytics.
 
-Current version: `0.1.39`
+Current version: `0.1.44`
 
 ## Features
 
 - Codex account pool dashboard with pagination, saved sorting, quota bars, 7d/month quota estimates, cost estimates, and light/dark compatible UI.
 - AI provider pages grouped by CPA endpoint name, separated from Codex OAuth account-pool pricing and quota calculations.
-- Codex 429 auto-ban support with `reset_at` based recovery.
-- 401 invalid-auth protection until the auth JSON file is replaced or removed.
+- Native Codex scheduling delegates to CPA; confirmed quota exhaustion is isolated through the CPA Management status API and recovered at reliable reset times.
+- Durable 401/402/account-level 403 isolation with explicit Recheck and Enable; ambiguous credential replacement never automatically enables an account.
 - Suspicious external quota consumption detection for shared or resold accounts.
 - Optional periodic Codex quota trigger that sends a tiny real Codex request to refresh/start server-reported quota windows.
 - Authenticated Management UI/API workflow for previewing and activating fresh Codex quota windows exactly once per observed account cycle.
@@ -20,9 +20,9 @@ Current version: `0.1.39`
 - xAI account-pool dashboard for xAI OAuth JSON credentials, with xAI-specific 401/403/429 and free-usage-exhausted states.
 - xAI accounts are read through CPA `host.auth.list/get/get_runtime` when available, with filesystem fallback for older CPA versions; account rows classify Free, Super, and Heavy tiers from auth metadata.
 - Non-standard Codex credential import converts ChatGPT Session, sub2api/account-product, 9router, Codex auth.json, AxonHub, Codex-Manager, and generic nested token JSON through CPA `host.auth.save`, with preview, conflict detection, and no-refresh-token warnings.
-- Optional Codex/xAI Session affinity for scheduler requests: the same Session can stay on the same account; without a usable binding, filtered candidates follow CPA `routing.strategy` (`fill-first` or `round-robin`).
-- Optional account-protection scheduling for Codex OAuth accounts: per-plan concurrency hard limits and rolling-window Token soft demotion.
-- Account-protection and error filtering preserve CPA `fill-first` or `round-robin` selection within the highest-priority candidate tier.
+- In legacy mode, optional Codex/xAI Session affinity for scheduler requests: the same Session can stay on the same account; without a usable binding, filtered candidates follow CPA `routing.strategy` (`fill-first` or `round-robin`).
+- Legacy-only account-protection scheduling for Codex OAuth accounts: per-plan concurrency hard limits and rolling-window Token soft demotion.
+- Legacy account-protection and error filtering preserve CPA `fill-first` or `round-robin` selection within the highest-priority candidate tier.
 - Configured accounts with no real requests display zero quota even when background health probes have captured quota headers.
 - Provider-aware cache read/write normalization keeps OpenAI-compatible and Anthropic-style usage, cache hit rates, and cost estimates consistent.
 - Summary cache keys are canonicalized and bounded in memory and SQLite for long-running installations.
@@ -50,6 +50,7 @@ plugins:
     codex-token-usage:
       enabled: true
       priority: 120
+      scheduling_mode: native # native (default) or legacy
 
       开启定时额度触发（不建议账号多的情况下开启）: false
       触发间隔分钟: 10
@@ -115,7 +116,43 @@ account_protection_token_window_seconds: 300
 account_protection_reservation_ttl_seconds: 900
 ```
 
-Quota trigger defaults to off and is not recommended for large account pools. `probe` mode sends a real minimal Codex model request, so it can consume a small amount of tokens and may affect quota. Probe results are account-health inputs: 401 and 402 update invalid-auth state, 403 follows the same repeated-failure threshold as normal traffic, 429 creates an auto-ban, and a successful probe clears recovered state. Accounts already restricted by 401, 402, 403, or 429 remain eligible for health rechecks after the configured cooldown, including when an older quota snapshot is still full. The legacy Chinese key `开启定时额度触发` and the legacy `quota` mode remain accepted for compatibility.
+Quota trigger defaults to off and is not recommended for large account pools. `probe` sends a real minimal Codex model request and can consume tokens. In native mode its failures use the same classifier as normal Usage: explicit 401, 402, account/workspace 403 and quota-exhaustion 429 can request isolation; ordinary 429, unknown/model 403 and transient failures remain with CPA cooldown/retry. Success does not automatically clear isolation. Disabled accounts are checked through the state controller without temporarily enabling them. Legacy retains its existing probe, auto-ban and successful-probe recovery behavior. The old Chinese trigger key and `quota` mode remain accepted.
+
+## Native scheduling and account state
+
+`scheduling_mode` defaults to `native`; invalid values reject configuration. Native returns control to CPA before old Codex filters, reservations or selectors run. Configure Priority, Weight, fallback, excluded models and Codex Session Affinity in CPA. The plugin does not rewrite CPA routing configuration. The old Session Affinity key continues to apply to legacy Codex and existing xAI behavior.
+
+Token windows and warnings remain available in native mode. Plugin concurrency hard limits and Token soft demotion are **not executed**. Select `legacy` to retain those older scheduling behaviors. xAI behavior is unchanged.
+
+Set these environment variables on the CPA process to enable status writes:
+
+```text
+CPA_TOKEN_USAGE_MANAGEMENT_URL=http://127.0.0.1:8317
+CPA_TOKEN_USAGE_MANAGEMENT_KEY=<your plaintext management key>
+```
+
+The URL is the CPA root URL. The key is read only from the environment; a configuration password hash is not a usable substitute. Missing configuration leaves statistics and native scheduling working and reports the controller as unconfigured. API errors never reactivate the old native candidate filters.
+
+The controller supports uniquely identified physical Codex OAuth auth files. It sends only `{name, auth_index, disabled}` to `PATCH /v0/management/auth-files/status`, then verifies both the file and runtime state and checks that credential/custom/routing fields were preserved. HTTP 200 alone is insufficient. SQLite stores fingerprints, intent, state versions and sanitized audit evidence. Existing disabled files are treated as manually disabled unless a completed plugin operation proves ownership.
+
+Only unchanged, plugin-owned quota isolation with a reliable expired reset is automatically enabled. Multiple exhausted windows use their latest reset; unknown reset times require read-only quota checks. 401 never has timer recovery. 402 and account-level 403 require manual review. External changes pause control, and Recheck never implicitly enables an account. CPA has no conditional update or operator marker, so a narrow concurrent external-write race remains possible.
+
+Dashboard actions call the existing Management-authenticated endpoint:
+
+```http
+POST /v0/management/plugins/codex-token-usage/auth-states/action
+Content-Type: application/json
+
+{"auth_index":"exact-index","version":3,"action":"recheck"}
+```
+
+Actions are `recheck`, `enable`, `disable`, and `clear`; use the latest lifecycle version from Summary. A stale version returns 409. Billing/permission Recheck requires `confirm_model_probe: true` and can include `probe_model` (default `gpt-5.5`); this sends a real request and respects auth-file model exclusions. Other Rechecks use read-only quota requests. A successful check is valid for five minutes for explicit Enable. Disable withdraws automatic recovery ownership. Clear stops plugin management without enabling the account and retains audit history.
+
+The old release/resolve routes remain registered. Native callers must supply exact `auth_index` and `version`; unversioned requests return `409 refresh_required` without changing auth. Legacy keeps its original route semantics.
+
+Before uninstalling or downgrading to an old binary, review every plugin-owned disabled account and either explicitly recover it after verification or hand responsibility to an operator using Disable/Clear. Keep the database for audit. Replacing a DLL alone does not undo disabled auth files. Switching to legacy stops new native isolation while continuing previously owned quota recovery.
+
+See [architecture audit](CODEX_ARCHITECTURE_AUDIT.md), [implementation report](CODEX_REFACTOR_REPORT.md), and [manual smoke test](MANUAL_SMOKE_TEST.md).
 
 ## One-shot quota-window activation
 
@@ -146,7 +183,7 @@ Example preview body:
 
 A completed preview returns a short-lived one-time confirmation token. Pass that token, the preview ID, and an explicit subset of preview-eligible auth indexes to the run endpoint. Preview/run state and cycle reservations are persisted in the plugin SQLite database. Credentials, internal auth IDs/file names, authorization headers, cookies, and raw upstream bodies are not returned; credentials, headers, cookies, and raw bodies are not persisted. A periodic trigger round and a one-shot run share an exclusion gate and cannot dispatch concurrently.
 
-Rollback is local: disable/remove this plugin and restart CPA if required. This stops future actions but cannot undo a successful upstream request or its intended quota-window effect.
+Stopping the activation feature stops future requests but cannot undo a successful upstream request or its quota-window effect. Before removing the plugin, also complete the account-state ownership handoff described above.
 
 ## Model Price Table
 
@@ -177,12 +214,15 @@ CPA_MODEL_PRICE_FILE=/path/to/model_prices.json
 - Access tokens, refresh tokens, id tokens, and API keys are not written to summary JSON, UI, alert output, or exports.
 - Exported account labels that look like API keys are masked as `sk-****abcd`.
 - Local alert data is generated inside summary/export responses only; this version does not send webhooks.
-- Auth JSON files are read only for account identity, provider classification, quota trigger access, and replacement detection. Tokens are used in memory for trigger requests and are not written to summary/export data.
+- Auth JSON is read for identity, quota access and conflict detection. Native status operations ask CPA to persist only disabled/enabled state, with field-preservation checks; the existing explicitly requested import workflow remains separate. Tokens are used in memory and never included in lifecycle logs, Summary or exports.
 
 ## Build
 
 ```bash
-go test ./...
+CGO_ENABLED=1 go test ./...
+go test -race ./...
+go vet ./...
+python3 integration/run_cpa_native.py # Go >=1.26; pinned CPA v7.2.145
 ./build.sh
 ./package-release.sh dist
 ```
@@ -190,11 +230,11 @@ go test ./...
 Release assets are named in the CLIProxyAPI plugin store format:
 
 ```text
-codex-token-usage_0.1.39_linux_amd64.zip
-codex-token-usage_0.1.39_linux_arm64.zip
-codex-token-usage_0.1.39_windows_amd64.zip
-codex-token-usage_0.1.39_darwin_amd64.zip
-codex-token-usage_0.1.39_darwin_arm64.zip
+codex-token-usage_0.1.44_linux_amd64.zip
+codex-token-usage_0.1.44_linux_arm64.zip
+codex-token-usage_0.1.44_windows_amd64.zip
+codex-token-usage_0.1.44_darwin_amd64.zip
+codex-token-usage_0.1.44_darwin_arm64.zip
 checksums.txt
 ```
 
@@ -209,8 +249,8 @@ checksums.txt
 ## Common Issues
 
 - `未注册 / 未生效`: confirm the file is under the correct plugin directory and restart CLIProxyAPI.
-- `401`: the auth JSON is invalid and will not be used until replaced or removed.
-- `429`: the account is temporarily auto-banned until the observed reset time.
+- Native `401`: isolation requires configured Management access; verify credentials with Recheck, then explicitly Enable. Replacement alone does not restore an ambiguous account.
+- Native `429`: ordinary rate limits stay with CPA cooldown; only confirmed quota exhaustion requests global isolation. Unknown resets do not get an invented recovery time.
 - Provider not visible: confirm the endpoint still exists in CPA config and refresh the dashboard.
 - Price missing: check `model_prices.cache` status in the summary JSON and the model price update error if present.
 

@@ -15,7 +15,7 @@ func TestSchedulerStateFastPathAvoidsOpeningDatabase(t *testing.T) {
 	resetSchedulerStateForTest()
 	t.Cleanup(resetSchedulerStateForTest)
 	globalSchedulerState.setRestricted("codex", false)
-	cfg := defaultPluginConfig()
+	cfg := legacyPluginConfig()
 	cfg.AccountProtectionEnabled = false
 	globalAccountProtection.configure(cfg)
 
@@ -190,7 +190,7 @@ func TestQuotaProbeRestrictionWritesMarkSchedulerState(t *testing.T) {
 			t.Cleanup(func() { codexResponsesURLOverrideForTest = "" })
 
 			globalSchedulerState.setRestricted("codex", false)
-			cfg := defaultPluginConfig()
+			cfg := legacyPluginConfig()
 			for i := 0; i < test.runs; i++ {
 				run := executeQuotaProbeRequest(context.Background(), db, triggerAuthAccount{
 					configuredAccount: configuredAccount{
@@ -358,7 +358,7 @@ INSERT INTO quota_trigger_runs (
 				t.Fatal(err)
 			}
 
-			candidates, skipped, err := selectQuotaTriggerCandidates(context.Background(), db, defaultPluginConfig())
+			candidates, skipped, err := selectQuotaTriggerCandidates(context.Background(), db, legacyPluginConfig())
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -395,7 +395,7 @@ INSERT INTO autoban_bans (
 		authFile, authFile, "rate-limited@example.com", now-30, now+3600, http.StatusTooManyRequests, authFile); err != nil {
 		t.Fatal(err)
 	}
-	candidates, skipped, err := selectQuotaTriggerCandidates(context.Background(), db, defaultPluginConfig())
+	candidates, skipped, err := selectQuotaTriggerCandidates(context.Background(), db, legacyPluginConfig())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -417,7 +417,7 @@ INSERT INTO autoban_bans (
 	if active != 0 || releaseReason != "reset_at reached" {
 		t.Fatalf("expired 429 active=%d release_reason=%q", active, releaseReason)
 	}
-	candidates, skipped, err = selectQuotaTriggerCandidates(context.Background(), db, defaultPluginConfig())
+	candidates, skipped, err = selectQuotaTriggerCandidates(context.Background(), db, legacyPluginConfig())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -440,7 +440,7 @@ func TestEmptySchedulerSnapshotClearsMatchingRestrictionGeneration(t *testing.T)
 				globalAccountProtection.configure(previousProtectionConfig)
 			})
 			if provider == "codex" {
-				cfg := defaultPluginConfig()
+				cfg := legacyPluginConfig()
 				cfg.AccountProtectionEnabled = false
 				globalAccountProtection.configure(cfg)
 			}

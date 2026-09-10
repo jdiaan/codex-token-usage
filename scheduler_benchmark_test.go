@@ -26,7 +26,7 @@ func benchmarkSchedulerCandidates(count int) []schedulerAuthCandidate {
 func BenchmarkSchedulerHealthyFastPath100Accounts(b *testing.B) {
 	resetSchedulerStateForTest()
 	globalSchedulerState.setRestricted("codex", false)
-	cfg := defaultPluginConfig()
+	cfg := legacyPluginConfig()
 	cfg.AccountProtectionEnabled = false
 	globalAccountProtection.configure(cfg)
 	s := &store{}
@@ -84,7 +84,7 @@ func BenchmarkProtectedPick100Accounts50kEvents(b *testing.B) {
 	if err := tx.Commit(); err != nil {
 		b.Fatal(err)
 	}
-	cfg := defaultPluginConfig()
+	cfg := legacyPluginConfig()
 	cfg.AccountProtectionEnabled = true
 	globalAccountProtection.configure(cfg)
 	b.ReportAllocs()

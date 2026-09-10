@@ -25,3 +25,18 @@ jobs:
         run: go test -race ./...
       - name: Vet
         run: go vet ./...
+      - name: Build shared plugin
+        run: bash ./build.sh
+
+  cpa-native-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+          cache: true
+      - name: Native CPA 7.2.145 contracts
+        env:
+          CGO_ENABLED: "1"
+        run: python3 integration/run_cpa_native.py

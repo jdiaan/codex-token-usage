@@ -2629,6 +2629,12 @@ function renderOpenManagementModals(){
 function renderPoolPage(source){
   const data=poolData(source); const t=data.totals||{}; const total=t.total_tokens||0; const okReq=(t.requests||0)-(t.failed||0);
   renderPoolLabels(data);
+  const controller=(source&&source.auth_controller)||{};
+  let lifecycleBanner=document.getElementById('lifecycle-banner');
+  if(!lifecycleBanner){lifecycleBanner=document.createElement('p');lifecycleBanner.id='lifecycle-banner';document.getElementById('pool-hero-hint').after(lifecycleBanner)}
+  lifecycleBanner.hidden=data.provider==='xai';
+  lifecycleBanner.textContent=controller.scheduling_mode==='native'?'Native · CPA 原生调度；Token 统计/告警保留，插件并发硬限制及 Token 降级未执行。'+(controller.management_configured?'':' 自动启停未配置：需要 Management URL / KEY 环境变量。')+(controller.last_error?' '+controller.last_error:''):'Legacy · 插件调度与原有账号保护。';
+
   document.getElementById('m-requests').textContent=fmt(t.requests);
   document.getElementById('m-success').textContent='成功率 '+pct(ratio(okReq,t.requests));
   document.getElementById('m-total').textContent=compact(total);
@@ -2870,7 +2876,31 @@ function accountName(r){return r.email||r.source||r.name||r.auth_id||r.auth_file
 function maxQuota(r){return Math.max(r.primary_used_percent||0,r.secondary_used_percent||0)}
 function triggerRisk(r){return r.quota_trigger_status&&r.quota_trigger_status!=='success'&&r.quota_trigger_status!=='skipped'}
 function triggerSortScore(r){return triggerRisk(r)?3:(r.quota_trigger_status==='skipped'?2:(r.quota_trigger_status==='success'?1:0))}
+function lifecycleStatus(s){
+  const labels={HEALTHY:'Healthy / 健康',AUTH_INVALID:'Login Required / 需要登录',QUOTA_COOLDOWN:'Quota Cooldown / 额度冷却',RATE_LIMITED:'Rate Limited / 短期限流',BILLING_BLOCKED:'Billing Blocked / 账单受限',PERMISSION_BLOCKED:'Permission Issue / 权限问题',MANUAL_DISABLED:'Manually Disabled / 人工禁用'};
+  const remaining=Math.max(0,Number(s.recover_at||0)-Math.floor(Date.now()/1000));
+  const details=['disabled='+Boolean(s.disabled),s.disabled_by_plugin?'插件禁用':'无自动恢复所有权',s.disable_reason||'',s.disabled_at?'禁用于 '+new Date(s.disabled_at*1000).toLocaleString():'',s.recover_at?'Recover at '+new Date(s.recover_at*1000).toLocaleString()+' ('+remaining+'s)':'',s.last_http_status?'HTTP '+s.last_http_status:'',s.last_error_message||'',s.sync_status||'',s.sync_error||''].filter(Boolean).join(' · ');
+  let buttons='';
+  for(const pair of [['recheck','Recheck'],['enable','Enable'],['disable','Disable'],['clear','Clear plugin state']])buttons+='<button type="button" class="btn" data-lifecycle-action="'+pair[0]+'" data-auth-index="'+esc(s.auth_index)+'" data-version="'+Number(s.version)+'">'+pair[1]+'</button> ';
+  return '<span class="status-pill '+(s.state==='HEALTHY'&&!s.paused?'ok':'warn')+'">'+esc(labels[s.state]||s.state)+'</span><details><summary>状态与操作</summary><div>'+esc(details)+'</div>'+buttons+'</details>';
+}
+document.addEventListener('click',async event=>{
+  const button=event.target.closest('[data-lifecycle-action]');if(!button)return;
+  const row=((lastData||{}).accounts||[]).find(r=>r.lifecycle&&r.lifecycle.auth_index===button.dataset.authIndex);if(!row)return;
+  const action=button.dataset.lifecycleAction;
+  const modelProbe=action==='recheck'&&(row.lifecycle.blocked_state==='BILLING_BLOCKED'||row.lifecycle.blocked_state==='PERMISSION_BLOCKED');
+  const message=modelProbe?'Recheck 将发送一次真实极小 Codex 模型请求，可能消耗少量额度，且不会自动启用账号。继续？':action==='clear'?'仅清理插件管理所有权，不会启用账号；该账号不再自动恢复。继续？':action==='enable'?'确认通过 CPA API 启用当前账号？':action==='disable'?'确认人工禁用当前账号？插件不会自动恢复。':'执行只读额度/认证 Recheck？不会自动启用账号。';
+  if(!window.confirm(message))return;
+  const probeModel=modelProbe?window.prompt('选择此账号允许的 Probe 模型（受 excluded-models 限制）','gpt-5.5'):'';if(modelProbe&&!probeModel)return;
+  button.disabled=true;
+  try{
+    const result=await quotaActivationJSON('/v0/management/plugins/__PLUGIN_ID__/auth-states/action',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({auth_index:button.dataset.authIndex,version:Number(button.dataset.version),action:action,confirm_model_probe:modelProbe,probe_model:probeModel})});
+    if(action==='recheck')window.alert(result.account&&result.account.check_ok?'Recheck 成功。需要恢复时请明确点击 Enable。':'Recheck 未通过，账号状态未启用。');
+    await load(true,true);
+  }catch(error){window.alert(String(error.message||error))}finally{button.disabled=false}
+});
 function accountStatus(r){
+  if(r.lifecycle&&((lastData||{}).auth_controller||{}).scheduling_mode==='native')return lifecycleStatus(r.lifecycle);
   const ban=findBan(r);
   if(r.xai_state)return '<span class="status-pill danger" title="'+esc(r.xai_state_reason||xaiStateLabel(r.xai_state))+'">'+esc(xaiStateLabel(r.xai_state))+'</span>';
   if(r.invalid_auth){const forbidden=Number(r.invalid_auth_status_code)===403;return '<span class="status-pill danger" title="'+esc(r.invalid_auth_reason||(forbidden?'403 forbidden':'401 unauthorized'))+'">'+(forbidden?'403 拒绝':'401 失效')+'</span>'}
@@ -2910,8 +2940,8 @@ function accountIdentityCell(r){
   if(r.plan_type)badges.push('<span class="pill">'+esc(r.plan_type)+'</span>');
 	if(isXAIPool()&&r.xai_tier){const tier=String(r.xai_tier).toLowerCase();const label=tier==='heavy'?'Heavy':tier==='super'?'Super':'Free';const detail=[r.xai_tier_source,r.xai_tier_detail].filter(Boolean).join(' · ');badges.push('<span class="pill tier-'+esc(tier)+'" title="'+esc(tr('识别来源')+': '+detail)+'">'+label+'</span>')}
 	if(r.xai_state)badges.push('<span class="pill danger" title="'+esc(r.xai_state_reason||'')+'">'+esc(xaiStateLabel(r.xai_state))+'</span>');
-	if(r.protection_concurrency_limit)badges.push('<span class="pill">在途 '+fmt(r.protection_in_flight||0)+' / '+fmt(r.protection_concurrency_limit)+'</span>');
-	if(r.protection_token_limit)badges.push('<span class="pill'+(r.protection_token_demoted?' danger':'')+'">5m '+compact(r.protection_window_tokens||0)+' / '+compact(r.protection_token_limit)+'</span>');
+	if(r.protection_enforced&&r.protection_concurrency_limit)badges.push('<span class="pill">在途 '+fmt(r.protection_in_flight||0)+' / '+fmt(r.protection_concurrency_limit)+'</span>');
+	if(r.protection_token_limit)badges.push('<span class="pill'+(r.protection_token_warning?' danger':'')+'">5m '+compact(r.protection_window_tokens||0)+' / '+compact(r.protection_token_limit)+'</span>');
 	if(r.configured)badges.push('<span class="pill">已配置</span>');
 	if(r.waiting_runtime_load)badges.push('<span class="pill warn" title="认证文件存在，但 CPA 尚未将其加载到运行时账号池。">等待 CPA 加载</span>');
 	if(r.invalid_auth){const forbidden=Number(r.invalid_auth_status_code)===403;badges.push('<span class="pill danger" title="'+esc(r.invalid_auth_at||'')+'">'+(forbidden?'403 拒绝':'401 失效')+'</span>')}

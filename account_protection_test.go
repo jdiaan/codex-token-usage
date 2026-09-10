@@ -83,7 +83,7 @@ func TestNormalizedProtectionPlan(t *testing.T) {
 func TestProtectionConcurrencySwitchesCandidate(t *testing.T) {
 	globalSchedulerRotation.reset()
 	db := newProtectionTestDB(t)
-	cfg := defaultPluginConfig()
+	cfg := legacyPluginConfig()
 	cfg.AccountProtectionEnabled = true
 	cfg.AccountProtectionFreeConcurrency = 2
 	s := &store{}
@@ -103,7 +103,7 @@ func TestProtectionConcurrencySwitchesCandidate(t *testing.T) {
 func TestProtectionTokenDemotionPrefersLowerUsageCandidate(t *testing.T) {
 	globalSchedulerRotation.reset()
 	db := newProtectionTestDB(t)
-	cfg := defaultPluginConfig()
+	cfg := legacyPluginConfig()
 	cfg.AccountProtectionEnabled = true
 	cfg.AccountProtectionFreeTokenLimit = 2_000_000
 	now := time.Now().Unix()
@@ -124,7 +124,7 @@ func TestProtectionTokenDemotionPrefersLowerUsageCandidate(t *testing.T) {
 func TestProtectionSaturationRejectsWithoutExceedingHardLimit(t *testing.T) {
 	globalSchedulerRotation.reset()
 	db := newProtectionTestDB(t)
-	cfg := defaultPluginConfig()
+	cfg := legacyPluginConfig()
 	cfg.AccountProtectionEnabled = true
 	cfg.AccountProtectionFreeConcurrency = 1
 	now := time.Now().Unix()
@@ -217,7 +217,7 @@ func TestProtectionReservationExpiresAndReleasesOnUsage(t *testing.T) {
 	if _, err := db.Exec(`INSERT INTO account_protection_reservations (auth_id, auth_index, source, plan_type, created_at, expires_at) VALUES ('active', 'active', '', 'plus', ?, ?)`, now, now+900); err != nil {
 		t.Fatal(err)
 	}
-	cfg := defaultPluginConfig()
+	cfg := legacyPluginConfig()
 	_, err := (&store{}).pickProtectedAuth(context.Background(), db, []schedulerAuthCandidate{protectionTestCandidate("other", "plus", 1)}, cfg, "codex\x00test", "")
 	if err != nil {
 		t.Fatal(err)

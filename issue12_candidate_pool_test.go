@@ -42,7 +42,7 @@ func TestCodexSchedulerReportsStaleCandidatePoolWithoutSelectingUnknownAuth(t *t
 	globalSchedulerAffinity.reset()
 	t.Cleanup(globalSchedulerAffinity.reset)
 	oldProtection := globalAccountProtection.config()
-	globalAccountProtection.configure(defaultPluginConfig())
+	globalAccountProtection.configure(legacyPluginConfig())
 	t.Cleanup(func() { globalAccountProtection.configure(oldProtection) })
 	s := newTestStore(t)
 	db, _, err := s.open(context.Background())
