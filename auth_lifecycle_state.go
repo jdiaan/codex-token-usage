@@ -51,6 +51,7 @@ type authLifecycleState struct {
 	IgnoreBefore       int64  `json:"ignore_before"`
 	CheckedAt          int64  `json:"checked_at"`
 	CheckOK            bool   `json:"check_ok"`
+	CheckResult        string `json:"check_result,omitempty"`
 	CreatedAt          int64  `json:"created_at"`
 	UpdatedAt          int64  `json:"updated_at"`
 	Version            int64  `json:"version"`
@@ -85,7 +86,7 @@ func migrateAuthLifecycle(ctx context.Context, db *sql.DB) error {
 	if err != nil {
 		return err
 	}
-	hasRetry := false
+	columns := map[string]bool{}
 	for rows.Next() {
 		var cid, notNull, primary int
 		var name, kind string
@@ -94,17 +95,34 @@ func migrateAuthLifecycle(ctx context.Context, db *sql.DB) error {
 			rows.Close()
 			return err
 		}
-		hasRetry = hasRetry || name == "retry_at"
+		columns[name] = true
 	}
 	err = rows.Err()
 	rows.Close()
 	if err != nil {
 		return err
 	}
-	if !hasRetry {
-		if _, err = db.ExecContext(ctx, `ALTER TABLE auth_lifecycle_events ADD COLUMN retry_at INTEGER NOT NULL DEFAULT 0`); err != nil {
+	for _, column := range []struct{ name, definition string }{
+		{"retry_at", "INTEGER NOT NULL DEFAULT 0"},
+		{"outcome", "TEXT NOT NULL DEFAULT 'pending'"},
+		{"detail", "TEXT NOT NULL DEFAULT ''"},
+	} {
+		if columns[column.name] {
+			continue
+		}
+		if _, err = db.ExecContext(ctx, `ALTER TABLE auth_lifecycle_events ADD COLUMN `+column.name+` `+column.definition); err != nil {
 			return err
 		}
+	}
+	if !columns["outcome"] {
+		if _, err = db.ExecContext(ctx, `UPDATE auth_lifecycle_events SET outcome='observed',detail='historical disposition unavailable' WHERE processed=1`); err != nil {
+			return err
+		}
+	}
+	if _, err = db.ExecContext(ctx, `
+CREATE INDEX IF NOT EXISTS idx_lifecycle_event_attention ON auth_lifecycle_events(id) WHERE processed=0 OR outcome IN ('pending_disable','identity_conflict');
+CREATE INDEX IF NOT EXISTS idx_lifecycle_event_outcome_auth ON auth_lifecycle_events(outcome,auth_index,auth_id);`); err != nil {
+		return err
 	}
 	// Evidence is not ownership and is never executable work.
 	_, err = db.ExecContext(ctx, `
@@ -180,6 +198,22 @@ func saveLifecycleState(ctx context.Context, db *sql.DB, s *authLifecycleState, 
 	}
 	if n != 1 {
 		return errLifecycleConflict
+	}
+	if (s.SyncStatus == "synced" && s.PendingAction == "") || s.Paused {
+		outcome := "observed"
+		if s.Paused {
+			outcome = "identity_conflict"
+		} else if s.Disabled {
+			outcome = "disabled"
+		}
+		if _, err = tx.ExecContext(ctx, `UPDATE auth_lifecycle_events SET outcome=?,detail=? WHERE outcome='pending_disable' AND (auth_index=? OR (auth_index='' AND auth_id=?))`, outcome, s.SyncError, s.AuthIndex, s.AuthID); err != nil {
+			return err
+		}
+	}
+	if action == "manual_recheck" || action == "manual_clear" || (action == "status_confirmed" && !s.Disabled) {
+		if _, err = tx.ExecContext(ctx, `UPDATE auth_lifecycle_events SET outcome='observed',detail='resolved by explicit account control or confirmed recovery' WHERE outcome='identity_conflict' AND (auth_index=? OR (auth_index='' AND auth_id=?))`, s.AuthIndex, s.AuthID); err != nil {
+			return err
+		}
 	}
 	if _, err = tx.ExecContext(ctx, `INSERT INTO auth_lifecycle_operations(auth_index,at,action,outcome,detail) VALUES(?,?,?,?,?)`, s.AuthIndex, s.UpdatedAt, action, s.SyncStatus, s.SyncError); err != nil {
 		return err

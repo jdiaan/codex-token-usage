@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const vm = require('node:vm');
 const path = require('node:path');
-const source = fs.readFileSync(path.join(__dirname, '..', 'dashboard_scripts.go'), 'utf8');
+const source = fs.readFileSync(path.join(__dirname, '..', 'dashboard_scripts.go'), 'utf8').replace(/\r\n/g, '\n');
 
 function dashboard(rows) {
   const elements = new Map();
@@ -81,8 +81,8 @@ test('historical HTTP codes and blocked states do not flag recovered accounts', 
 test('unknown reset, pending writes, manual ownership and due recovery are explicit', () => {
   const { context, run } = dashboard([]);
   context.account = row('quota', 'QUOTA_COOLDOWN', { recover_at: 0 });
-  assert.equal(run('autobanRemainingText(account)'), '待查询');
-  assert.equal(run('autobanResetText(account)'), '等待查询额度恢复时间');
+  assert.equal(run('autobanRemainingText(account)'), '待手动检查');
+  assert.equal(run('autobanResetText(account)'), '恢复时间未知，等待手动检查');
   context.account.lifecycle.disabled = false;
   context.account.lifecycle.pending_action = 'disable';
   assert.equal(run('autobanResetText(account)'), '等待禁用确认');
@@ -91,4 +91,51 @@ test('unknown reset, pending writes, manual ownership and due recovery are expli
   assert.equal(run('autobanResetText(account)'), '需人工复查后启用');
   context.account = row('due', 'RATE_LIMITED', { recover_at: Math.floor(Date.now() / 1000) - 1 });
   assert.equal(run('autobanRemainingText(account)'), '等待启用确认');
+});
+
+test('check and recover only appears for unchanged plugin-owned 429 disables', () => {
+  const {context,run}=dashboard([]);
+  for(const [state,extra,visible] of [
+    ['QUOTA_COOLDOWN',{},true],['RATE_LIMITED',{},true],['AUTH_INVALID',{},false],
+    ['QUOTA_COOLDOWN',{paused:true},false],['QUOTA_COOLDOWN',{disabled_by_plugin:false},false],
+    ['QUOTA_COOLDOWN',{pending_action:'enable'},false],['QUOTA_COOLDOWN',{disabled:false},false],
+  ]){
+    context.account=row('a',state,extra);
+    assert.equal(run('lifecycleStatus(account.lifecycle)').includes('data-lifecycle-action="check_and_recover"'),visible);
+  }
+});
+
+test('pending evidence is visible without counting it as a confirmed disable or querying quota', () => {
+  const {context,elements,run}=dashboard([row('pending','AUTH_INVALID',{disabled:false,pending_action:'disable'})]);
+  let queries=0;
+  context.fetch=()=>{queries++;throw Error('render must not request quota')};
+  context.lastData.auth_controller.events={pending:[{auth_index:'<unmatched>',status:401,outcome:'pending_identity',detail:'auth identity missing or ambiguous'}]};
+  for(let i=0;i<3;i++)run("renderNativeLifecycleModal('invalid-auth',{rows:lastData.autobans,pages:1,pageRows:lastData.autobans},1,'管理 401 失效账号')");
+  assert.equal(elements.get('invalid-auth-summary').textContent,'已禁用 0 个 · 待处理 1 个');
+  assert.match(elements.get('invalid-auth-status').textContent,/<unmatched> · 待匹配账号/);
+  assert.match(elements.get('invalid-auth-status').textContent,/页面刷新不查询额度/);
+  assert.equal(queries,0);
+});
+
+test('check-and-recover click sends one versioned action and refreshes after success or failure', async () => {
+  for(const outcome of ['enabled','still_disabled','error']){
+    const {context}=dashboard([row('a')]);
+    const button={dataset:{authIndex:'a',version:'1',lifecycleAction:'check_and_recover'},disabled:false};
+    const requests=[];
+    let refreshes=0,handler;
+    context.window={confirm:()=>true,alert:()=>{}};
+    context.document.addEventListener=(_event,fn)=>{handler=fn};
+    context.quotaActivationJSON=async(url,options)=>{requests.push({url,body:JSON.parse(options.body)});if(outcome==='error')throw Error('failed');return {account:{disabled:outcome!=='enabled'}}};
+    context.load=async()=>{refreshes++};
+    const start=source.indexOf("document.addEventListener('click',async event=>{\n  const button=event.target.closest('[data-lifecycle-action]')");
+    assert.ok(start>=0);
+    vm.runInContext(source.slice(start,source.indexOf('function accountStatus(',start)),context);
+    await handler({target:{closest:()=>button}});
+    assert.equal(requests.length,1);
+    assert.equal(requests[0].body.action,'check_and_recover');
+    assert.equal(requests[0].body.auth_index,'a');
+    assert.equal(requests[0].body.version,1);
+    assert.equal(refreshes,1);
+    assert.equal(button.disabled,false);
+  }
 });

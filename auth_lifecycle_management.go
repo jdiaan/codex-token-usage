@@ -93,6 +93,9 @@ func (c *authLifecycleController) action(ctx context.Context, req lifecycleActio
 	if err != nil {
 		return s, err
 	}
+	if req.Action == "check_and_recover" {
+		return c.checkAndRecover(ctx, db, s, snapshot)
+	}
 	if req.Action == "recheck" {
 		// Explicit recheck adopts the *current* exact auth, but never enables it.
 		s.AuthID = snapshot.Entry.ID
@@ -127,6 +130,9 @@ func (c *authLifecycleController) action(ctx context.Context, req lifecycleActio
 		}
 		s.CheckedAt = c.clock.Now().Unix()
 		s.CheckOK = successfulStatusCode(run.HTTPStatus)
+		if s.State == authQuotaCooldown || s.BlockedState == authQuotaCooldown || s.State == authRateLimited || s.BlockedState == authRateLimited {
+			s.CheckOK = s.CheckOK && lifecycleQuotaAvailable(run, c.clock.Now())
+		}
 		s.LastHTTPStatus = run.HTTPStatus
 		s.PendingAction = ""
 		s.PendingOwner = false
@@ -134,8 +140,10 @@ func (c *authLifecycleController) action(ctx context.Context, req lifecycleActio
 		s.SyncStatus = "rechecked"
 		s.SyncError = ""
 		if s.CheckOK {
+			s.CheckResult = "passed"
 			s.LastErrorMessage = "probe succeeded; explicit enable required"
 		} else {
+			s.CheckResult = "not_available"
 			s.LastErrorMessage = "probe failed; account remains unchanged"
 			d := classifyAuthFailure(usageRecord{Failed: true, Failure: usageFailure{StatusCode: run.HTTPStatus, Body: run.FailureBody}, ResponseHeaders: run.ResponseHeaders}, c.clock.Now())
 			if d.Disable {
@@ -169,6 +177,93 @@ func (c *authLifecycleController) action(ctx context.Context, req lifecycleActio
 		s.RecoverAt = 0
 	}
 	err = c.transition(ctx, db, &s, snapshot, req.Action == "disable", false)
+	return s, err
+}
+
+// Only an explicit user action can query quota for recovery. No background
+// caller, cached dashboard percentage, or successful in-flight usage can enable.
+func (c *authLifecycleController) checkAndRecover(ctx context.Context, db *sql.DB, s authLifecycleState, snapshot lifecycleSnapshot) (authLifecycleState, error) {
+	if !nativeScheduling() || !s.Disabled || !s.DisabledByPlugin || s.Paused || s.PendingAction != "" || (s.State != authQuotaCooldown && s.State != authRateLimited) {
+		return s, errLifecycleAction
+	}
+	if snapshotChanged(s, snapshot) {
+		c.conflict(ctx, db, &s, snapshot, "auth changed before quota recovery")
+		return s, errLifecycleConflict
+	}
+	if !c.host.Ready() {
+		return s, errors.New("management API environment is not configured")
+	}
+	pending, err := pendingLifecycleEvents(ctx, db, s)
+	if err != nil {
+		return s, err
+	}
+	if pending {
+		return s, errors.New("account failure events pending; retry after reconciliation")
+	}
+	// Suspend an old timer before the network call. A timeout, cancellation or
+	// failed read-back must not leave a due timer able to enable the account.
+	s.CheckOK, s.CheckResult, s.RecoverAt = false, "incomplete", 0
+	if err = saveLifecycleState(ctx, db, &s, c.clock.Now(), "manual_quota_check_started"); err != nil {
+		return s, err
+	}
+	account := triggerAuthAccount{configuredAccount: configuredAccount{AuthID: s.AuthID, AuthIndex: s.AuthIndex, AuthFile: s.Name, Provider: "codex"}, AccessToken: lifecycleString(snapshot.Data, "access_token"), ChatGPTAccountID: lifecycleString(snapshot.Data, "account_id")}
+	run := executeQuotaUsageRequest(ctx, db, account, defaultPluginConfig())
+	after, err := c.host.Read(ctx, s.AuthIndex)
+	if err != nil {
+		s.CheckResult = "request_failed"
+		_ = saveLifecycleState(ctx, db, &s, c.clock.Now(), "manual_quota_check_failed")
+		return s, errors.New("quota check auth read-back failed")
+	}
+	if snapshotChanged(s, after) {
+		c.conflict(ctx, db, &s, after, "auth changed during quota recovery")
+		return s, errLifecycleConflict
+	}
+	s.CheckedAt, s.CheckOK = c.clock.Now().Unix(), successfulStatusCode(run.HTTPStatus) && lifecycleQuotaAvailable(run, c.clock.Now())
+	s.CheckResult = "not_available"
+	s.RetryAt, s.RecoverAt = 0, 0
+	if !successfulStatusCode(run.HTTPStatus) {
+		s.CheckResult = "request_failed"
+		d := classifyAuthFailure(usageRecord{Failed: true, Failure: usageFailure{StatusCode: run.HTTPStatus, Body: run.FailureBody}, ResponseHeaders: run.ResponseHeaders}, c.clock.Now())
+		if d.Disable && (lifecycleFailurePriority(d.State) >= lifecycleFailurePriority(s.State)) {
+			s.State, s.BlockedState, s.Reason, s.RecoverAt = d.State, d.State, d.Reason, d.RecoverAt
+			s.LastHTTPStatus, s.LastErrorCode, s.LastErrorType, s.LastErrorMessage = d.Status, d.ErrorCode, d.ErrorType, d.Reason
+		}
+	} else if !s.CheckOK {
+		// Only complete, valid window evidence can supply a new recovery time.
+		quota := quotaActivationQuotaFromRun(run)
+		valid, exhausted := true, false
+		for _, window := range []quotaActivationWindow{quota.Primary, quota.Secondary} {
+			if window.Presence == quotaWindowAbsent {
+				continue
+			}
+			if !activationWindowMetadataValid(window, c.clock.Now().Unix()) || window.UsedPercent == nil {
+				valid = false
+				continue
+			}
+			exhausted = exhausted || *window.UsedPercent >= 100
+		}
+		if valid && exhausted {
+			d := classifyAuthFailure(usageRecord{Failed: true, Failure: usageFailure{StatusCode: 429, Body: `{"error":{"type":"usage_limit_reached"}}`}, ResponseHeaders: run.ResponseHeaders}, c.clock.Now())
+			s.State, s.BlockedState, s.Reason, s.RecoverAt = d.State, d.State, d.Reason, d.RecoverAt
+			s.CheckResult = "quota_exhausted"
+		}
+	}
+	pending, err = pendingLifecycleEvents(ctx, db, s)
+	if err != nil {
+		return s, err
+	}
+	if pending {
+		s.CheckOK, s.CheckResult = false, "pending_failure"
+	}
+	if s.CheckOK {
+		s.CheckResult = "passed"
+	}
+	if err = saveLifecycleState(ctx, db, &s, c.clock.Now(), "manual_quota_recovery_check"); err != nil {
+		return s, err
+	}
+	if s.CheckOK {
+		err = c.transition(ctx, db, &s, after, false, false)
+	}
 	return s, err
 }
 
@@ -239,7 +334,7 @@ func queryLifecycleAutobans(ctx context.Context, db *sql.DB, now int64) ([]autob
 	}
 	rows := []autobanRow{}
 	for _, s := range states {
-		if !s.Disabled && s.PendingAction == "" && (s.State == authHealthy || s.State == authManualDisabled) {
+		if !s.Disabled && s.PendingAction == "" && s.SyncStatus != "conflict" && (s.State == authHealthy || s.State == authManualDisabled) {
 			continue
 		}
 		if !s.Disabled && s.PendingAction == "" && s.State == authRateLimited && s.RecoverAt > 0 && s.RecoverAt <= now {

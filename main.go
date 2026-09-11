@@ -2642,7 +2642,12 @@ func (s *store) recordUsage(ctx context.Context, rec usageRecord) error {
 	if ttftMs > 0 && (latencyMs <= 0 || latencyMs < ttftMs) {
 		latencyMs = ttftMs
 	}
-	_, err = db.ExecContext(ctx, insertSQL,
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	_, err = tx.ExecContext(ctx, insertSQL,
 		rec.RequestedAt.Unix(),
 		trim(rec.Provider), trim(rec.ExecutorType), trim(rec.Model), trim(rec.Alias),
 		trim(rec.APIKey), trim(rec.AuthID), trim(rec.AuthIndex), trim(rec.AuthType), trim(rec.Source),
@@ -2654,6 +2659,18 @@ func (s *store) recordUsage(ctx context.Context, rec usageRecord) error {
 	if err != nil {
 		return err
 	}
+	// Persist isolation evidence atomically with the visible request, before
+	// auxiliary accounting can fail. Wake only after the transaction commits.
+	insertedLifecycle, err := persistAuthLifecycleEvent(ctx, tx, rec)
+	if err != nil {
+		return err
+	}
+	if err = tx.Commit(); err != nil {
+		return err
+	}
+	if insertedLifecycle {
+		globalAuthLifecycle.signal()
+	}
 	if err := releaseProtectionReservation(ctx, db, rec); err != nil {
 		return err
 	}
@@ -2661,7 +2678,7 @@ func (s *store) recordUsage(ctx context.Context, rec usageRecord) error {
 		return err
 	}
 	if nativeScheduling() {
-		return observeAuthLifecycle(ctx, db, rec)
+		return nil
 	}
 	if err := recordInvalidAuthIfNeeded(ctx, db, rec, status); err != nil {
 		return err

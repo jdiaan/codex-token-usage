@@ -363,7 +363,7 @@ func buildAuthDiagnostics(accounts []accountRow, invalidAuths []invalidAuthRow, 
 func count429Autobans(autobans []autobanRow) int {
 	count := 0
 	for _, ban := range autobans {
-		if ban.Lifecycle != nil && ban.LastStatusCode != http.StatusTooManyRequests {
+		if ban.Lifecycle != nil && (ban.LastStatusCode != http.StatusTooManyRequests || !ban.Lifecycle.Disabled) {
 			continue
 		}
 		window := strings.TrimSpace(ban.Window)

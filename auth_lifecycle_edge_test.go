@@ -251,6 +251,13 @@ func TestNativeUnknownQuotaResetRequiresAuthoritativeRead(t *testing.T) {
 	codexQuotaURLOverrideForTest = server.URL
 	c.reconcile(context.Background())
 	s := lifecycleStateForTest(t, c, "a")
+	if s.RecoverAt != 0 {
+		t.Fatal("background reconciliation queried quota")
+	}
+	s, err := c.action(context.Background(), lifecycleActionRequest{AuthIndex: "a", Version: s.Version, Action: "check_and_recover"})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if s.RecoverAt != 1893502800 || !host.accounts["a"].Entry.Disabled {
 		t.Fatalf("quota reset read=%+v", s)
 	}

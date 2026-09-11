@@ -28,7 +28,7 @@ func TestNativeLifecycleFailuresAreVisible(t *testing.T) {
 	markers := []string{
 		"function lifecycleAuthInvalid(r)",
 		"function lifecycleRisk(r)",
-		"lifecycleAccounts.filter(lifecycleAuthInvalid).length",
+		"lifecycleAccounts.filter(r=>lifecycleAuthInvalid(r)&&r.lifecycle.disabled).length",
 		"最近列表已有 ",
 		"请在插件配置中填写 management_url / management_key",
 		"data-lifecycle-action=\"recheck\"",

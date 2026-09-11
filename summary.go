@@ -1046,8 +1046,16 @@ func (s *store) summaryOnce(ctx context.Context, window string, limit int) (map[
 	if err := applyLifecycleSummary(ctx, db, accounts); err != nil {
 		return nil, err
 	}
+	controllerStatus := globalAuthLifecycle.status()
+	if nativeScheduling() {
+		events, eventErr := queryLifecycleEventDiagnostics(ctx, db)
+		if eventErr != nil {
+			return nil, eventErr
+		}
+		controllerStatus["events"] = events
+	}
 	result := map[string]any{
-		"auth_controller":             globalAuthLifecycle.status(),
+		"auth_controller":             controllerStatus,
 		"plugin":                      pluginID,
 		"version":                     pluginVersion,
 		"generated_at":                time.Now().Format(time.RFC3339),

@@ -101,9 +101,21 @@ func (c *authLifecycleController) status() map[string]any {
 	return map[string]any{"scheduling_mode": mode, "management_configured": client.Ready(), "management_config": managementAuthConfigStatus(cfg), "last_error": last, "concurrency_enforced": mode == "legacy" && globalAccountProtection.enabled(), "token_demotion_enforced": mode == "legacy" && globalAccountProtection.enabled(), "reconcile_interval_seconds": 30}
 }
 
-func observeAuthLifecycle(ctx context.Context, db *sql.DB, rec usageRecord) error {
+type lifecycleExecer interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}
+
+func observeAuthLifecycle(ctx context.Context, db lifecycleExecer, rec usageRecord) error {
+	inserted, err := persistAuthLifecycleEvent(ctx, db, rec)
+	if err == nil && inserted {
+		globalAuthLifecycle.signal()
+	}
+	return err
+}
+
+func persistAuthLifecycleEvent(ctx context.Context, db lifecycleExecer, rec usageRecord) (bool, error) {
 	if !nativeScheduling() || !isCodexUsage(rec) {
-		return nil
+		return false, nil
 	}
 	// Successful requests must not clear a plugin-owned ban: another request may
 	// have succeeded concurrently with a quota or permission failure.
@@ -115,7 +127,7 @@ func observeAuthLifecycle(ctx context.Context, db *sql.DB, rec usageRecord) erro
 			}
 		}
 		if !exhausted {
-			return nil
+			return false, nil
 		}
 		// A successful final request or quota read can exhaust a window too.
 		rec.Failed = true
@@ -124,13 +136,10 @@ func observeAuthLifecycle(ctx context.Context, db *sql.DB, rec usageRecord) erro
 	d := classifyAuthFailure(rec, time.Now())
 	raw, err := json.Marshal(d)
 	if err != nil {
-		return err
+		return false, err
 	}
 	_, err = db.ExecContext(ctx, `INSERT INTO auth_lifecycle_events(auth_index,auth_id,requested_at,payload) VALUES(?,?,?,?)`, rec.AuthIndex, rec.AuthID, rec.RequestedAt.Unix(), string(raw))
-	if err == nil {
-		globalAuthLifecycle.signal()
-	}
-	return err
+	return err == nil, err
 }
 
 func isCodexUsage(rec usageRecord) bool {
@@ -188,6 +197,19 @@ func (c *authLifecycleController) reconcile(ctx context.Context) {
 			}
 			states = append(states, state)
 			known[state.AuthIndex] = true
+		}
+	}
+	// Consume queued failures before any timer recovery or pending status write.
+	// In particular, a queued 401 must supersede a due 429 cooldown.
+	if nativeScheduling() {
+		if err = c.processEvents(ctx, db, entries); err != nil {
+			c.setError(errors.New("lifecycle event processing failed"))
+			return
+		}
+		states, err = listLifecycleStates(ctx, db)
+		if err != nil {
+			c.setError(errors.New("lifecycle state read failed"))
+			return
 		}
 	}
 	for _, state := range states {
@@ -255,6 +277,7 @@ func (c *authLifecycleController) reconcile(ctx context.Context) {
 				state.LastErrorCode = d.ErrorCode
 				state.LastErrorMessage = d.Reason
 				state.CheckOK = false
+				state.CheckResult = ""
 				state.PendingAction = "disable"
 				state.PendingOwner = true
 				state.PendingContentHash = state.ContentHash
@@ -280,18 +303,18 @@ func (c *authLifecycleController) reconcile(ctx context.Context) {
 			continue
 		}
 		if (state.State == authQuotaCooldown || state.State == authRateLimited) && state.DisabledByPlugin && !state.Paused && state.RecoverAt > 0 && state.RecoverAt <= c.clock.Now().Unix() {
+			pending, pendingErr := pendingLifecycleEvents(ctx, db, state)
+			if pendingErr != nil {
+				c.setError(errors.New("lifecycle pending event read failed"))
+				return
+			}
+			if pending {
+				continue
+			}
 			c.transition(ctx, db, &state, snapshot, false, false)
 		}
-		// Missing resets are never invented. Read-only recheck may discover one.
-		if state.State == authQuotaCooldown && state.DisabledByPlugin && !state.Paused && state.RecoverAt == 0 {
-			c.discoverQuotaReset(ctx, db, &state, snapshot)
-		}
-	}
-	if nativeScheduling() {
-		if err = c.processEvents(ctx, db, entries); err != nil {
-			c.setError(errors.New("lifecycle event processing failed"))
-			return
-		}
+		// Unknown quota resets wait for an explicit check_and_recover action.
+		// Reconciliation must never query the upstream quota endpoint.
 	}
 }
 
@@ -330,6 +353,7 @@ func (c *authLifecycleController) conflict(ctx context.Context, db *sql.DB, s *a
 	s.RuntimeUpdated = current.Entry.UpdatedAt
 	s.IgnoreBefore = c.clock.Now().Unix()
 	s.CheckOK = false
+	s.CheckResult = ""
 	s.RetryAt = 0
 	if current.Entry.Disabled || current.FileDisabled {
 		s.State = authManualDisabled
@@ -482,80 +506,100 @@ func (c *authLifecycleController) processEvents(ctx context.Context, db *sql.DB,
 		return err
 	}
 	for _, event := range events {
-		index := ""
-		count := 0
+		if !event.Decision.Disable && !event.Decision.ModelIssue {
+			if err = c.recordEventOutcome(ctx, db, event, true, "observed", "non-isolating failure"); err != nil {
+				return err
+			}
+			continue
+		}
+		index, count := "", 0
 		for _, entry := range entries {
 			if (event.Index != "" && entry.AuthIndex == event.Index && (event.AuthID == "" || event.AuthID == entry.ID)) || (event.Index == "" && event.AuthID != "" && entry.ID == event.AuthID) {
 				index = entry.AuthIndex
 				count++
 			}
 		}
-		if count == 1 && index != "" {
-			s, loadErr := loadLifecycleState(ctx, db, index)
-			if loadErr != nil {
-				if !errors.Is(loadErr, sql.ErrNoRows) {
-					return loadErr
-				}
-				// A temporarily unavailable physical auth must not discard the
-				// failure that would isolate it. Defer without blocking later events.
-				if _, err = db.ExecContext(ctx, `UPDATE auth_lifecycle_events SET retry_at=? WHERE id=?`, c.clock.Now().Add(30*time.Second).Unix(), event.ID); err != nil {
-					return err
-				}
-				c.setError(errors.New("account snapshot unavailable; failure deferred"))
-				continue
+		if count != 1 || index == "" {
+			if err = c.recordEventOutcome(ctx, db, event, false, "pending_identity", "auth identity missing or ambiguous"); err != nil {
+				return err
 			}
-			if loadErr == nil && event.ID > s.LastEventID {
-				d := event.Decision
-				s.LastEventID = event.ID
-				s.LastHTTPStatus = d.Status
-				s.LastErrorType = d.ErrorType
-				s.LastErrorCode = d.ErrorCode
-				s.LastErrorMessage = d.Reason
-				if d.ModelIssue {
-					if _, err = db.ExecContext(ctx, `INSERT INTO auth_model_issues(auth_index,model,observed_at,status,error_code) VALUES(?,?,?,?,?) ON CONFLICT(auth_index,model) DO UPDATE SET observed_at=excluded.observed_at,status=excluded.status,error_code=excluded.error_code`, index, d.Model, c.clock.Now().Unix(), d.Status, d.Reason); err != nil {
-						return err
-					}
-				}
-				eligible := !s.Paused && s.PendingAction == "" && event.RequestedAt >= s.IgnoreBefore && (!s.Disabled || (s.DisabledByPlugin && d.Disable && lifecycleFailurePriority(d.State) >= lifecycleFailurePriority(s.State)))
-				if eligible && d.State != authHealthy {
-					if s.Disabled && d.State == s.State {
-						if d.RecoverAt == 0 || s.RecoverAt == 0 {
-							d.RecoverAt = 0
-						} else if s.RecoverAt > d.RecoverAt {
-							d.RecoverAt = s.RecoverAt
-						}
-					}
-					s.CheckOK = false
-					s.State = d.State
-					s.Reason = d.Reason
-					s.RecoverAt = d.RecoverAt
-					if d.Disable {
-						s.BlockedState = d.State
-					}
-				}
-				if eligible && d.Disable && !s.Disabled {
-					s.PendingAction = "disable"
-					s.PendingOwner = true
-					s.PendingContentHash = s.ContentHash
-				}
-				if err = saveLifecycleState(ctx, db, &s, c.clock.Now(), "failure_observed"); err != nil {
-					return err
-				}
-				if eligible && d.Disable && !s.Disabled {
-					snapshot, readErr := c.host.Read(ctx, index)
-					if readErr != nil {
-						c.retry(ctx, db, &s, "auth read failed; isolation not applied")
-					} else if snapshotChanged(s, snapshot) {
-						c.conflict(ctx, db, &s, snapshot, "auth changed before failure isolation")
-					} else {
-						_ = c.transition(ctx, db, &s, snapshot, true, true)
-					}
-				}
-			}
-		} else {
-			c.setError(errors.New("usage auth identity missing or ambiguous; automatic isolation skipped"))
+			continue
 		}
-		if _, err = db.ExecContext(ctx, `UPDATE auth_lifecycle_events SET processed=1 WHERE id=?`, event.ID); err != nil {
+		s, loadErr := loadLifecycleState(ctx, db, index)
+		if loadErr != nil {
+			if !errors.Is(loadErr, sql.ErrNoRows) {
+				return loadErr
+			}
+			if err = c.recordEventOutcome(ctx, db, event, false, "pending_snapshot", "account snapshot unavailable or unsupported"); err != nil {
+				return err
+			}
+			continue
+		}
+		d := event.Decision
+		if event.RequestedAt < s.IgnoreBefore {
+			if err = c.recordEventOutcome(ctx, db, event, true, "ignored_stale", "request predates current auth control boundary"); err != nil {
+				return err
+			}
+			continue
+		}
+		if s.Paused || (s.Disabled && !s.DisabledByPlugin) {
+			if err = c.recordEventOutcome(ctx, db, event, true, "identity_conflict", "manual control or auth change requires recheck"); err != nil {
+				return err
+			}
+			continue
+		}
+		snapshot, readErr := c.host.Read(ctx, index)
+		if readErr != nil {
+			if err = c.recordEventOutcome(ctx, db, event, false, "pending_snapshot", "auth snapshot temporarily unavailable"); err != nil {
+				return err
+			}
+			continue
+		}
+		if snapshotChanged(s, snapshot) || (s.PendingAction == "enable" && d.Disable) {
+			c.conflict(ctx, db, &s, snapshot, "auth changed or new failure during pending enable; manual recheck required")
+			if err = c.recordEventOutcome(ctx, db, event, true, "identity_conflict", "auth change or pending enable requires recheck"); err != nil {
+				return err
+			}
+			continue
+		}
+		if d.ModelIssue {
+			if _, err = db.ExecContext(ctx, `INSERT INTO auth_model_issues(auth_index,model,observed_at,status,error_code) VALUES(?,?,?,?,?) ON CONFLICT(auth_index,model) DO UPDATE SET observed_at=excluded.observed_at,status=excluded.status,error_code=excluded.error_code`, index, d.Model, c.clock.Now().Unix(), d.Status, d.Reason); err != nil {
+				return err
+			}
+		}
+		if !d.Disable || ((s.Disabled || s.PendingAction == "disable") && lifecycleFailurePriority(d.State) < lifecycleFailurePriority(s.State)) {
+			if err = c.recordEventOutcome(ctx, db, event, true, "observed", "non-isolating or superseded failure"); err != nil {
+				return err
+			}
+			continue
+		}
+		if (s.Disabled || s.PendingAction == "disable") && d.State == s.State {
+			if d.RecoverAt == 0 || s.RecoverAt == 0 {
+				d.RecoverAt = 0
+			} else if s.RecoverAt > d.RecoverAt {
+				d.RecoverAt = s.RecoverAt
+			}
+		}
+		// Pending disable is executable intent, not a reason to lose later failures.
+		// Upgrade 429 to 401 even while Management is unavailable.
+		s.State, s.BlockedState, s.Reason, s.RecoverAt = d.State, d.State, d.Reason, d.RecoverAt
+		s.LastHTTPStatus, s.LastErrorType, s.LastErrorCode, s.LastErrorMessage = d.Status, d.ErrorType, d.ErrorCode, d.Reason
+		s.CheckOK = false
+		s.CheckResult = ""
+		if event.ID > s.LastEventID {
+			s.LastEventID = event.ID
+		}
+		if !s.Disabled && s.PendingAction == "" {
+			s.PendingAction, s.PendingOwner, s.PendingContentHash = "disable", true, s.ContentHash
+		}
+		if err = saveLifecycleState(ctx, db, &s, c.clock.Now(), "failure_observed"); err != nil {
+			return err
+		}
+		outcome := "disabled"
+		if !s.Disabled {
+			outcome = "pending_disable"
+		}
+		if err = c.recordEventOutcome(ctx, db, event, true, outcome, "failure merged into account isolation"); err != nil {
 			return err
 		}
 	}
@@ -575,34 +619,6 @@ func lifecycleFailurePriority(state string) int {
 		return 1
 	}
 	return 0
-}
-
-func (c *authLifecycleController) discoverQuotaReset(ctx context.Context, db *sql.DB, s *authLifecycleState, snapshot lifecycleSnapshot) {
-	account := triggerAuthAccount{configuredAccount: configuredAccount{AuthID: s.AuthID, AuthIndex: s.AuthIndex, Provider: "codex"}, AccessToken: lifecycleString(snapshot.Data, "access_token"), ChatGPTAccountID: lifecycleString(snapshot.Data, "account_id")}
-	run := executeQuotaUsageRequest(ctx, db, account, defaultPluginConfig())
-	after, err := c.host.Read(ctx, s.AuthIndex)
-	if err != nil {
-		c.retry(ctx, db, s, "quota recheck auth read-back failed")
-		return
-	}
-	if snapshotChanged(*s, after) {
-		c.conflict(ctx, db, s, after, "auth changed during quota recheck")
-		return
-	}
-	s.RetryAt = c.clock.Now().Add(5 * time.Minute).Unix()
-	if run.HTTPStatus >= 200 && run.HTTPStatus < 300 {
-		decision := classifyAuthFailure(usageRecord{Failed: true, Failure: usageFailure{StatusCode: 429, Body: `{"error":{"type":"usage_limit_reached"}}`}, ResponseHeaders: run.ResponseHeaders}, c.clock.Now())
-		s.RecoverAt = decision.RecoverAt
-		if s.RecoverAt == 0 && lifecycleQuotaAvailable(run, c.clock.Now()) {
-			s.RecoverAt = c.clock.Now().Unix()
-		}
-		if s.RecoverAt > 0 {
-			s.RetryAt = 0
-		}
-	}
-	if err = saveLifecycleState(ctx, db, s, c.clock.Now(), "quota_reset_recheck"); err != nil {
-		c.setError(errors.New("quota recheck state write failed"))
-	}
 }
 
 func lifecycleQuotaAvailable(run quotaTriggerRun, now time.Time) bool {
