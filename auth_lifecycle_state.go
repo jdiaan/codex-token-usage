@@ -16,6 +16,7 @@ const (
 	authBillingBlocked    = "BILLING_BLOCKED"
 	authPermissionBlocked = "PERMISSION_BLOCKED"
 	authManualDisabled    = "MANUAL_DISABLED"
+	authDisabledUnknown   = "DISABLED_UNKNOWN"
 )
 
 // Only observations and hashes are durable. Never put auth JSON or raw errors here.
@@ -23,6 +24,7 @@ type authLifecycleState struct {
 	PolicyVersion         int    `json:"policy_version"`
 	ManualDisabled        bool   `json:"manual_disabled"`
 	CredentialSince       int64  `json:"credential_since_ns"`
+	ControlSince          int64  `json:"control_since_ns,omitempty"`
 	BlockedFingerprint    string `json:"blocked_fingerprint,omitempty"`
 	IgnoredRuntimeFailure string `json:"ignored_runtime_failure,omitempty"`
 	AuthIndex             string `json:"auth_index"`

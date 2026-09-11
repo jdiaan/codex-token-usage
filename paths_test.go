@@ -43,7 +43,7 @@ func TestDefaultPathsUseCurrentUserHome(t *testing.T) {
 	withUserHomeDir(t, home, nil)
 	clearPathOverrides(t)
 
-	dataDir := filepath.Join(home, ".cli-proxy-api", "plugins", "codex-token-usage")
+	dataDir := filepath.Join(home, ".cli-proxy-api", "data", "codex-token-usage")
 	dbPath, err := usageDBPath()
 	if err != nil {
 		t.Fatalf("usageDBPath() error = %v", err)
@@ -73,7 +73,7 @@ func TestStoreOpenInitializesSQLiteUnderCurrentUserHome(t *testing.T) {
 	if err != nil {
 		t.Fatalf("store.open() error = %v", err)
 	}
-	want := filepath.Join(home, ".cli-proxy-api", "plugins", "codex-token-usage", "usage.db")
+	want := filepath.Join(home, ".cli-proxy-api", "data", "codex-token-usage", "usage.db")
 	if path != want {
 		t.Fatalf("store.open() path = %q, want %q", path, want)
 	}

@@ -203,9 +203,11 @@ func pluginOwnedDataPath(value string) bool {
 		return false
 	}
 	normalized := strings.ToLower(filepath.ToSlash(filepath.Clean(value)))
-	marker := "/plugins/" + strings.ToLower(pluginID) + "/"
-	if strings.Contains(normalized, marker) || strings.HasPrefix(normalized, "plugins/"+strings.ToLower(pluginID)+"/") {
-		return true
+	for _, root := range []string{"plugins", "data"} {
+		marker := root + "/" + strings.ToLower(pluginID) + "/"
+		if strings.Contains(normalized, "/"+marker) || strings.HasPrefix(normalized, marker) {
+			return true
+		}
 	}
 	if strings.ToLower(filepath.Base(value)) != "model_prices.json" {
 		return false

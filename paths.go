@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -46,10 +47,17 @@ func pluginDataDir() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(base, "plugins", pluginID), nil
+	return filepath.Join(base, "data", pluginID), nil
 }
 
 func usageDBPath() (string, error) {
+	return usageDBPathContext(context.Background())
+}
+
+func usageDBPathContext(ctx context.Context) (string, error) {
+	if err := migrateDefaultPluginData(ctx); err != nil {
+		return "", err
+	}
 	dir, err := pluginDataDir()
 	if err != nil {
 		return "", err

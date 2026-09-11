@@ -209,6 +209,9 @@ func (c *managementAuthClient) SetDisabled(ctx context.Context, s lifecycleSnaps
 	}
 	defer response.Body.Close()
 	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4096))
+	if response.StatusCode == http.StatusUnauthorized {
+		return errors.New("CPA management authentication failed (HTTP 401); check management_key; this is not an account credential error")
+	}
 	if response.StatusCode != http.StatusOK {
 		return fmt.Errorf("management status HTTP %d", response.StatusCode)
 	}

@@ -111,6 +111,9 @@ func (m *modelPriceUpdateManager) ensureFresh() {
 }
 
 func migrateLegacyModelPriceFile() error {
+	if err := migrateDefaultPluginData(context.Background()); err != nil {
+		return err
+	}
 	legacyPath := legacyModelPriceFilePath()
 	newPath := modelPriceFilePath()
 	if legacyPath == "" || newPath == "" || filepath.Clean(legacyPath) == filepath.Clean(newPath) {

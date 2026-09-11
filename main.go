@@ -87,7 +87,7 @@ const (
 )
 
 var (
-	pluginVersion    = "0.1.48"
+	pluginVersion    = "0.1.49"
 	pluginAuthor     = "Codex Token Usage Contributors"
 	pluginRepository = "https://github.com/zhumengling/codex-token-usage"
 )
@@ -1404,7 +1404,7 @@ func (s *store) openWithoutRepairLock(ctx context.Context) (*sql.DB, string, err
 	if s.db != nil {
 		return s.db, s.dbPath, nil
 	}
-	path, err := usageDBPath()
+	path, err := usageDBPathContext(ctx)
 	if err != nil {
 		return nil, "", err
 	}

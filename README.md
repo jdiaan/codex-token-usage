@@ -2,7 +2,7 @@
 
 CPA Token Usage is a CLIProxyAPI plugin for Codex account operation dashboards and AI provider usage analytics.
 
-Current version: `0.1.48`
+Current version: `0.1.49`
 
 ## Features
 
@@ -38,6 +38,16 @@ plugins/darwin/arm64/codex-token-usage.dylib
 ```
 
 Restart CLIProxyAPI after replacing the file.
+
+### Upgrading to 0.1.49
+
+The default persistent directory is now `$HOME/.cli-proxy-api/data/codex-token-usage`, outside the plugin installation directory. On first use, the plugin snapshots the old `$HOME/.cli-proxy-api/plugins/codex-token-usage/usage.db`, including committed WAL data, checks its integrity, and copies the price cache before publishing the new database. The old files are retained. An existing destination database is authoritative and is never overwritten or merged. Migration errors stop database initialization instead of silently starting with an empty database. The filesystem must support hard links for atomic publication (for example ext4 or NTFS).
+
+`CPA_TOKEN_USAGE_DIR` remains authoritative: explicitly configured directories are not relocated. Set it to an absolute persistent path if the CPA service user or container changes; replacing the binary cannot preserve a home directory or volume that is itself deleted. `CPA_MODEL_PRICE_FILE` still overrides the price cache location.
+
+Before replacing the library, stop CPA and back up `usage.db` together with any `usage.db-wal` and `usage.db-shm` files. Restart CPA, then check Summary's `version` and `db_path` to confirm the loaded build and data location. Preserve the new data directory on future upgrades. For rollback, stop CPA and point `CPA_TOKEN_USAGE_DIR` at the active data directory rather than resuming the stale copy in the old directory.
+
+Old external-change conflicts are migrated automatically when same-account credential evidence is available. The oldest releases sometimes overwrote the only old fingerprint; when neither the saved state nor failure evidence can establish a credential change, use **启用 (Enable)** for that account after signing in again. Do not clear the database to recover accounts. If the old database is already missing, disabled accounts display **禁用来源未知** (`DISABLED_UNKNOWN`) and remain disabled until explicitly enabled.
 
 ## Configuration
 
@@ -137,7 +147,7 @@ CPA_TOKEN_USAGE_MANAGEMENT_KEY=<your plaintext management key>
 
 The URL is the CPA root URL. Environment variables override the corresponding plugin fields. The key must be plaintext; a configuration password hash is not a usable substitute. CPA 7.2.145 does not provide a masked secret field for plugin configuration, so `management_key` is stored visibly in the CPA YAML and should only be used where access to that file and Management UI is trusted. Prefer the environment variable when the config must not contain the key. Missing or invalid configuration leaves statistics and native scheduling working, but the dashboard shows a prominent warning that 401/402/403/429 state writes cannot run. API errors never reactivate the old native candidate filters.
 
-The controller supports uniquely identified physical Codex OAuth auth files. It sends only `{name, auth_index, disabled}` to `PATCH /v0/management/auth-files/status`, then verifies both the file and runtime state and checks that credential/custom/routing fields were preserved. HTTP 200 alone is insufficient. SQLite stores fingerprints, intent, state versions and sanitized audit evidence. Existing disabled files are treated as manually disabled unless a completed plugin operation proves ownership.
+The controller supports uniquely identified physical Codex OAuth auth files. It sends only `{name, auth_index, disabled}` to `PATCH /v0/management/auth-files/status`, then verifies both the file and runtime state and checks that credential/custom/routing fields were preserved. HTTP 200 alone is insufficient. SQLite stores fingerprints, intent, state versions and sanitized audit evidence. Existing disabled files without plugin history retain unknown ownership; explicit manual disables remain manual.
 
 401/402 (and explicit account-level 403) disable the CPA auth file until same-account credentials update, then automatically enable it. Ordinary metadata changes and token refresh observations never impose a manual-review gate. 429 and explicit traffic limits use returned JSON/header deadlines; multiple exhausted windows use the latest known reset, and a missing window does not erase another valid reset. Without a valid deadline, cooldown lasts 60 seconds. Timer expiry automatically enables plugin-owned isolation. Explicit manual disables remain manual.
 
@@ -152,7 +162,9 @@ Content-Type: application/json
 {"auth_index":"exact-index","version":3,"action":"retry_sync"}
 ```
 
-The normal dashboard offers only **重试同步** (`retry_sync`) for pending/failed synchronization. Use the latest lifecycle version from Summary; stale versions return 409. Compatibility `recheck` and `check_and_recover` actions perform the same local reconciliation without upstream requests. Legacy explicit `enable`, `disable`, and `clear` actions remain available through the API; Disable/Clear relinquish automatic recovery ownership.
+The dashboard offers **启用 (Enable)** (`enable`) for blocked/disabled accounts and **重试同步** (`retry_sync`) for pending/failed synchronization. Enable supersedes old failures using a durable nanosecond control boundary (`control_since_ns`) and synchronizes CPA without requiring Recheck or sending upstream probes. It reports success only after file and runtime read-back confirms enabled state; this permits scheduling but does not assert that credentials have been validated. New request failures still trigger isolation. Management HTTP 401 explicitly identifies the management key problem, separately from account credential failures.
+
+Use the latest lifecycle version from Summary; stale versions return 409 and the dashboard refreshes before another action. Compatibility `recheck` and `check_and_recover` actions perform the same local reconciliation without upstream requests. Explicit `disable` and `clear` actions remain available through the API; Disable/Clear relinquish automatic recovery ownership. The compact `relogin-required-accounts` response shape is unchanged.
 
 External programs can query confirmed native-mode accounts that are waiting for re-login without fetching the full Summary or changing account state:
 
@@ -217,7 +229,7 @@ https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_
 The downloaded file is stored under the current CPA user's data directory:
 
 ```text
-$HOME/.cli-proxy-api/plugins/codex-token-usage/model_prices.cache
+$HOME/.cli-proxy-api/data/codex-token-usage/model_prices.cache
 ```
 
 The file is about 1.5 MB and is not bundled into release zips, so plugin binaries stay smaller and prices can be refreshed without rebuilding the plugin.
@@ -251,11 +263,11 @@ python3 integration/run_cpa_native.py # Go >=1.26; pinned CPA v7.2.145
 Release assets are named in the CLIProxyAPI plugin store format:
 
 ```text
-codex-token-usage_0.1.48_linux_amd64.zip
-codex-token-usage_0.1.48_linux_arm64.zip
-codex-token-usage_0.1.48_windows_amd64.zip
-codex-token-usage_0.1.48_darwin_amd64.zip
-codex-token-usage_0.1.48_darwin_arm64.zip
+codex-token-usage_0.1.49_linux_amd64.zip
+codex-token-usage_0.1.49_linux_arm64.zip
+codex-token-usage_0.1.49_windows_amd64.zip
+codex-token-usage_0.1.49_darwin_amd64.zip
+codex-token-usage_0.1.49_darwin_arm64.zip
 checksums.txt
 ```
 

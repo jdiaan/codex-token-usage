@@ -172,6 +172,8 @@ func TestConfiguredCodexHostAuthEntryRequiresExplicitProviderAndRejectsPluginPat
 		{name: "empty provider", entry: hostAuthFileEntry{Name: "codex-looking.json"}},
 		{name: "plugin data path", entry: hostAuthFileEntry{Name: "model_prices.json", Path: filepath.Join(pluginDir, "model_prices.json"), Provider: "codex"}},
 		{name: "relative plugin data path", entry: hostAuthFileEntry{ID: "plugins/codex-token-usage/model_prices.json", Provider: "codex"}},
+		{name: "persistent data path", entry: hostAuthFileEntry{ID: "data/codex-token-usage/model_prices.json", Provider: "codex"}},
+		{name: "absolute persistent data path", entry: hostAuthFileEntry{Path: filepath.Join(t.TempDir(), "data", pluginID, "model_prices.json"), Provider: "codex"}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

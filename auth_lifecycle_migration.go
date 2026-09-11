@@ -9,11 +9,15 @@ import (
 // Upgrade the former review-gated policy once per account. No quota probe or
 // new failure is fabricated; only existing local failure evidence is replayed.
 func (c *authLifecycleController) migrateAccountPolicy(ctx context.Context, db *sql.DB, s *authLifecycleState, current lifecycleSnapshot) error {
-	explicitManual := s.Reason == "manual_disabled" || s.Reason == "manual_clear" || (s.State == authManualDisabled && s.BlockedState == "" && s.DisabledAt == 0 && s.SyncStatus != "conflict")
+	if s.PolicyVersion >= 2 {
+		s.PolicyVersion = lifecyclePolicyVersion
+		return nil
+	}
+	explicitManual := s.Reason == "manual_disabled" || s.Reason == "manual_clear"
 	s.ManualDisabled = explicitManual && (current.FileDisabled || s.PendingAction == "disable")
 	s.PolicyVersion, s.Paused = lifecyclePolicyVersion, false
 	s.IgnoreBefore = 0 // Old metadata-conflict timestamps are not login boundaries.
-	s.CredentialSince = snapshotCredentialTime(current)
+	s.CredentialSince = 0
 	s.SyncStatus, s.SyncError, s.RetryAt, s.RetryCount = "synced", "", 0, 0
 	if s.ManualDisabled {
 		s.State, s.Reason, s.DisabledByPlugin = authManualDisabled, "manual_disabled", false
@@ -24,6 +28,10 @@ func (c *authLifecycleController) migrateAccountPolicy(ctx context.Context, db *
 	}
 	if s.State == authManualDisabled {
 		clearLifecycleFailure(s)
+		s.DisabledByPlugin = false
+		if current.FileDisabled || current.Entry.Disabled {
+			s.State, s.Reason = authDisabledUnknown, "disabled_origin_unknown"
+		}
 	}
 	if loginAuthState(s.State) || temporaryAuthState(s.State) {
 		s.BlockedFingerprint = s.Fingerprint
@@ -34,18 +42,28 @@ func (c *authLifecycleController) migrateAccountPolicy(ctx context.Context, db *
 			s.RecoverAt = s.UpdatedAt + 60
 		}
 	}
-	if loginAuthState(s.State) && s.CredentialSince > 0 {
-		var lastFailure int64
-		if err := db.QueryRowContext(ctx, `SELECT COALESCE(MAX(requested_at),0) FROM auth_lifecycle_events WHERE (auth_index=? OR (auth_index='' AND auth_id=?)) AND json_extract(payload,'$.state') IN ('AUTH_INVALID','BILLING_BLOCKED','PERMISSION_BLOCKED')`, s.AuthIndex, s.AuthID).Scan(&lastFailure); err != nil {
+	if loginAuthState(s.State) {
+		// The old conflict handler overwrote the observed fingerprint. Recover
+		// the failure generation from the latest event when that evidence exists.
+		var raw string
+		err := db.QueryRowContext(ctx, `SELECT payload FROM auth_lifecycle_events WHERE (auth_index=? OR (auth_index='' AND auth_id=?)) AND json_extract(payload,'$.state') IN ('AUTH_INVALID','BILLING_BLOCKED','PERMISSION_BLOCKED') ORDER BY requested_at DESC,id DESC LIMIT 1`, s.AuthIndex, s.AuthID).Scan(&raw)
+		if err != nil && err != sql.ErrNoRows {
 			return err
 		}
-		if lastFailure > 0 && s.CredentialSince/1e9 > lastFailure {
-			if current.FileDisabled || current.Entry.Disabled {
-				s.PendingAction = "enable"
-				s.PendingOwner = false
-			} else {
-				clearLifecycleFailure(s)
+		if err == nil {
+			var d authDecision
+			if err = json.Unmarshal([]byte(raw), &d); err != nil {
+				return err
 			}
+			if d.Fingerprint != "" && d.Fingerprint != "previous-generation" {
+				s.BlockedFingerprint = d.Fingerprint
+			}
+		}
+	}
+	if s.Fingerprint != current.Fingerprint || (loginAuthState(s.State) && s.BlockedFingerprint != "" && s.BlockedFingerprint != current.Fingerprint) {
+		s.CredentialSince = snapshotCredentialTime(current)
+		if s.CredentialSince <= 0 || s.CredentialSince > c.clock.Now().UnixNano() {
+			s.CredentialSince = c.clock.Now().UnixNano()
 		}
 	}
 	var success int64
@@ -80,7 +98,7 @@ func (c *authLifecycleController) migrateAccountPolicy(ctx context.Context, db *
 			continue
 		}
 		outcome, detail, processed := "pending", "replaying failure after policy upgrade", 0
-		if e.RequestedAt < success || (s.CredentialSince > 0 && e.RequestedAt < s.CredentialSince/1e9) || explicitManual {
+		if e.RequestedAt < success || (s.CredentialSince > 0 && e.RequestedAt < s.CredentialSince/1e9) || (e.Decision.Fingerprint != "" && e.Decision.Fingerprint != current.Fingerprint) || explicitManual {
 			outcome, detail, processed = "ignored_stale", "newer login, successful usage or manual action superseded failure", 1
 		}
 		if temporaryAuthState(e.Decision.State) {

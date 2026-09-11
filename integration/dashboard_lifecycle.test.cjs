@@ -93,15 +93,57 @@ test('unknown reset, pending writes, manual ownership and due recovery are expli
   assert.equal(run('autobanRemainingText(account)'), '正在恢复');
 });
 
-test('normal account states have no review controls and only sync failures offer retry', () => {
+test('blocked and unknown accounts offer Enable without the former recheck requirement', () => {
   const {context,run}=dashboard([]);
-  for(const state of ['HEALTHY','AUTH_INVALID','BILLING_BLOCKED','QUOTA_COOLDOWN','RATE_LIMITED']){
+  context.account=row('a','HEALTHY',{disabled:false});
+  assert.doesNotMatch(run('lifecycleStatus(account.lifecycle)'),/data-lifecycle-action/);
+  for(const state of ['AUTH_INVALID','BILLING_BLOCKED','QUOTA_COOLDOWN','RATE_LIMITED','MANUAL_DISABLED','DISABLED_UNKNOWN']){
     context.account=row('a',state);
     const html=run('lifecycleStatus(account.lifecycle)');
-    assert.doesNotMatch(html,/data-lifecycle-action|Recheck|Enable|Disable|check_and_recover/);
+    assert.match(html,/data-lifecycle-action="enable"/);
+    assert.doesNotMatch(html,/Recheck|check_and_recover|data-lifecycle-action="retry_sync"/);
   }
   context.account=row('a','AUTH_INVALID',{disabled:false,pending_action:'disable',sync_error:'retrying'});
   assert.match(run('lifecycleStatus(account.lifecycle)'),/data-lifecycle-action="retry_sync"/);
+  context.account=row('a','HEALTHY',{disabled:false,control_since_ns:123,pending_action:'enable'});
+  const pending=run('lifecycleStatus(account.lifecycle)');
+  assert.match(pending,/正在同步.*启用待确认/);
+  assert.doesNotMatch(pending,/已启用/);
+  context.account.lifecycle.pending_action='';
+  assert.match(run('lifecycleStatus(account.lifecycle)'),/已启用/);
+});
+
+test('Enable reports confirmed success, partial sync, management failure and stale version', async () => {
+  for(const outcome of ['enabled','partial','management401','browser401','conflict']){
+    const {context}=dashboard([row('a')]);
+    const button={dataset:{authIndex:'a',version:'7',lifecycleAction:'enable'},disabled:false,textContent:'启用 (Enable)'};
+    const requests=[],alerts=[];
+    let refreshes=0,handler;
+    context.window={alert:message=>alerts.push(message)};
+    context.document.addEventListener=(_event,fn)=>{handler=fn};
+    context.quotaActivationJSON=async(url,options)=>{
+      requests.push({url,body:JSON.parse(options.body)});
+      assert.equal(button.disabled,true);
+      if(outcome==='management401')throw Error('CPA management authentication failed (HTTP 401); check management_key');
+      if(outcome==='browser401'){const error=Error('invalid API key');error.status=401;throw error}
+      if(outcome==='conflict')throw Error('account state changed; refresh and retry');
+      return {account:{disabled:outcome!=='enabled',sync_status:outcome==='enabled'?'synced':'pending'}};
+    };
+    context.load=async()=>{refreshes++};
+    const start=source.indexOf("document.addEventListener('click',async event=>{\n  const button=event.target.closest('[data-lifecycle-action]')");
+    vm.runInContext(source.slice(start,source.indexOf('function accountStatus(',start)),context);
+    const event={target:{closest:()=>button}};
+    const first=handler(event);
+    await handler(event); // Double clicks cannot dispatch a second write.
+    await first;
+    assert.equal(requests.length,1);
+    assert.deepEqual(requests[0].body,{auth_index:'a',version:7,action:'enable'});
+    assert.equal(refreshes,1);
+    assert.equal(button.disabled,false);
+    assert.equal(button.textContent,'启用 (Enable)');
+    assert.equal(alerts.length,1);
+    assert.match(alerts[0],{enabled:/已启用.*实际请求/,partial:/尚未确认.*同步/,management401:/management authentication.*management_key/,browser401:/管理接口认证失败.*不是账号凭据/,conflict:/状态已变化.*重新操作/}[outcome]);
+  }
 });
 
 test('pending evidence is visible without counting it as a confirmed disable or querying quota', () => {

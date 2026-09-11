@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-const lifecyclePolicyVersion = 2
+const lifecyclePolicyVersion = 3
 
 func temporaryAuthState(state string) bool {
 	return state == authQuotaCooldown || state == authRateLimited
@@ -37,10 +37,10 @@ func snapshotCredentialTime(s lifecycleSnapshot) int64 {
 }
 
 func stateFromSnapshot(s lifecycleSnapshot, now time.Time) authLifecycleState {
-	state := authLifecycleState{PolicyVersion: lifecyclePolicyVersion, AuthIndex: s.Entry.AuthIndex, AuthID: s.Entry.ID, Name: s.Entry.Name, Identity: s.Identity, Fingerprint: s.Fingerprint, ContentHash: s.ContentHash, RuntimeUpdated: s.Entry.UpdatedAt, State: authHealthy, Disabled: s.Entry.Disabled && s.FileDisabled, ManualDisabled: s.FileDisabled, SyncStatus: "synced", CreatedAt: now.Unix(), CredentialSince: snapshotCredentialTime(s)}
-	if state.ManualDisabled {
-		state.State = authManualDisabled
-		state.Reason = "manual_disabled"
+	state := authLifecycleState{PolicyVersion: lifecyclePolicyVersion, AuthIndex: s.Entry.AuthIndex, AuthID: s.Entry.ID, Name: s.Entry.Name, Identity: s.Identity, Fingerprint: s.Fingerprint, ContentHash: s.ContentHash, RuntimeUpdated: s.Entry.UpdatedAt, State: authHealthy, Disabled: s.Entry.Disabled && s.FileDisabled, SyncStatus: "synced", CreatedAt: now.Unix(), CredentialSince: snapshotCredentialTime(s)}
+	if s.Entry.Disabled || s.FileDisabled {
+		state.State = authDisabledUnknown
+		state.Reason = "disabled_origin_unknown"
 	}
 	if s.Entry.Disabled != s.FileDisabled {
 		state.SyncStatus = "pending"
@@ -60,7 +60,16 @@ func eventIsStale(e lifecycleEvent, s authLifecycleState) bool {
 	if ns == 0 {
 		ns = e.RequestedAt * int64(time.Second)
 	}
-	return (s.CredentialSince > 0 && ns < s.CredentialSince) || e.RequestedAt < s.IgnoreBefore || (e.Decision.Fingerprint != "" && e.Decision.Fingerprint != s.Fingerprint)
+	return (s.CredentialSince > 0 && ns < s.CredentialSince) || (s.ControlSince > 0 && ns < s.ControlSince) || e.RequestedAt < s.IgnoreBefore || (e.Decision.Fingerprint != "" && e.Decision.Fingerprint != s.Fingerprint)
+}
+
+// Persist before the status write, so late failures cannot undo an explicit
+// enable even when the CPA write needs retrying or the plugin restarts.
+func supersedeLifecycleFailures(s *authLifecycleState, snapshot lifecycleSnapshot, now time.Time) {
+	s.ControlSince = now.UnixNano()
+	if _, terminal := classifyRuntimeAuthFailure(snapshot.Entry); terminal {
+		s.IgnoredRuntimeFailure = runtimeFailureSignature(snapshot.Entry)
+	}
 }
 
 // Observe credential changes before consuming failures or applying status writes.
@@ -77,10 +86,11 @@ func (c *authLifecycleController) observeSnapshot(ctx context.Context, db *sql.D
 		}
 	}
 	credentialChanged := s.Fingerprint != current.Fingerprint
+	blockedCredentialChanged := loginAuthState(s.State) && s.PendingAction != "enable" && s.BlockedFingerprint != "" && s.BlockedFingerprint != current.Fingerprint
 	if _, terminal := classifyRuntimeAuthFailure(current.Entry); !terminal {
 		s.IgnoredRuntimeFailure = ""
 	}
-	if credentialChanged {
+	if credentialChanged || blockedCredentialChanged {
 		if _, terminal := classifyRuntimeAuthFailure(current.Entry); terminal {
 			s.IgnoredRuntimeFailure = runtimeFailureSignature(current.Entry)
 		}
@@ -102,14 +112,15 @@ func (c *authLifecycleController) observeSnapshot(ctx context.Context, db *sql.D
 		}
 	}
 	if s.PendingAction == "" {
-		if current.FileDisabled && !s.Disabled && !s.DisabledByPlugin {
+		if current.FileDisabled && !s.Disabled && !s.DisabledByPlugin && s.State != authDisabledUnknown {
 			s.ManualDisabled = true
 			s.State, s.Reason = authManualDisabled, "manual_disabled"
-		} else if !current.FileDisabled && !current.Entry.Disabled && (s.Disabled || s.ManualDisabled) {
+		} else if !current.FileDisabled && !current.Entry.Disabled && (s.Disabled || s.ManualDisabled || s.State == authDisabledUnknown) {
 			// An operator's enable is effective immediately, without a permanent pause.
 			clearLifecycleFailure(s)
 			s.ManualDisabled, s.DisabledByPlugin = false, false
 			s.IgnoreBefore = c.clock.Now().Unix()
+			supersedeLifecycleFailures(s, current, c.clock.Now())
 		}
 	}
 	s.Disabled = current.FileDisabled && current.Entry.Disabled
@@ -233,6 +244,9 @@ func (c *authLifecycleController) syncAccount(ctx context.Context, db *sql.DB, s
 		}
 		return nil
 	}
+	if s.State == authDisabledUnknown && s.PendingAction == "" {
+		return nil
+	}
 	if s.RetryAt > c.clock.Now().Unix() {
 		return nil
 	}
@@ -300,7 +314,7 @@ func (c *authLifecycleController) transition(ctx context.Context, db *sql.DB, s 
 	}
 	s.PendingOwner = owner
 	if !c.host.Ready() {
-		c.retry(ctx, db, s, "management API is not configured; retrying status sync")
+		c.retry(ctx, db, s, "management API is not configured; check management_url and management_key; retrying status sync")
 		return errors.New(s.SyncError)
 	}
 	current, err := c.host.Read(ctx, s.AuthIndex)
@@ -316,13 +330,18 @@ func (c *authLifecycleController) transition(ctx context.Context, db *sql.DB, s 
 	if err = saveLifecycleState(ctx, db, s, c.clock.Now(), "status_intent"); err != nil {
 		return err
 	}
+	var writeErr error
 	if current.FileDisabled != disabled || current.Entry.Disabled != disabled {
-		_ = c.host.SetDisabled(ctx, current, disabled)
+		writeErr = c.host.SetDisabled(ctx, current, disabled)
 	}
 	after, err := c.host.Read(ctx, s.AuthIndex)
 	if err != nil {
-		c.retry(ctx, db, s, "status read-back unavailable; retrying")
-		return err
+		reason := "status read-back unavailable; retrying"
+		if writeErr != nil {
+			reason = writeErr.Error() + "; " + reason
+		}
+		c.retry(ctx, db, s, reason)
+		return errors.New(reason)
 	}
 	if snapshotChanged(*s, after) || current.Fingerprint != after.Fingerprint {
 		c.retry(ctx, db, s, "credentials changed during status sync; retrying")
@@ -330,7 +349,11 @@ func (c *authLifecycleController) transition(ctx context.Context, db *sql.DB, s 
 	}
 	if after.FileDisabled != disabled || after.Entry.Disabled != disabled {
 		s.Disabled = after.FileDisabled && after.Entry.Disabled
-		c.retry(ctx, db, s, "status not yet confirmed in file and runtime; retrying")
+		reason := "status not yet confirmed in file and runtime; retrying"
+		if writeErr != nil {
+			reason = writeErr.Error()
+		}
+		c.retry(ctx, db, s, reason)
 		return errors.New(s.SyncError)
 	}
 	s.Disabled, s.DisabledByPlugin = disabled, disabled && owner

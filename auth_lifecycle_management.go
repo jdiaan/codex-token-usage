@@ -205,6 +205,9 @@ func (c *authLifecycleController) action(ctx context.Context, req lifecycleActio
 		return s, err
 	case "enable", "disable":
 		clearLifecycleFailure(&s)
+		if req.Action == "enable" {
+			supersedeLifecycleFailures(&s, snapshot, c.clock.Now())
+		}
 		s.ManualDisabled = req.Action == "disable"
 		if s.ManualDisabled {
 			s.State, s.Reason = authManualDisabled, "manual_disabled"

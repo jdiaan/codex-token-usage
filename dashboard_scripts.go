@@ -192,7 +192,7 @@ async function quotaActivationJSON(url,options={}){
   const res=await fetch(url,Object.assign({},options,{headers:Object.assign({},headers,options.headers||{})}));
   let body={};try{body=await res.json()}catch(e){}
   if(res.status===401)rejectManagementKey(managementKey());
-  if(!res.ok)throw new Error(body.message||body.error||('HTTP '+res.status));
+  if(!res.ok){const error=new Error(body.message||body.error||('HTTP '+res.status));error.status=res.status;throw error}
   return body;
 }
 async function previewQuotaActivation(){
@@ -2913,13 +2913,14 @@ function maxQuota(r){return Math.max(r.primary_used_percent||0,r.secondary_used_
 function triggerRisk(r){return r.quota_trigger_status&&r.quota_trigger_status!=='success'&&r.quota_trigger_status!=='skipped'}
 function triggerSortScore(r){return triggerRisk(r)?3:(r.quota_trigger_status==='skipped'?2:(r.quota_trigger_status==='success'?1:0))}
 function lifecycleStatus(s){
-  const labels={HEALTHY:'健康',AUTH_INVALID:'401 · 认证失效',BILLING_BLOCKED:'402 · 账号／工作区不可用',QUOTA_COOLDOWN:'429 · 额度限制',RATE_LIMITED:'429 · 请求限流',PERMISSION_BLOCKED:'403 · 账号权限受限',MANUAL_DISABLED:'人工停用'};
   const syncing=Boolean(s.pending_action||s.sync_error);
+  const labels={HEALTHY:s.control_since_ns?(syncing||s.disabled?'启用待确认':'已启用'):'健康',AUTH_INVALID:'401 · 认证失效',BILLING_BLOCKED:'402 · 账号／工作区不可用',QUOTA_COOLDOWN:'429 · 额度限制',RATE_LIMITED:'429 · 请求限流',PERMISSION_BLOCKED:'403 · 账号权限受限',MANUAL_DISABLED:'人工停用',DISABLED_UNKNOWN:'禁用来源未知'};
   const label=(syncing?(s.sync_error?'同步失败 · ':'正在同步 · '):s.disabled?'已禁用 · ':'')+(labels[s.state]||s.state);
   const recovery=['AUTH_INVALID','BILLING_BLOCKED','PERMISSION_BLOCKED'].includes(s.state)?'重新登录后自动恢复':['QUOTA_COOLDOWN','RATE_LIMITED'].includes(s.state)?(s.recover_at?'恢复时间：'+new Date(s.recover_at*1000).toLocaleString():'默认冷却 1 分钟'):'';
-  const detail=[recovery,s.disable_reason==='rate_limit_backoff'?'上游未返回有效时间，使用默认冷却':s.disable_reason||'',s.sync_error||''].filter(Boolean).join(' · ');
+  const detail=[recovery,s.disable_reason==='disabled_origin_unknown'?'缺少原禁用记录；确认后可手动启用':s.disable_reason==='rate_limit_backoff'?'上游未返回有效时间，使用默认冷却':s.disable_reason||'',s.sync_error||''].filter(Boolean).join(' · ');
   const retry=syncing?'<button type="button" class="btn" data-lifecycle-action="retry_sync" data-auth-index="'+esc(s.auth_index)+'" data-version="'+Number(s.version)+'">重试同步</button>':'';
-  return '<span class="status-pill '+(s.state==='HEALTHY'&&!syncing?'ok':'warn')+'">'+esc(label)+'</span>'+(detail?'<details><summary>详情</summary><div>'+esc(detail)+'</div></details>':'')+retry;
+  const enable=s.disabled||s.state!=='HEALTHY'||s.paused||syncing?'<button type="button" class="btn" data-lifecycle-action="enable" data-auth-index="'+esc(s.auth_index)+'" data-version="'+Number(s.version)+'">启用 (Enable)</button>':'';
+  return '<span class="status-pill '+(s.state==='HEALTHY'&&!s.disabled&&!syncing?'ok':'warn')+'">'+esc(label)+'</span>'+(detail?'<details><summary>详情</summary><div>'+esc(detail)+'</div></details>':'')+retry+enable;
 }
 function renderNativeLifecycleModal(prefix,page,pageNumber,title){
   if(!isNativeLifecycle())return false;
@@ -2941,13 +2942,24 @@ function renderNativeLifecycleModal(prefix,page,pageNumber,title){
   return true;
 }
 document.addEventListener('click',async event=>{
-  const button=event.target.closest('[data-lifecycle-action]');if(!button||button.dataset.lifecycleAction!=='retry_sync')return;
+  const button=event.target.closest('[data-lifecycle-action]');if(!button||button.disabled||!['retry_sync','enable'].includes(button.dataset.lifecycleAction))return;
+  const action=button.dataset.lifecycleAction;
+  const originalText=button.textContent;
   button.disabled=true;
+  button.textContent=action==='enable'?'正在启用…':'正在同步…';
   try{
-    await quotaActivationJSON('/v0/management/plugins/__PLUGIN_ID__/auth-states/action',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({auth_index:button.dataset.authIndex,version:Number(button.dataset.version),action:'retry_sync'})});
-  }catch(error){window.alert(String(error.message||error))}finally{
+    const result=await quotaActivationJSON('/v0/management/plugins/__PLUGIN_ID__/auth-states/action',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({auth_index:button.dataset.authIndex,version:Number(button.dataset.version),action})});
+    if(action==='enable'){
+      const s=result.account||{};
+      window.alert(s.disabled===false&&s.sync_status==='synced'&&!s.pending_action&&!s.sync_error?'已启用，可参与调度；凭据是否有效以实际请求结果为准。':'启用尚未确认，正在同步。请查看账号详情或重试同步。');
+    }
+  }catch(error){
+    const message=String(error.message||error);
+    window.alert(error.status===401?'管理接口认证失败 (HTTP 401)，请检查管理密钥；这不是账号凭据的 401。':message==='management_key_required'?'请先填写 CPA 管理密钥。':message.includes('account state changed')?'账号状态已变化，页面将刷新，请重新操作。':message);
+  }finally{
     try{await load(true,true)}catch(error){window.alert(String(error.message||error))}
     button.disabled=false;
+    button.textContent=originalText;
   }
 });
 function accountStatus(r){
