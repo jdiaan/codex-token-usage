@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net/http"
 	"path"
+	"sort"
 	"strings"
 	"time"
 )
@@ -17,6 +18,113 @@ type lifecycleActionRequest struct {
 	Action            string `json:"action"`
 	ConfirmModelProbe bool   `json:"confirm_model_probe"`
 	ProbeModel        string `json:"probe_model,omitempty"`
+}
+
+// reloginRequiredAccount is the deliberately small public representation of a
+// plugin-owned Codex credential that cannot recover until it is signed in
+// again. Do not add lifecycle internals here: this endpoint is intended as a
+// stable integration contract.
+type reloginRequiredAccount struct {
+	AuthIndex  string `json:"auth_index"`
+	AuthID     string `json:"auth_id"`
+	Name       string `json:"name"`
+	State      string `json:"state"`
+	HTTPStatus int    `json:"http_status"`
+	Reason     string `json:"reason"`
+	DisabledAt int64  `json:"disabled_at"`
+	Version    int64  `json:"version"`
+}
+
+type reloginRequiredAccountsResponse struct {
+	GeneratedAt string                   `json:"generated_at"`
+	Count       int                      `json:"count"`
+	Accounts    []reloginRequiredAccount `json:"accounts"`
+}
+
+func lifecycleDisplayState(s authLifecycleState) string {
+	if s.State == authManualDisabled && s.BlockedState != "" {
+		return s.BlockedState
+	}
+	return s.State
+}
+
+// lifecycleRequiresRelogin defines the same confirmed, non-timed lifecycle
+// states the dashboard presents as "等待重新登录". Pending or unhealthy sync
+// state is intentionally excluded: an external caller must not act on a
+// disable that CPA has not confirmed.
+func lifecycleRequiresRelogin(s authLifecycleState) bool {
+	if !s.Disabled || !s.DisabledByPlugin || s.ManualDisabled || s.Paused ||
+		s.PendingAction != "" || s.SyncError != "" || s.SyncStatus != "synced" || s.RecoverAt != 0 {
+		return false
+	}
+	switch lifecycleDisplayState(s) {
+	case authInvalid, authBillingBlocked, authPermissionBlocked:
+		return true
+	default:
+		return false
+	}
+}
+
+func lifecycleHTTPStatus(s authLifecycleState) int {
+	switch lifecycleDisplayState(s) {
+	case authInvalid:
+		return http.StatusUnauthorized
+	case authBillingBlocked:
+		return http.StatusPaymentRequired
+	case authPermissionBlocked:
+		return http.StatusForbidden
+	case authQuotaCooldown, authRateLimited:
+		return http.StatusTooManyRequests
+	default:
+		return s.LastHTTPStatus
+	}
+}
+
+func queryReloginRequiredAccounts(ctx context.Context, db *sql.DB) ([]reloginRequiredAccount, error) {
+	states, err := listLifecycleStates(ctx, db)
+	if err != nil {
+		return nil, err
+	}
+	accounts := make([]reloginRequiredAccount, 0, len(states))
+	for _, s := range states {
+		if !lifecycleRequiresRelogin(s) {
+			continue
+		}
+		accounts = append(accounts, reloginRequiredAccount{
+			AuthIndex:  s.AuthIndex,
+			AuthID:     s.AuthID,
+			Name:       s.Name,
+			State:      lifecycleDisplayState(s),
+			HTTPStatus: lifecycleHTTPStatus(s),
+			Reason:     s.Reason,
+			DisabledAt: s.DisabledAt,
+			Version:    s.Version,
+		})
+	}
+	sort.Slice(accounts, func(i, j int) bool { return accounts[i].AuthIndex < accounts[j].AuthIndex })
+	return accounts, nil
+}
+
+func handleReloginRequiredAccounts(req managementRequest) managementResponse {
+	if req.Method != http.MethodGet {
+		return jsonResponse(http.StatusMethodNotAllowed, map[string]any{"error": "method_not_allowed"})
+	}
+	if !nativeScheduling() {
+		return jsonResponse(http.StatusConflict, map[string]any{"error": "unsupported_scheduling_mode"})
+	}
+	db, _, err := globalStore.open(context.Background())
+	if err != nil {
+		return jsonResponse(http.StatusInternalServerError, map[string]any{"error": "relogin_accounts_failed", "message": err.Error()})
+	}
+	accounts, err := queryReloginRequiredAccounts(context.Background(), db)
+	if err != nil {
+		return jsonResponse(http.StatusInternalServerError, map[string]any{"error": "relogin_accounts_failed", "message": err.Error()})
+	}
+	return jsonResponse(http.StatusOK, reloginRequiredAccountsResponse{
+		GeneratedAt: time.Now().Format(time.RFC3339),
+		Count:       len(accounts),
+		Accounts:    accounts,
+	})
 }
 
 func handleLifecycleAction(req managementRequest) managementResponse {
@@ -202,11 +310,7 @@ func queryLifecycleRows(ctx context.Context, db *sql.DB, now int64, pending bool
 		}
 		copy := s
 		r := autobanRow{Lifecycle: &copy, AuthID: s.AuthID, AuthIndex: s.AuthIndex, AuthFile: s.Name, Source: s.Name, Provider: "codex", Active: true, Window: s.State, Reason: s.Reason, BannedAt: s.DisabledAt, ResetAt: s.RecoverAt, SecondsRemaining: -1}
-		state := s.State
-		if state == authManualDisabled && s.BlockedState != "" {
-			state = s.BlockedState
-		}
-		switch state {
+		switch lifecycleDisplayState(s) {
 		case authInvalid:
 			r.Window, r.LastStatusCode = "401", 401
 		case authBillingBlocked:

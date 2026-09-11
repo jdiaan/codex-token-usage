@@ -87,7 +87,7 @@ const (
 )
 
 var (
-	pluginVersion    = "0.1.47"
+	pluginVersion    = "0.1.48"
 	pluginAuthor     = "Codex Token Usage Contributors"
 	pluginRepository = "https://github.com/zhumengling/codex-token-usage"
 )
@@ -465,6 +465,7 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		return okJSON(managementRegistrationResponse{
 			Routes: []managementRoute{
 				{Method: "POST", Path: "/plugins/codex-token-usage/auth-states/action", Description: "Versioned Codex account lifecycle action."},
+				{Method: "GET", Path: "/plugins/codex-token-usage/relogin-required-accounts", Description: "Confirmed Codex accounts awaiting re-login."},
 				{Method: "GET", Path: "/plugins/codex-token-usage/summary", Description: "Token usage summary JSON."},
 				{Method: "GET", Path: "/plugins/codex-token-usage/export", Description: "Token usage CSV/JSON export."},
 				{Method: "POST", Path: "/plugins/codex-token-usage/autobans/release", Description: "Manually release active Codex 429 auto-bans."},
@@ -569,6 +570,9 @@ func pluginConfigFields() []configField {
 func handleManagement(req managementRequest) managementResponse {
 	if req.Path == "/v0/management/plugins/"+pluginID+"/auth-states/action" {
 		return handleLifecycleAction(req)
+	}
+	if req.Path == "/v0/management/plugins/"+pluginID+"/relogin-required-accounts" {
+		return handleReloginRequiredAccounts(req)
 	}
 	if nativeScheduling() && (req.Path == "/v0/management/plugins/"+pluginID+"/autobans/release" || req.Path == "/v0/management/plugins/"+pluginID+"/invalid-auths/resolve") {
 		return handleLifecycleCompatibility(req)

@@ -2,7 +2,7 @@
 
 CPA Token Usage is a CLIProxyAPI plugin for Codex account operation dashboards and AI provider usage analytics.
 
-Current version: `0.1.47`
+Current version: `0.1.48`
 
 ## Features
 
@@ -154,6 +154,15 @@ Content-Type: application/json
 
 The normal dashboard offers only **重试同步** (`retry_sync`) for pending/failed synchronization. Use the latest lifecycle version from Summary; stale versions return 409. Compatibility `recheck` and `check_and_recover` actions perform the same local reconciliation without upstream requests. Legacy explicit `enable`, `disable`, and `clear` actions remain available through the API; Disable/Clear relinquish automatic recovery ownership.
 
+External programs can query confirmed native-mode accounts that are waiting for re-login without fetching the full Summary or changing account state:
+
+```bash
+curl -H "Authorization: Bearer <CPA management key>" \
+  http://127.0.0.1:8317/v0/management/plugins/codex-token-usage/relogin-required-accounts
+```
+
+`GET /v0/management/plugins/codex-token-usage/relogin-required-accounts` returns only plugin-owned, confirmed 401, 402, and account-level 403 disables. It excludes timed 429 cooldowns, manual disables, and pending or failed synchronization. The response contains `generated_at`, `count`, and a stable `accounts` list with `auth_index`, `auth_id`, `name`, `state`, `http_status`, `reason`, `disabled_at`, and `version`. The route returns `409 unsupported_scheduling_mode` in legacy mode and is protected by the same CPA Management Bearer authentication as other plugin routes.
+
 Confirmed automatic disables appear in `autobans`; unconfirmed writes and sync failures appear separately in `auth_controller.pending_accounts`. Each account shows its failure, disable time and either “重新登录后自动恢复” or a cooldown countdown. Healthy, enabled accounts leave the list.
 
 Request records and native lifecycle events commit atomically before auxiliary accounting. Missing identities or temporarily unreadable auth snapshots keep events pending for retry; identity matching never falls back to email. Pending 429 isolation can be upgraded by a later 401, and queued failures are processed before timer recovery. Summary exposes sanitized `auth_controller.events` with disposition counts plus bounded `pending` and `recent` lists (up to 100 each). Dispositions distinguish pending identity/snapshot, pending disable, confirmed disable, stale observations and conflicts. Upgrades retain unfinished events and replay existing failures previously suppressed by erroneous metadata conflicts, except failures superseded by newer login/success and expired cooldowns. Migration is idempotent and preserves explicit manual disables; historical usage errors are not bulk converted into new events.
@@ -242,11 +251,11 @@ python3 integration/run_cpa_native.py # Go >=1.26; pinned CPA v7.2.145
 Release assets are named in the CLIProxyAPI plugin store format:
 
 ```text
-codex-token-usage_0.1.47_linux_amd64.zip
-codex-token-usage_0.1.47_linux_arm64.zip
-codex-token-usage_0.1.47_windows_amd64.zip
-codex-token-usage_0.1.47_darwin_amd64.zip
-codex-token-usage_0.1.47_darwin_arm64.zip
+codex-token-usage_0.1.48_linux_amd64.zip
+codex-token-usage_0.1.48_linux_arm64.zip
+codex-token-usage_0.1.48_windows_amd64.zip
+codex-token-usage_0.1.48_darwin_amd64.zip
+codex-token-usage_0.1.48_darwin_arm64.zip
 checksums.txt
 ```
 
