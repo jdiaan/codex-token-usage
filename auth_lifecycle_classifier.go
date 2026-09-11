@@ -9,15 +9,17 @@ import (
 )
 
 type authDecision struct {
-	State      string `json:"state"`
-	Disable    bool   `json:"disable"`
-	Reason     string `json:"reason"`
-	RecoverAt  int64  `json:"recover_at"`
-	Status     int    `json:"status"`
-	ErrorType  string `json:"error_type"`
-	ErrorCode  string `json:"error_code"`
-	Model      string `json:"model"`
-	ModelIssue bool   `json:"model_issue"`
+	Fingerprint string `json:"credential_fingerprint,omitempty"`
+	RequestedNS int64  `json:"requested_at_ns,omitempty"`
+	State       string `json:"state"`
+	Disable     bool   `json:"disable"`
+	Reason      string `json:"reason"`
+	RecoverAt   int64  `json:"recover_at"`
+	Status      int    `json:"status"`
+	ErrorType   string `json:"error_type"`
+	ErrorCode   string `json:"error_code"`
+	Model       string `json:"model"`
+	ModelIssue  bool   `json:"model_issue"`
 }
 
 // Whitelist machine-readable classifications; never persist provider message/body.
@@ -46,7 +48,11 @@ func classifyAuthFailure(rec usageRecord, now time.Time) authDecision {
 	d.ErrorType, d.ErrorCode = known(typ), known(code)
 	signal := strings.ToLower(typ + " " + code)
 	message, _ := e["message"].(string)
-	switch d.Status {
+	classificationStatus := d.Status
+	if d.Status != 401 && d.Status != 402 && (d.ErrorType == "usage_limit_reached" || d.ErrorCode == "usage_limit_reached" || d.ErrorType == "rate_limit_exceeded" || d.ErrorCode == "rate_limit_exceeded") {
+		classificationStatus = 429
+	}
+	switch classificationStatus {
 	case 401:
 		d.State, d.Disable, d.Reason = authInvalid, true, "auth_invalid"
 	case 402:
@@ -62,7 +68,6 @@ func classifyAuthFailure(rec usageRecord, now time.Time) authDecision {
 		}
 	case 429:
 		quota := strings.Contains(signal, "usage_limit_reached")
-		unknownReset := false
 		for _, prefix := range []string{"primary", "secondary"} {
 			pct := headerFloat(rec.ResponseHeaders, "x-codex-"+prefix+"-used-percent")
 			if pct == nil || *pct < 100 {
@@ -71,7 +76,6 @@ func classifyAuthFailure(rec usageRecord, now time.Time) authDecision {
 			quota = true
 			reset := headerInt(rec.ResponseHeaders, "x-codex-"+prefix+"-reset-at")
 			if reset == nil || normalizeUnixSeconds(*reset) <= now.Unix() {
-				unknownReset = true
 				continue
 			}
 			if t := normalizeUnixSeconds(*reset); t > d.RecoverAt {
@@ -82,9 +86,6 @@ func classifyAuthFailure(rec usageRecord, now time.Time) authDecision {
 			d.State, d.Disable, d.Reason = authQuotaCooldown, true, "usage_limit_reached"
 			if reset, ok := lifecycleReset(e, now); ok && reset > d.RecoverAt {
 				d.RecoverAt = reset
-			}
-			if unknownReset {
-				d.RecoverAt = 0
 			}
 		} else {
 			d.State, d.Disable, d.Reason = authRateLimited, true, "rate_limited"
@@ -110,6 +111,26 @@ func classifyAuthFailure(rec usageRecord, now time.Time) authDecision {
 		}
 	default:
 		d.Reason = "transient_failure"
+	}
+	if d.State == authQuotaCooldown || d.State == authRateLimited {
+		if reset, ok := lifecycleReset(e, now); ok && reset > d.RecoverAt {
+			d.RecoverAt = reset
+		}
+		v := headerValue(rec.ResponseHeaders, "Retry-After")
+		if seconds, err := strconv.ParseInt(v, 10, 64); err == nil && seconds >= 0 && seconds < 31536000 {
+			if reset := now.Unix() + seconds; reset > d.RecoverAt {
+				d.RecoverAt = reset
+			}
+		} else if reset, err := http.ParseTime(v); err == nil && reset.Unix() > d.RecoverAt {
+			d.RecoverAt = reset.Unix()
+		}
+		if seconds, ok := exactInt64FromAny(e["retry_after"]); ok && seconds >= 0 && seconds < 31536000 && now.Unix()+seconds > d.RecoverAt {
+			d.RecoverAt = now.Unix() + seconds
+		}
+		if d.RecoverAt <= now.Unix() {
+			d.RecoverAt = now.Add(time.Minute).Unix()
+			d.Reason = "rate_limit_backoff"
+		}
 	}
 	return d
 }

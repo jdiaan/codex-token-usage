@@ -4,28 +4,25 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
-	"net/http/httptest"
 	"os/exec"
 	"strings"
 	"testing"
 	"time"
 )
 
-func TestNativeExternalChangeRequiresRecheckWithoutPriorFailure(t *testing.T) {
+func TestNativeMetadataChangeDoesNotRequireRecheck(t *testing.T) {
 	c, host, _ := nativeTestController(t)
 	snapshot := host.accounts["a"]
-	snapshot.ContentHash = "externally-replaced"
+	snapshot.ContentHash = "new-metadata"
+	snapshot.Entry.UpdatedAt = "2030-01-01T10:00:01Z"
 	host.accounts["a"] = snapshot
 	c.reconcile(context.Background())
-	s := lifecycleStateForTest(t, c, "a")
-	if s.SyncStatus != "conflict" || s.LastHTTPStatus != 0 {
-		t.Fatalf("expected conflict without HTTP failure: %+v", s)
+	if state := lifecycleStateForTest(t, c, "a"); state.Paused || state.SyncStatus != "synced" {
+		t.Fatalf("metadata paused account: %+v", state)
 	}
-	if _, err := c.action(context.Background(), lifecycleActionRequest{AuthIndex: "a", Version: s.Version, Action: "enable"}); err == nil {
-		t.Fatal("external replacement enabled without recheck")
-	}
-	if len(host.writes) != 0 {
-		t.Fatal("rejected action wrote auth")
+	lifecycleFailure(t, c, "a", 401, `{}`)
+	if !host.accounts["a"].FileDisabled {
+		t.Fatal("401 after metadata update was ignored")
 	}
 }
 
@@ -61,7 +58,7 @@ func TestNativeLateFailureAfterExternalEnable(t *testing.T) {
 	}
 	c.reconcile(context.Background())
 	s := lifecycleStateForTest(t, c, "a")
-	if !s.Paused || s.DisabledByPlugin || host.accounts["a"].Entry.Disabled || len(host.writes) != 1 {
+	if s.Paused || s.DisabledByPlugin || host.accounts["a"].Entry.Disabled || len(host.writes) != 1 {
 		t.Fatalf("late failure reclaimed external enable: %+v", s)
 	}
 }
@@ -123,7 +120,7 @@ func TestNativeExternalEnableClearsManualDisabledState(t *testing.T) {
 
 	c.reconcile(context.Background())
 	s = lifecycleStateForTest(t, c, "a")
-	if s.State != authHealthy || s.Disabled || !s.Paused || s.SyncStatus != "conflict" || s.Reason != "external_enable" {
+	if s.State != authHealthy || s.Disabled || s.Paused || s.SyncStatus != "synced" || s.Reason != "" {
 		t.Fatalf("external enable left a stale manual-disabled state: %+v", s)
 	}
 }
@@ -135,6 +132,7 @@ func TestNativeRepairsPersistedManualDisabledAfterExternalEnable(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := lifecycleStateForTest(t, c, "a")
+	s.PolicyVersion = 0
 	s.State = authManualDisabled
 	s.Disabled = false
 	s.Paused = true
@@ -146,7 +144,7 @@ func TestNativeRepairsPersistedManualDisabledAfterExternalEnable(t *testing.T) {
 
 	c.reconcile(context.Background())
 	s = lifecycleStateForTest(t, c, "a")
-	if s.State != authHealthy || s.Reason != "external_enable" || !s.Paused {
+	if s.State != authHealthy || s.Reason != "" || s.Paused {
 		t.Fatalf("persisted stale manual-disabled state was not repaired: %+v", s)
 	}
 }
@@ -190,81 +188,8 @@ func TestNativeMissingConfigurationAndLegacyPendingCancellation(t *testing.T) {
 	if len(host.writes) != 0 {
 		t.Fatal("legacy executed pending native disable")
 	}
-	if s = lifecycleStateForTest(t, c, "a"); s.PendingAction != "" || !s.Paused {
+	if s = lifecycleStateForTest(t, c, "a"); s.PendingAction != "" || s.Paused {
 		t.Fatalf("pending action not canceled: %+v", s)
-	}
-}
-
-func TestNativeRecheckNeverEnablesAndRejectsChangedProbe(t *testing.T) {
-	c, host, _ := nativeTestController(t)
-	lifecycleFailure(t, c, "a", 401, `{}`)
-	oldURL := codexQuotaURLOverrideForTest
-	t.Cleanup(func() { codexQuotaURLOverrideForTest = oldURL })
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"rate_limit":{"primary_window":{"used_percent":10,"reset_at":2000000000},"secondary_window":null}}`))
-	}))
-	defer server.Close()
-	codexQuotaURLOverrideForTest = server.URL
-	s := lifecycleStateForTest(t, c, "a")
-	checked, err := c.action(context.Background(), lifecycleActionRequest{AuthIndex: "a", Version: s.Version, Action: "recheck"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !checked.CheckOK || !host.accounts["a"].Entry.Disabled || checked.DisabledByPlugin {
-		t.Fatal("recheck implicitly enabled or claimed ownership")
-	}
-	if _, err = c.action(context.Background(), lifecycleActionRequest{AuthIndex: "a", Version: checked.Version, Action: "enable"}); err != nil {
-		t.Fatal(err)
-	}
-	if host.accounts["a"].Entry.Disabled {
-		t.Fatal("explicit enable failed")
-	}
-}
-
-func TestNativeBillingProbeRequiresExplicitAcknowledgement(t *testing.T) {
-	c, host, clock := nativeTestController(t)
-	lifecycleFailure(t, c, "a", 402, `{}`)
-	clock.now = clock.now.Add(24 * time.Hour)
-	c.reconcile(context.Background())
-	s := lifecycleStateForTest(t, c, "a")
-	if _, err := c.action(context.Background(), lifecycleActionRequest{AuthIndex: "a", Version: s.Version, Action: "recheck"}); err == nil {
-		t.Fatal("billing probe lacked acknowledgement")
-	}
-	if !host.accounts["a"].Entry.Disabled {
-		t.Fatal("billing timed recovery")
-	}
-}
-
-func TestNativeUnknownQuotaResetRequiresAuthoritativeRead(t *testing.T) {
-	c, host, clock := nativeTestController(t)
-	lifecycleFailure(t, c, "a", 429, `{"error":{"type":"usage_limit_reached"}}`)
-	if lifecycleStateForTest(t, c, "a").RecoverAt != 0 {
-		t.Fatal("invented reset")
-	}
-	oldURL := codexQuotaURLOverrideForTest
-	t.Cleanup(func() { codexQuotaURLOverrideForTest = oldURL })
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`{"rate_limit":{"primary_window":{"used_percent":100,"reset_at":1893502800},"secondary_window":null}}`))
-	}))
-	defer server.Close()
-	codexQuotaURLOverrideForTest = server.URL
-	c.reconcile(context.Background())
-	s := lifecycleStateForTest(t, c, "a")
-	if s.RecoverAt != 0 {
-		t.Fatal("background reconciliation queried quota")
-	}
-	s, err := c.action(context.Background(), lifecycleActionRequest{AuthIndex: "a", Version: s.Version, Action: "check_and_recover"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if s.RecoverAt != 1893502800 || !host.accounts["a"].Entry.Disabled {
-		t.Fatalf("quota reset read=%+v", s)
-	}
-	clock.now = time.Unix(s.RecoverAt+1, 0)
-	c.reconcile(context.Background())
-	if host.accounts["a"].Entry.Disabled {
-		t.Fatal("discovered reset did not recover")
 	}
 }
 
@@ -389,7 +314,7 @@ func TestNativeDashboardJavaScript(t *testing.T) {
 	escStart := strings.Index(dashboardScripts, "function esc(v){")
 	escEnd := strings.Index(dashboardScripts[escStart:], "\n")
 	source += dashboardScripts[escStart:escStart+escEnd] + "\n" + dashboardScripts[start:start+end] + "\n"
-	source += `const html=lifecycleStatus({auth_index:'\" onclick=\"alert(1)',version:7,state:'QUOTA_COOLDOWN',disabled:true,disabled_by_plugin:true,recover_at:2000000000});if(html.includes('data-auth-index="" onclick='))throw Error('unsafe attribute');if(!html.includes('data-version="7"')||!html.includes('Recheck')||!html.includes('Recover at'))throw Error('missing lifecycle controls');`
+	source += `const html=lifecycleStatus({auth_index:'\" onclick=\"alert(1)',version:7,state:'QUOTA_COOLDOWN',disabled:true,disabled_by_plugin:true,recover_at:2000000000,sync_error:'retry',pending_action:'disable'});if(html.includes('data-auth-index="" onclick='))throw Error('unsafe attribute');if(!html.includes('data-version="7"')||!html.includes('retry_sync')||html.includes('Clear plugin state'))throw Error('missing lifecycle controls');`
 	command := exec.Command(node, "-")
 	command.Stdin = strings.NewReader(source)
 	if output, err := command.CombinedOutput(); err != nil {

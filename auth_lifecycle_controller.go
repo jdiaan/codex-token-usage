@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
-	"log"
 	"strings"
 	"sync"
 	"time"
@@ -103,6 +102,7 @@ func (c *authLifecycleController) status() map[string]any {
 
 type lifecycleExecer interface {
 	ExecContext(context.Context, string, ...any) (sql.Result, error)
+	QueryRowContext(context.Context, string, ...any) *sql.Row
 }
 
 func observeAuthLifecycle(ctx context.Context, db lifecycleExecer, rec usageRecord) error {
@@ -134,6 +134,21 @@ func persistAuthLifecycleEvent(ctx context.Context, db lifecycleExecer, rec usag
 		rec.Failure = usageFailure{StatusCode: 429, Body: `{"error":{"type":"usage_limit_reached"}}`}
 	}
 	d := classifyAuthFailure(rec, time.Now())
+	d.RequestedNS = rec.RequestedAt.UnixNano()
+	var stateJSON string
+	// Bind to the observed credential generation without reading tokens or making
+	// host calls in the usage transaction. The request time guards late arrivals.
+	if err := db.QueryRowContext(ctx, `SELECT payload FROM auth_lifecycle_states WHERE auth_index=?`, rec.AuthIndex).Scan(&stateJSON); err == nil {
+		var state authLifecycleState
+		if json.Unmarshal([]byte(stateJSON), &state) == nil && (rec.AuthID == "" || rec.AuthID == state.AuthID) {
+			d.Fingerprint = state.Fingerprint
+			if state.CredentialSince > 0 && d.RequestedNS < state.CredentialSince {
+				d.Fingerprint = "previous-generation"
+			}
+		}
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return false, err
+	}
 	raw, err := json.Marshal(d)
 	if err != nil {
 		return false, err
@@ -152,238 +167,6 @@ func isCodexUsage(rec usageRecord) bool {
 }
 func stringsEqualCodex(provider string) bool { return strings.EqualFold(trim(provider), "codex") }
 
-func (c *authLifecycleController) reconcile(ctx context.Context) {
-	if err := lockMutexWithContext(ctx, &c.opMu); err != nil {
-		return
-	}
-	defer c.opMu.Unlock()
-	if c.host == nil || !tryAcquireQuotaProbeGate() {
-		return
-	}
-	defer releaseQuotaProbeGate()
-	db, _, err := c.store.open(ctx)
-	if err != nil {
-		c.setError(errors.New("lifecycle database unavailable"))
-		return
-	}
-	entries, err := c.host.List(ctx)
-	if err != nil {
-		c.setError(err)
-		return
-	}
-	c.setError(nil)
-	states, err := listLifecycleStates(ctx, db)
-	if err != nil {
-		c.setError(errors.New("lifecycle state read failed"))
-		return
-	}
-	known := map[string]bool{}
-	for _, state := range states {
-		known[state.AuthIndex] = true
-	}
-	if nativeScheduling() {
-		for _, entry := range entries {
-			if known[entry.AuthIndex] || entry.AuthIndex == "" || !stringsEqualCodex(firstNonEmptyString(entry.Provider, entry.Type)) || entry.RuntimeOnly {
-				continue
-			}
-			snapshot, readErr := readLifecycleInventoryEntry(ctx, c.host, entries, entry.AuthIndex)
-			if readErr != nil {
-				continue
-			}
-			state := stateFromSnapshot(snapshot, c.clock.Now())
-			if err = saveLifecycleState(ctx, db, &state, c.clock.Now(), "discovered"); err != nil {
-				c.setError(errors.New("lifecycle discovery write failed"))
-				return
-			}
-			states = append(states, state)
-			known[state.AuthIndex] = true
-		}
-	}
-	// Consume queued failures before any timer recovery or pending status write.
-	// In particular, a queued 401 must supersede a due 429 cooldown.
-	if nativeScheduling() {
-		if err = c.processEvents(ctx, db, entries); err != nil {
-			c.setError(errors.New("lifecycle event processing failed"))
-			return
-		}
-		states, err = listLifecycleStates(ctx, db)
-		if err != nil {
-			c.setError(errors.New("lifecycle state read failed"))
-			return
-		}
-	}
-	for _, state := range states {
-		if ctx.Err() != nil {
-			return
-		}
-		if !nativeScheduling() && !state.DisabledByPlugin && state.PendingAction == "" {
-			continue
-		}
-		if state.RetryAt > c.clock.Now().Unix() {
-			continue
-		}
-		snapshot, readErr := readLifecycleInventoryEntry(ctx, c.host, entries, state.AuthIndex)
-		if readErr != nil {
-			c.retry(ctx, db, &state, "auth identity unavailable; no state write attempted")
-			continue
-		}
-		if state.PendingAction != "" {
-			if !nativeScheduling() && state.PendingAction == "disable" && !state.DisabledByPlugin {
-				c.conflict(ctx, db, &state, snapshot, "legacy mode canceled unconfirmed native isolation")
-				continue
-			}
-			// Crash between PATCH and confirmation cannot establish ownership.
-			desired := state.PendingAction == "disable"
-			if snapshot.Entry.Disabled == desired || snapshot.FileDisabled == desired {
-				c.conflict(ctx, db, &state, snapshot, "unconfirmed prior operation; manual recheck required")
-				continue
-			}
-			if snapshot.ContentHash != state.PendingContentHash || snapshot.Entry.UpdatedAt != state.RuntimeUpdated {
-				c.conflict(ctx, db, &state, snapshot, "auth changed during pending operation")
-				continue
-			}
-			if !c.host.Ready() {
-				c.retry(ctx, db, &state, "management API environment is not configured")
-				continue
-			}
-			c.transition(ctx, db, &state, snapshot, desired, state.PendingOwner)
-			continue
-		}
-		if snapshotChanged(state, snapshot) {
-			c.conflict(ctx, db, &state, snapshot, "external auth change; manual recheck required")
-			continue
-		}
-		// Repair states written by older versions after an operator enabled a
-		// manually disabled auth outside the plugin. The account remains paused
-		// for review, but its business state must no longer claim it is disabled.
-		if reconcileExternallyEnabledState(&state, snapshot) {
-			if err = saveLifecycleState(ctx, db, &state, c.clock.Now(), "external_enable_observed"); err != nil {
-				c.setError(errors.New("external enable state write failed"))
-				return
-			}
-		}
-		// Refresh-token failure happens before a provider request exists, so CPA
-		// may expose it only through the runtime auth status rather than Usage.
-		// Polling the exact runtime identity closes that event gap without log
-		// parsing or treating transient refresh failures as permanent.
-		if !state.Paused && !state.Disabled && state.PendingAction == "" {
-			if d, terminal := classifyRuntimeAuthFailure(snapshot.Entry); terminal {
-				state.State = d.State
-				state.BlockedState = d.State
-				state.Reason = d.Reason
-				state.RecoverAt = 0
-				state.LastHTTPStatus = d.Status
-				state.LastErrorType = d.ErrorType
-				state.LastErrorCode = d.ErrorCode
-				state.LastErrorMessage = d.Reason
-				state.CheckOK = false
-				state.CheckResult = ""
-				state.PendingAction = "disable"
-				state.PendingOwner = true
-				state.PendingContentHash = state.ContentHash
-				if err = saveLifecycleState(ctx, db, &state, c.clock.Now(), "runtime_auth_failure_observed"); err != nil {
-					c.setError(errors.New("runtime auth failure state write failed"))
-					return
-				}
-				_ = c.transition(ctx, db, &state, snapshot, true, true)
-				continue
-			}
-		}
-		if state.State == authRateLimited && !state.Disabled && state.RecoverAt <= c.clock.Now().Unix() && !state.Paused {
-			state.State = authHealthy
-			state.BlockedState = ""
-			state.RecoverAt = 0
-			_ = saveLifecycleState(ctx, db, &state, c.clock.Now(), "rate_limit_observation_expired")
-		}
-		// Adopt still-current rate-limit observations from versions that only
-		// displayed 429 without disabling the exact auth.
-		if nativeScheduling() && state.State == authRateLimited && !state.Disabled && !state.Paused && state.RecoverAt > c.clock.Now().Unix() {
-			state.BlockedState = authRateLimited
-			_ = c.transition(ctx, db, &state, snapshot, true, true)
-			continue
-		}
-		if (state.State == authQuotaCooldown || state.State == authRateLimited) && state.DisabledByPlugin && !state.Paused && state.RecoverAt > 0 && state.RecoverAt <= c.clock.Now().Unix() {
-			pending, pendingErr := pendingLifecycleEvents(ctx, db, state)
-			if pendingErr != nil {
-				c.setError(errors.New("lifecycle pending event read failed"))
-				return
-			}
-			if pending {
-				continue
-			}
-			c.transition(ctx, db, &state, snapshot, false, false)
-		}
-		// Unknown quota resets wait for an explicit check_and_recover action.
-		// Reconciliation must never query the upstream quota endpoint.
-	}
-}
-
-func stateFromSnapshot(s lifecycleSnapshot, now time.Time) authLifecycleState {
-	state := authLifecycleState{AuthIndex: s.Entry.AuthIndex, AuthID: s.Entry.ID, Name: s.Entry.Name, Identity: s.Identity, Fingerprint: s.Fingerprint, ContentHash: s.ContentHash, RuntimeUpdated: s.Entry.UpdatedAt, State: authHealthy, Disabled: s.Entry.Disabled, SyncStatus: "synced", CreatedAt: now.Unix()}
-	if s.Entry.Disabled || s.FileDisabled {
-		state.State = authManualDisabled
-		state.Paused = true
-	}
-	if s.Entry.Disabled != s.FileDisabled {
-		state.SyncStatus = "conflict"
-		state.Paused = true
-		state.SyncError = "physical and runtime state differ"
-	}
-	if updated, err := time.Parse(time.RFC3339Nano, s.Entry.UpdatedAt); err == nil {
-		state.IgnoreBefore = updated.Unix()
-	}
-	return state
-}
-
-func snapshotChanged(s authLifecycleState, current lifecycleSnapshot) bool {
-	return s.AuthID != current.Entry.ID || s.Name != current.Entry.Name || s.ContentHash != current.ContentHash || s.Identity != current.Identity || s.Fingerprint != current.Fingerprint || s.Disabled != current.Entry.Disabled || current.Entry.Disabled != current.FileDisabled || (s.DisabledByPlugin && s.RuntimeUpdated != current.Entry.UpdatedAt)
-}
-
-func (c *authLifecycleController) conflict(ctx context.Context, db *sql.DB, s *authLifecycleState, current lifecycleSnapshot, reason string) {
-	s.Paused = true
-	s.DisabledByPlugin = false
-	s.Disabled = current.Entry.Disabled
-	s.PendingAction = ""
-	s.PendingOwner = false
-	s.SyncStatus = "conflict"
-	s.SyncError = reason
-	s.Fingerprint = current.Fingerprint
-	s.Identity = current.Identity
-	s.ContentHash = current.ContentHash
-	s.RuntimeUpdated = current.Entry.UpdatedAt
-	s.IgnoreBefore = c.clock.Now().Unix()
-	s.CheckOK = false
-	s.CheckResult = ""
-	s.RetryAt = 0
-	if current.Entry.Disabled || current.FileDisabled {
-		s.State = authManualDisabled
-	} else {
-		reconcileExternallyEnabledState(s, current)
-	}
-	if err := saveLifecycleState(ctx, db, s, c.clock.Now(), "ownership_conflict"); err != nil {
-		c.setError(errors.New("lifecycle conflict write failed"))
-	}
-}
-
-func reconcileExternallyEnabledState(s *authLifecycleState, current lifecycleSnapshot) bool {
-	if s.State != authManualDisabled || current.Entry.Disabled || current.FileDisabled {
-		return false
-	}
-	s.Disabled = false
-	s.DisabledAt = 0
-	s.RecoverAt = 0
-	s.CheckOK = false
-	if s.BlockedState != "" {
-		s.State = s.BlockedState
-		s.Reason = "external_enable_requires_recheck"
-	} else {
-		s.State = authHealthy
-		s.BlockedState = ""
-		s.Reason = "external_enable"
-	}
-	return true
-}
-
 func (c *authLifecycleController) retry(ctx context.Context, db *sql.DB, s *authLifecycleState, reason string) {
 	s.RetryCount++
 	delay := time.Second * 5
@@ -400,78 +183,6 @@ func (c *authLifecycleController) retry(ctx context.Context, db *sql.DB, s *auth
 		c.setError(errors.New("lifecycle retry write failed"))
 	}
 	c.setError(errors.New(reason))
-}
-
-func (c *authLifecycleController) transition(ctx context.Context, db *sql.DB, s *authLifecycleState, before lifecycleSnapshot, disabled, owner bool) error {
-	if !c.host.Ready() {
-		c.retry(ctx, db, s, "management API environment is not configured")
-		return errors.New("management API environment is not configured")
-	}
-	// Re-read directly before the mutation, including metadata and runtime revision.
-	current, err := c.host.Read(ctx, s.AuthIndex)
-	if err != nil {
-		c.retry(ctx, db, s, "auth read before status change failed")
-		return err
-	}
-	if current.ContentHash != before.ContentHash || current.Entry.ID != before.Entry.ID || current.Entry.Name != before.Entry.Name || current.Entry.Disabled != before.Entry.Disabled || current.Entry.UpdatedAt != before.Entry.UpdatedAt || current.FileDisabled != before.FileDisabled {
-		c.conflict(ctx, db, s, current, "auth changed before status update")
-		return errLifecycleConflict
-	}
-	s.PendingAction = "enable"
-	if disabled {
-		s.PendingAction = "disable"
-	}
-	s.PendingOwner = owner
-	s.PendingContentHash = current.ContentHash
-	s.PendingAt = c.clock.Now().Unix()
-	s.SyncStatus = "pending"
-	s.SyncError = ""
-	if err = saveLifecycleState(ctx, db, s, c.clock.Now(), "status_intent"); err != nil {
-		return err
-	}
-	patchErr := c.host.SetDisabled(ctx, current, disabled)
-	after, readErr := c.host.Read(ctx, s.AuthIndex)
-	if readErr != nil {
-		c.retry(ctx, db, s, "status read-back unavailable")
-		return errors.New("status read-back unavailable")
-	}
-	if after.ContentHash != current.ContentHash || after.Entry.ID != current.Entry.ID || after.Entry.Name != current.Entry.Name {
-		c.conflict(ctx, db, s, after, "auth fields changed during status write; not overwriting credentials")
-		return errLifecycleConflict
-	}
-	if after.Entry.Disabled != disabled || after.FileDisabled != disabled {
-		c.retry(ctx, db, s, "status not confirmed in both physical and runtime auth")
-		return errors.New("status not confirmed in both physical and runtime auth")
-	}
-	// A timeout can follow a successful PATCH. Read-back is authoritative.
-	_ = patchErr
-	s.Disabled = disabled
-	s.DisabledByPlugin = disabled && owner
-	s.RuntimeUpdated = after.Entry.UpdatedAt
-	s.PendingAction = ""
-	s.PendingOwner = false
-	s.SyncStatus = "synced"
-	s.SyncError = ""
-	s.RetryAt = 0
-	s.RetryCount = 0
-	if disabled {
-		s.DisabledAt = c.clock.Now().Unix()
-	} else {
-		s.State = authHealthy
-		s.BlockedState = ""
-		s.RecoverAt = 0
-		s.DisabledAt = 0
-		s.Reason = ""
-		s.Paused = false
-		s.IgnoreBefore = c.clock.Now().Unix()
-	}
-	if err = saveLifecycleState(ctx, db, s, c.clock.Now(), "status_confirmed"); err != nil {
-		return err
-	}
-	globalCodexAuthSource.invalidate()
-	log.Printf("auth lifecycle status confirmed: auth_index=%s disabled=%t plugin_owned=%t state=%s", s.AuthIndex, s.Disabled, s.DisabledByPlugin, s.State)
-	c.setError(nil)
-	return nil
 }
 
 type lifecycleEvent struct {
@@ -536,14 +247,14 @@ func (c *authLifecycleController) processEvents(ctx context.Context, db *sql.DB,
 			continue
 		}
 		d := event.Decision
-		if event.RequestedAt < s.IgnoreBefore {
+		if eventIsStale(event, s) {
 			if err = c.recordEventOutcome(ctx, db, event, true, "ignored_stale", "request predates current auth control boundary"); err != nil {
 				return err
 			}
 			continue
 		}
-		if s.Paused || (s.Disabled && !s.DisabledByPlugin) {
-			if err = c.recordEventOutcome(ctx, db, event, true, "identity_conflict", "manual control or auth change requires recheck"); err != nil {
+		if s.ManualDisabled {
+			if err = c.recordEventOutcome(ctx, db, event, true, "manual_disabled", "account was manually disabled"); err != nil {
 				return err
 			}
 			continue
@@ -555,9 +266,20 @@ func (c *authLifecycleController) processEvents(ctx context.Context, db *sql.DB,
 			}
 			continue
 		}
-		if snapshotChanged(s, snapshot) || (s.PendingAction == "enable" && d.Disable) {
-			c.conflict(ctx, db, &s, snapshot, "auth changed or new failure during pending enable; manual recheck required")
-			if err = c.recordEventOutcome(ctx, db, event, true, "identity_conflict", "auth change or pending enable requires recheck"); err != nil {
+		if err = c.observeSnapshot(ctx, db, &s, snapshot); err != nil {
+			if err = c.recordEventOutcome(ctx, db, event, false, "pending_snapshot", "account identity or snapshot not ready"); err != nil {
+				return err
+			}
+			continue
+		}
+		if eventIsStale(event, s) {
+			if err = c.recordEventOutcome(ctx, db, event, true, "ignored_stale", "failure belongs to previous credential generation"); err != nil {
+				return err
+			}
+			continue
+		}
+		if s.ManualDisabled {
+			if err = c.recordEventOutcome(ctx, db, event, true, "manual_disabled", "account was manually disabled"); err != nil {
 				return err
 			}
 			continue
@@ -573,10 +295,17 @@ func (c *authLifecycleController) processEvents(ctx context.Context, db *sql.DB,
 			}
 			continue
 		}
-		if (s.Disabled || s.PendingAction == "disable") && d.State == s.State {
-			if d.RecoverAt == 0 || s.RecoverAt == 0 {
-				d.RecoverAt = 0
-			} else if s.RecoverAt > d.RecoverAt {
+		if temporaryAuthState(d.State) {
+			if d.RecoverAt == 0 {
+				d.RecoverAt = event.RequestedAt + 60
+			}
+			if d.RecoverAt <= c.clock.Now().Unix() {
+				if err = c.recordEventOutcome(ctx, db, event, true, "ignored_expired", "temporary limit already expired"); err != nil {
+					return err
+				}
+				continue
+			}
+			if temporaryAuthState(s.State) && s.RecoverAt > d.RecoverAt {
 				d.RecoverAt = s.RecoverAt
 			}
 		}
@@ -586,10 +315,12 @@ func (c *authLifecycleController) processEvents(ctx context.Context, db *sql.DB,
 		s.LastHTTPStatus, s.LastErrorType, s.LastErrorCode, s.LastErrorMessage = d.Status, d.ErrorType, d.ErrorCode, d.Reason
 		s.CheckOK = false
 		s.CheckResult = ""
+		s.BlockedFingerprint = s.Fingerprint
+		s.Paused = false
 		if event.ID > s.LastEventID {
 			s.LastEventID = event.ID
 		}
-		if !s.Disabled && s.PendingAction == "" {
+		if !s.Disabled || s.PendingAction == "enable" {
 			s.PendingAction, s.PendingOwner, s.PendingContentHash = "disable", true, s.ContentHash
 		}
 		if err = saveLifecycleState(ctx, db, &s, c.clock.Now(), "failure_observed"); err != nil {

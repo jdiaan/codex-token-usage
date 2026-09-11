@@ -47,26 +47,24 @@ func TestNativeVisibleBansAndRateRecovery(t *testing.T) {
 	}
 }
 
-func TestNativePendingAndManualDisableRemainVisible(t *testing.T) {
+func TestNativePendingAndManualDisableAreSeparateFromAutomaticBans(t *testing.T) {
 	c, host, clock := nativeTestController(t)
 	host.ready = false
 	lifecycleFailure(t, c, "a", 401, `{}`)
 	db, _, _ := c.store.open(context.Background())
-	rows, err := queryLifecycleAutobans(context.Background(), db, clock.now.Unix())
-	if err != nil || len(rows) != 1 || rows[0].Lifecycle.Disabled || rows[0].Lifecycle.PendingAction != "disable" || rows[0].BannedAt != 0 {
-		t.Fatalf("pending disable missing or reported as confirmed: %+v %v", rows, err)
+	bans, err := queryLifecycleAutobans(context.Background(), db, clock.Now().Unix())
+	pending, pendingErr := queryLifecycleRows(context.Background(), db, clock.Now().Unix(), true)
+	if err != nil || pendingErr != nil || len(bans) != 0 || len(pending) != 1 || pending[0].Lifecycle.Disabled {
+		t.Fatalf("bans=%+v pending=%+v", bans, pending)
 	}
 	host.ready = true
-	s := lifecycleStateForTest(t, c, "b")
-	if _, err = c.action(context.Background(), lifecycleActionRequest{AuthIndex: "b", Version: s.Version, Action: "disable"}); err != nil {
+	state := lifecycleStateForTest(t, c, "b")
+	if _, err = c.action(context.Background(), lifecycleActionRequest{AuthIndex: "b", Version: state.Version, Action: "disable"}); err != nil {
 		t.Fatal(err)
 	}
-	rows, _ = queryLifecycleAutobans(context.Background(), db, clock.now.Unix())
-	if len(rows) != 2 || rows[1].Lifecycle.DisabledByPlugin || !rows[1].Lifecycle.Disabled {
-		t.Fatalf("manual disabled auth must also be visible: %+v", rows)
-	}
-	if count429Autobans(rows) != 0 {
-		t.Fatal("manual disable or 401 was counted as 429")
+	bans, err = queryLifecycleAutobans(context.Background(), db, clock.Now().Unix())
+	if err != nil || len(bans) != 0 {
+		t.Fatalf("manual disable included in automatic list: %+v %v", bans, err)
 	}
 }
 

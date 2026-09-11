@@ -1053,6 +1053,11 @@ func (s *store) summaryOnce(ctx context.Context, window string, limit int) (map[
 			return nil, eventErr
 		}
 		controllerStatus["events"] = events
+		pendingAccounts, pendingErr := queryLifecycleRows(ctx, db, now, true)
+		if pendingErr != nil {
+			return nil, pendingErr
+		}
+		controllerStatus["pending_accounts"] = pendingAccounts
 	}
 	result := map[string]any{
 		"auth_controller":             controllerStatus,

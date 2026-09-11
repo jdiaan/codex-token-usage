@@ -31,7 +31,7 @@ func TestNativeLifecycleFailuresAreVisible(t *testing.T) {
 		"lifecycleAccounts.filter(r=>lifecycleAuthInvalid(r)&&r.lifecycle.disabled).length",
 		"最近列表已有 ",
 		"请在插件配置中填写 management_url / management_key",
-		"data-lifecycle-action=\"recheck\"",
+		"data-lifecycle-action=\"retry_sync\"",
 	}
 	for _, marker := range markers {
 		if !strings.Contains(dashboardScripts, marker) {
@@ -138,15 +138,12 @@ func TestDashboardExplainsWaitingRuntimeAccountsAndStaleCandidates(t *testing.T)
 	}
 }
 
-func TestDashboardShowsExternallyEnabledManualAuthAsPendingReview(t *testing.T) {
-	for _, marker := range []string{
-		"s.disable_reason==='external_enable'",
-		"Externally Enabled / 外部启用，待复查",
-		"esc(label)",
-	} {
-		if !strings.Contains(dashboardScripts, marker) {
-			t.Fatalf("dashboard external-enable status marker %q not found", marker)
-		}
+func TestDashboardUsesSimpleLifecycleActions(t *testing.T) {
+	start := strings.Index(dashboardScripts, "function lifecycleStatus(")
+	end := strings.Index(dashboardScripts[start:], "function renderNativeLifecycleModal(") + start
+	status := dashboardScripts[start:end]
+	if strings.Contains(status, "Recheck") || strings.Contains(status, "Clear plugin state") || !strings.Contains(status, "retry_sync") {
+		t.Fatal("lifecycle still requires manual review controls")
 	}
 }
 

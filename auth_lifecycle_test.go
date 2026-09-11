@@ -116,7 +116,7 @@ func TestNativeClassifier(t *testing.T) {
 		{"402", 402, `{}`, authBillingBlocked, true, false, 0},
 		{"quota-relative", 429, `{"error":{"type":"usage_limit_reached","resets_in_seconds":3600}}`, authQuotaCooldown, true, false, now.Unix() + 3600},
 		{"quota-absolute", 429, `{"error":{"type":"usage_limit_reached","resets_at":2000000100}}`, authQuotaCooldown, true, false, 2000000100},
-		{"quota-unknown", 429, `{"error":{"type":"usage_limit_reached"}}`, authQuotaCooldown, true, false, 0},
+		{"quota-unknown", 429, `{"error":{"type":"usage_limit_reached"}}`, authQuotaCooldown, true, false, now.Unix() + 60},
 		{"rate", 429, `{"error":{"type":"rate_limit_exceeded","retry_after":30}}`, authRateLimited, true, false, now.Unix() + 30},
 		{"unknown429", 429, `{}`, authRateLimited, true, false, now.Unix() + 60},
 		{"model403", 403, `{"error":{"code":"model_not_allowed"}}`, authHealthy, false, true, 0},
@@ -160,7 +160,7 @@ func TestNativeIsolationAndRecoveryAcrossRestart(t *testing.T) {
 	}
 }
 
-func TestNativeManualOwnershipAndReloginConflict(t *testing.T) {
+func TestNativeManualOwnershipAndReloginRecovery(t *testing.T) {
 	c, host, clock := nativeTestController(t)
 	lifecycleFailure(t, c, "a", 401, `{}`)
 	clock.now = clock.now.Add(24 * time.Hour)
@@ -174,7 +174,7 @@ func TestNativeManualOwnershipAndReloginConflict(t *testing.T) {
 	host.accounts["a"] = snapshot
 	c.reconcile(context.Background())
 	s := lifecycleStateForTest(t, c, "a")
-	if !s.Paused || s.DisabledByPlugin || !host.accounts["a"].Entry.Disabled {
+	if s.Paused || s.DisabledByPlugin || host.accounts["a"].Entry.Disabled || s.State != authHealthy {
 		t.Fatalf("relogin took ownership: %+v", s)
 	}
 	snapshot = host.accounts["b"]
@@ -204,8 +204,8 @@ func TestNativePartialWriteAndTimeout(t *testing.T) {
 				clock.now = clock.now.Add(time.Minute)
 				c.reconcile(context.Background())
 				s = lifecycleStateForTest(t, c, "a")
-				if !s.Paused || s.DisabledByPlugin {
-					t.Fatal("restart ambiguity claimed ownership")
+				if s.Paused || s.DisabledByPlugin || s.PendingAction != "disable" {
+					t.Fatal("partial write stopped automatic retry")
 				}
 			} else if !s.DisabledByPlugin || s.SyncStatus != "synced" {
 				t.Fatalf("readback failed: %+v", s)
@@ -214,11 +214,11 @@ func TestNativePartialWriteAndTimeout(t *testing.T) {
 	}
 }
 
-func TestNativeFieldMutationDoesNotOverwriteNewAuth(t *testing.T) {
+func TestNativeMetadataMutationDuringStatusWriteDoesNotPause(t *testing.T) {
 	c, host, _ := nativeTestController(t)
 	host.mutateField = true
 	lifecycleFailure(t, c, "a", 401, `{}`)
-	if len(host.writes) != 1 || lifecycleStateForTest(t, c, "a").DisabledByPlugin {
+	if len(host.writes) != 1 || !lifecycleStateForTest(t, c, "a").DisabledByPlugin {
 		t.Fatal("unsafe restoration or ownership after field mutation")
 	}
 }

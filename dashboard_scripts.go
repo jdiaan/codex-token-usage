@@ -887,7 +887,7 @@ function renderInvalidAuthModal(){
     const lifecycle=sourceKind==='lifecycle'&&r.lifecycle;
     const rowClass=sourceKind==='runtime_only'?' is-runtime':(actionKind==='legacy'&&!lifecycle?' is-legacy':'');
     const sourceText=lifecycle?'生命周期控制器 · 需要重新登录':sourceKind==='file'?('物理 JSON · '+(file||'文件名缺失')):sourceKind==='runtime_only'?('运行时凭据 · '+firstText(r.auth_id,r.auth_index,'-')):'历史记录 · 无可操作认证源';
-    const firstAction=lifecycle?'<button class="ghost" type="button" data-lifecycle-action="recheck" data-auth-index="'+esc(r.auth_index)+'" data-version="'+Number(r.lifecycle.version||0)+'">Recheck</button>':actionKind==='file'&&!xai?'<button class="ghost" type="button" data-invalid-login="'+esc(key)+'"'+(invalidAuthDeleting?' disabled':'')+'>OAuth 登录</button>':'<button class="ghost" type="button" disabled>'+esc(sourceKind==='runtime_only'?'仅本次运行':xai?'xAI 认证':'历史记录')+'</button>';
+    const firstAction=lifecycle?'<button class="ghost" type="button" data-lifecycle-action="retry_sync" data-auth-index="'+esc(r.auth_index)+'" data-version="'+Number(r.lifecycle.version||0)+'">重试同步</button>':actionKind==='file'&&!xai?'<button class="ghost" type="button" data-invalid-login="'+esc(key)+'"'+(invalidAuthDeleting?' disabled':'')+'>OAuth 登录</button>':'<button class="ghost" type="button" disabled>'+esc(sourceKind==='runtime_only'?'仅本次运行':xai?'xAI 认证':'历史记录')+'</button>';
     const lifecycleConfigured=Boolean(((lastData||{}).auth_controller||{}).management_configured);
     const finalAction=lifecycle?'<button class="ghost" type="button" data-lifecycle-action="enable" data-auth-index="'+esc(r.auth_index)+'" data-version="'+Number(r.lifecycle.version||0)+'"'+(lifecycleConfigured?'':' disabled title="请先配置 management_url / management_key"')+'>Enable</button>':actionKind==='file'?'<button class="ghost danger-ghost" type="button" data-invalid-delete="'+esc(key)+'"'+(invalidAuthDeleting?' disabled':'')+'>删除</button>':actionKind==='runtime_only'?'<button class="ghost danger-ghost" type="button" data-invalid-runtime-disable="'+esc(key)+'"'+(invalidAuthDeleting?' disabled':'')+'>本次运行禁用</button>':'<button class="ghost" type="button" disabled>不可删除</button>';
     return '<div class="invalid-auth-row'+rowClass+loginBusy+'" data-key="'+esc(key)+'" data-action-kind="'+esc(actionKind)+'">'+
@@ -2528,13 +2528,13 @@ function colorForPct(v){v=Number(v||0); return v>=90?'var(--red)':v>=70?'var(--o
 function health(v){v=Number(v||0); return v>=90?'danger':v>=70?'warn':'ok'}
 function successRate(r){return ratio((r.requests||0)-(r.failed||0),r.requests||0)}
 function resetText(ts){if(!ts)return '未捕获重置时间'; const n=Number(ts); const ms=n>1e12?n:n*1000; const d=new Date(ms); return isNaN(d.getTime())?'未捕获重置时间':'重置 '+d.toLocaleString()}
-function duration(sec){sec=Math.max(0,Number(sec||0)); const d=Math.floor(sec/86400), h=Math.floor(sec%86400/3600), m=Math.floor(sec%3600/60); return d?d+'天 '+h+'小时':h?h+'小时 '+m+'分':m+'分'}
+function duration(sec){sec=Math.max(0,Number(sec||0)); const d=Math.floor(sec/86400), h=Math.floor(sec%86400/3600), m=Math.floor(sec%3600/60); return d?d+'天 '+h+'小时':h?h+'小时 '+m+'分':m?m+'分 '+Math.floor(sec%60)+'秒':Math.floor(sec)+'秒'}
 function isInvalidAuthBan(r){const w=String(r&&r.window||'').toLowerCase();const code=Number(r&&r.last_status_code);return w==='401'||w==='403'||code===401||code===403}
 function isWorkspaceDeactivatedBan(r){return String(r&&r.window||'').toLowerCase()==='402'||Number(r&&r.last_status_code)===402}
 function is429Autoban(r){const w=String(r&&r.window||'').toLowerCase();const code=Number(r&&r.last_status_code);if(w==='401'||w==='402'||w==='403'||code===401||code===402||code===403)return false;return code===429||['429','5h','primary','7d','week','secondary'].includes(w)}
 function isPermanentAuthBan(r){return isInvalidAuthBan(r)||isWorkspaceDeactivatedBan(r)}
-function autobanResetText(r){if(r.lifecycle){const s=r.lifecycle;if(!s.disabled)return s.pending_action==='disable'?'等待禁用确认':'尚未禁用';if(!s.disabled_by_plugin||s.paused)return '需人工复查后启用';if(isPermanentAuthBan(r))return '处理认证后复查并启用';return s.recover_at?(r.reset_at_text||new Date(s.recover_at*1000).toLocaleString()):'恢复时间未知，等待手动检查'}return isWorkspaceDeactivatedBan(r)?'删除或替换认证文件后解除':isInvalidAuthBan(r)?'重新登录后解除':(r.reset_at_text||'-')}
-function autobanRemainingText(r){if(r.lifecycle){const s=r.lifecycle;if(!s.disabled)return '待禁用';if(!s.disabled_by_plugin||s.paused||isPermanentAuthBan(r))return '需处理';if(!s.recover_at)return '待手动检查';const seconds=Math.max(0,Number(s.recover_at)-Math.floor(Date.now()/1000));return seconds?duration(seconds):'等待启用确认'}return isPermanentAuthBan(r)?'需处理':duration(r.seconds_remaining)}
+function autobanResetText(r){if(r.lifecycle){const s=r.lifecycle;if(s.manual_disabled)return '人工停用';if(s.pending_action||!s.disabled)return s.sync_error?'同步失败，自动重试':'正在同步';if(isPermanentAuthBan(r))return '重新登录后自动恢复';return s.recover_at?(r.reset_at_text||new Date(s.recover_at*1000).toLocaleString()):'默认冷却 1 分钟'}return isWorkspaceDeactivatedBan(r)?'删除或替换认证文件后解除':isInvalidAuthBan(r)?'重新登录后解除':(r.reset_at_text||'-')}
+function autobanRemainingText(r){if(r.lifecycle){const s=r.lifecycle;if(s.manual_disabled)return '人工停用';if(s.pending_action||!s.disabled)return s.sync_error?'同步失败':'正在同步';if(isPermanentAuthBan(r))return '等待重新登录';const seconds=Math.max(0,Number(s.recover_at||0)-Math.floor(Date.now()/1000));return seconds?duration(seconds):'正在恢复'}return isPermanentAuthBan(r)?'需处理':duration(r.seconds_remaining)}
 function fmtLatencyMs(ms){ms=Number(ms||0); if(!ms)return '—'; if(ms>=1000)return (ms/1000).toFixed(1)+'s'; return Math.round(ms)+'ms'}
 function latencyTone(ms){ms=Number(ms||0); return ms>=12000?'slow':ms>0?'fast':''}
 function reliableThroughputSample(r){const latency=Number(r.latency_ms||0),ttft=Number(r.ttft_ms||0),ms=Math.max(latency,ttft),out=Number(r.output_tokens||0); return out>0&&ms>=1000&&!(latency===ttft&&out>=1000&&ms<5000)}
@@ -2615,7 +2615,7 @@ async function fetchSummary(win,key,forceRefresh=false,syncRefresh=false,signal=
 function isXAIPool(){return activePage==='xai'}
 function xaiStateLabel(state){return state==='unauthorized'?'401 失效':state==='forbidden'?'403 拒绝':state==='free_usage_exhausted'?'免费额度耗尽':state==='rate_limited'?'短期限流':state||'-'}
 function isNativeLifecycle(){return !isXAIPool()&&((lastData||{}).auth_controller||{}).scheduling_mode==='native'}
-function nativeLifecycleRows(){return ((lastData||{}).autobans||[]).filter(r=>r.lifecycle)}
+function nativeLifecycleRows(){return [...((lastData||{}).autobans||[]),...((((lastData||{}).auth_controller||{}).pending_accounts)||[])].filter(r=>r.lifecycle)}
 function lifecycleCurrentState(r){const s=r&&r.lifecycle||{};return s.state==='MANUAL_DISABLED'&&s.blocked_state?s.blocked_state:s.state}
 function lifecycleAuthInvalid(r){return lifecycleCurrentState(r)==='AUTH_INVALID'}
 function lifecycleWorkspaceBlocked(r){return lifecycleCurrentState(r)==='BILLING_BLOCKED'}
@@ -2913,45 +2913,38 @@ function maxQuota(r){return Math.max(r.primary_used_percent||0,r.secondary_used_
 function triggerRisk(r){return r.quota_trigger_status&&r.quota_trigger_status!=='success'&&r.quota_trigger_status!=='skipped'}
 function triggerSortScore(r){return triggerRisk(r)?3:(r.quota_trigger_status==='skipped'?2:(r.quota_trigger_status==='success'?1:0))}
 function lifecycleStatus(s){
-  const labels={HEALTHY:'Healthy / 健康',AUTH_INVALID:'Login Required / 需要登录',QUOTA_COOLDOWN:'Quota Cooldown / 额度冷却',RATE_LIMITED:'Rate Limited / 短期限流',BILLING_BLOCKED:'Billing Blocked / 账单受限',PERMISSION_BLOCKED:'Permission Issue / 权限问题',MANUAL_DISABLED:'Manually Disabled / 人工禁用'};
-  const label=(s.disabled?'已禁用 · ':s.pending_action==='disable'?'待禁用 · ':'')+(!s.disabled&&s.paused&&s.disable_reason==='external_enable'?'Externally Enabled / 外部启用，待复查':(labels[s.state]||s.state));
-  const remaining=Math.max(0,Number(s.recover_at||0)-Math.floor(Date.now()/1000));
-  const checkLabels={passed:'检查通过',incomplete:'上次检查未完成，请重新检查',not_available:'额度信息不完整或尚未恢复',quota_exhausted:'额度仍耗尽',request_failed:'检查请求失败，保持禁用',pending_failure:'有新失败待处理，保持禁用'};
-  const details=['disabled='+Boolean(s.disabled),s.disabled_by_plugin?'插件禁用':'无自动恢复所有权',s.disable_reason||'',s.disabled_at?'禁用于 '+new Date(s.disabled_at*1000).toLocaleString():'',s.recover_at?'Recover at '+new Date(s.recover_at*1000).toLocaleString()+' ('+remaining+'s)':s.state==='QUOTA_COOLDOWN'?'恢复时间未知，等待手动检查':'',s.last_http_status?'HTTP '+s.last_http_status:'',s.last_error_message||'',checkLabels[s.check_result]||'',s.sync_status||'',s.sync_error||''].filter(Boolean).join(' · ');
-  let buttons='';
-  if(s.disabled&&s.disabled_by_plugin&&!s.paused&&!s.pending_action&&['QUOTA_COOLDOWN','RATE_LIMITED'].includes(s.state))buttons+='<button type="button" class="btn" data-lifecycle-action="check_and_recover" data-auth-index="'+esc(s.auth_index)+'" data-version="'+Number(s.version)+'">检查并恢复</button> ';
-  for(const pair of [['recheck','Recheck'],['enable','Enable'],['disable','Disable'],['clear','Clear plugin state']])buttons+='<button type="button" class="btn" data-lifecycle-action="'+pair[0]+'" data-auth-index="'+esc(s.auth_index)+'" data-version="'+Number(s.version)+'">'+pair[1]+'</button> ';
-  return '<span class="status-pill '+(s.state==='HEALTHY'&&!s.paused?'ok':'warn')+'">'+esc(label)+'</span><details><summary>状态与操作</summary><div>'+esc(details)+'</div>'+buttons+'</details>';
+  const labels={HEALTHY:'健康',AUTH_INVALID:'401 · 认证失效',BILLING_BLOCKED:'402 · 账号／工作区不可用',QUOTA_COOLDOWN:'429 · 额度限制',RATE_LIMITED:'429 · 请求限流',PERMISSION_BLOCKED:'403 · 账号权限受限',MANUAL_DISABLED:'人工停用'};
+  const syncing=Boolean(s.pending_action||s.sync_error);
+  const label=(syncing?(s.sync_error?'同步失败 · ':'正在同步 · '):s.disabled?'已禁用 · ':'')+(labels[s.state]||s.state);
+  const recovery=['AUTH_INVALID','BILLING_BLOCKED','PERMISSION_BLOCKED'].includes(s.state)?'重新登录后自动恢复':['QUOTA_COOLDOWN','RATE_LIMITED'].includes(s.state)?(s.recover_at?'恢复时间：'+new Date(s.recover_at*1000).toLocaleString():'默认冷却 1 分钟'):'';
+  const detail=[recovery,s.disable_reason==='rate_limit_backoff'?'上游未返回有效时间，使用默认冷却':s.disable_reason||'',s.sync_error||''].filter(Boolean).join(' · ');
+  const retry=syncing?'<button type="button" class="btn" data-lifecycle-action="retry_sync" data-auth-index="'+esc(s.auth_index)+'" data-version="'+Number(s.version)+'">重试同步</button>':'';
+  return '<span class="status-pill '+(s.state==='HEALTHY'&&!syncing?'ok':'warn')+'">'+esc(label)+'</span>'+(detail?'<details><summary>详情</summary><div>'+esc(detail)+'</div></details>':'')+retry;
 }
 function renderNativeLifecycleModal(prefix,page,pageNumber,title){
   if(!isNativeLifecycle())return false;
   document.getElementById(prefix+'-title').textContent=title;
   for(const suffix of ['-delete-all','-select-page','-delete-selected','-all','-selected']){const el=document.getElementById(prefix+suffix);if(el)el.hidden=true}
-  const confirmed=page.rows.filter(r=>r.lifecycle.disabled).length;
-  document.getElementById(prefix+'-summary').textContent='已禁用 '+confirmed+' 个 · 待处理 '+(page.rows.length-confirmed)+' 个';
+  const confirmed=page.rows.filter(r=>r.lifecycle.disabled&&r.lifecycle.disabled_by_plugin).length;
+  document.getElementById(prefix+'-summary').textContent='已禁用 '+confirmed+' 个 · 正在同步 '+(page.rows.length-confirmed)+' 个';
   document.getElementById(prefix+'-page-label').textContent=pageNumber+' / '+page.pages;
   document.getElementById(prefix+'-prev').disabled=pageNumber<=1;
   document.getElementById(prefix+'-next').disabled=pageNumber>=page.pages;
   const statusCode=prefix==='invalid-auth'?401:prefix==='workspace-deactivated'?402:429;
-  const events=((((lastData||{}).auth_controller||{}).events||{}).pending||[]).filter(e=>e.status===statusCode&&e.outcome!=='pending_disable');
-  const eventLabels={pending:'待处理',pending_identity:'待匹配账号',pending_snapshot:'待读取账号',identity_conflict:'身份冲突，需复查'};
-  document.getElementById(prefix+'-status').textContent='429 可靠到期自动启用；检查并恢复只查询一次。页面刷新不查询额度。401/402 处理认证后复查并启用。'+(events.length?' 待核对事件（最多显示 100 条）：'+events.map(e=>(e.auth_index||e.auth_id||'未知账号')+' · '+(eventLabels[e.outcome]||e.outcome)+' · '+e.detail).join('；'):'');
-  document.getElementById(prefix+'-list').innerHTML=page.pageRows.map(r=>'<div class="lifecycle-management-row"><b>'+esc(accountName(r))+'</b><div>'+esc(r.auth_index)+' · '+esc(autobanResetText(r))+' · '+esc(autobanRemainingText(r))+'</div>'+lifecycleStatus(r.lifecycle)+'</div>').join('')||'<div class="invalid-auth-empty">当前没有此类账号。</div>';
+  const events=((((lastData||{}).auth_controller||{}).events||{}).pending||[]).filter(e=>e.status===statusCode&&['pending_identity','pending_snapshot'].includes(e.outcome));
+  const unresolved=new Set(events.map(e=>e.auth_index||e.auth_id||'unknown')).size;
+  document.getElementById(prefix+'-status').textContent=(statusCode===429?'按上游返回时间自动恢复；未返回时间时默认冷却 1 分钟。':'在 CPA 重新登录账号后自动恢复，无需额外操作。')+(unresolved?' '+unresolved+' 个账号暂无法同步，正在自动重试。':'');
+  const rowsHTML=rows=>rows.map(r=>'<div class="lifecycle-management-row"><b>'+esc(accountName(r))+'</b><div>'+esc(r.auth_index)+' · '+esc(autobanResetText(r))+' · '+esc(autobanRemainingText(r))+'</div>'+lifecycleStatus(r.lifecycle)+'</div>').join('');
+  const disabled=page.pageRows.filter(r=>r.lifecycle.disabled&&r.lifecycle.disabled_by_plugin);
+  const pending=page.pageRows.filter(r=>!(r.lifecycle.disabled&&r.lifecycle.disabled_by_plugin));
+  document.getElementById(prefix+'-list').innerHTML=(disabled.length?rowsHTML(disabled):'')+(pending.length?'<h3>状态同步</h3>'+rowsHTML(pending):'')||'<div class="invalid-auth-empty">当前没有此类账号。</div>';
   return true;
 }
 document.addEventListener('click',async event=>{
-  const button=event.target.closest('[data-lifecycle-action]');if(!button)return;
-  const row=[...((lastData||{}).accounts||[]),...nativeLifecycleRows()].find(r=>r.lifecycle&&r.lifecycle.auth_index===button.dataset.authIndex);if(!row)return;
-  const action=button.dataset.lifecycleAction;
-  const modelProbe=action==='recheck'&&(row.lifecycle.blocked_state==='BILLING_BLOCKED'||row.lifecycle.blocked_state==='PERMISSION_BLOCKED');
-  const message=action==='check_and_recover'?'查询一次当前额度，确认恢复后启用此账号？':modelProbe?'Recheck 将发送一次真实极小 Codex 模型请求，可能消耗少量额度，且不会自动启用账号。继续？':action==='clear'?'仅清理插件管理所有权，不会启用账号；该账号不再自动恢复。继续？':action==='enable'?'确认通过 CPA API 启用当前账号？':action==='disable'?'确认人工禁用当前账号？插件不会自动恢复。':'执行只读额度/认证 Recheck？不会自动启用账号。';
-  if(!window.confirm(message))return;
-  const probeModel=modelProbe?window.prompt('选择此账号允许的 Probe 模型（受 excluded-models 限制）','gpt-5.5'):'';if(modelProbe&&!probeModel)return;
+  const button=event.target.closest('[data-lifecycle-action]');if(!button||button.dataset.lifecycleAction!=='retry_sync')return;
   button.disabled=true;
   try{
-    const result=await quotaActivationJSON('/v0/management/plugins/__PLUGIN_ID__/auth-states/action',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({auth_index:button.dataset.authIndex,version:Number(button.dataset.version),action:action,confirm_model_probe:modelProbe,probe_model:probeModel})});
-    if(action==='recheck')window.alert(result.account&&result.account.check_ok?'Recheck 成功。需要恢复时请明确点击 Enable。':'Recheck 未通过，账号状态未启用。');
-    if(action==='check_and_recover')window.alert(result.account&&!result.account.disabled?'额度检查通过，已启用账号。':'尚未恢复，账号保持禁用。请查看状态与操作中的检查结果。');
+    await quotaActivationJSON('/v0/management/plugins/__PLUGIN_ID__/auth-states/action',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({auth_index:button.dataset.authIndex,version:Number(button.dataset.version),action:'retry_sync'})});
   }catch(error){window.alert(String(error.message||error))}finally{
     try{await load(true,true)}catch(error){window.alert(String(error.message||error))}
     button.disabled=false;
@@ -3094,7 +3087,7 @@ function renderInsights(data){
     ['Token 集中度',top?accountName(top):'-',top?'Top 占 '+pct(ratio(top.total_tokens,total)):'暂无账号',ratio(top?.total_tokens||0,total)>50?'tone-orange':''],
     ['额度触发',qt.enabled?((qt.mode||'probe')+' · '+(qt.interval_minutes||10)+'m'):'已关闭',triggerLine,qt.last_failed?'tone-orange':qt.enabled?'tone-green':''],
     ['自动禁用',fmt(bans.length)+' 个账号',bans.length?'429 等待 reset_at，401/402 需处理认证文件':'当前没有自动禁用',bans.length?'tone-red':'tone-green'],
-    ['401 失效',invalid?accountName(invalid):'0 个账号',invalid?(invalid.lifecycle&&!invalid.lifecycle.disabled?'已识别；当前尚未禁用，请检查控制器配置':'已停止使用，重新登录后 Recheck / Enable'):'当前没有认证失效',invalid?'tone-red':'tone-green'],
+    ['401 失效',invalid?accountName(invalid):'0 个账号',invalid?(invalid.lifecycle&&!invalid.lifecycle.disabled?'已识别；当前尚未禁用，请检查控制器配置':'已停止使用，重新登录后自动恢复'):'当前没有认证失效',invalid?'tone-red':'tone-green'],
     ['403 拒绝',forbidden?accountName(forbidden):'0 个账号',forbidden?'权限被拒绝，需检查账号权限或认证':'当前没有权限拒绝',forbidden?'tone-red':'tone-green'],
     ['402 工作区',workspace?accountName(workspace):'0 个账号',workspace?'Team 工作区失效，删除或替换 json 后解除':'当前没有工作区失效',workspace?'tone-orange':'tone-green'],
     ['外部消耗',external?accountName(external):'0 个账号',external?external.external_use_window+' +'+pct(external.external_use_delta_percent)+' · 本地 '+compact(external.external_use_local_tokens)+' tok':'未发现一号多卖迹象',external?'tone-red':'tone-green'],

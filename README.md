@@ -2,14 +2,14 @@
 
 CPA Token Usage is a CLIProxyAPI plugin for Codex account operation dashboards and AI provider usage analytics.
 
-Current version: `0.1.46`
+Current version: `0.1.47`
 
 ## Features
 
 - Codex account pool dashboard with pagination, saved sorting, quota bars, 7d/month quota estimates, cost estimates, and light/dark compatible UI.
 - AI provider pages grouped by CPA endpoint name, separated from Codex OAuth account-pool pricing and quota calculations.
 - Native Codex scheduling delegates to CPA; confirmed quota exhaustion is isolated through the CPA Management status API and recovered at reliable reset times.
-- Durable 401/402/account-level 403 isolation with explicit Recheck and Enable; ambiguous credential replacement never automatically enables an account.
+- Automatic 401/402/account-level 403 isolation, restored after same-account credentials update; timed 429 recovery with a 60-second fallback.
 - Suspicious external quota consumption detection for shared or resold accounts.
 - Optional periodic Codex quota trigger that sends a tiny real Codex request to refresh/start server-reported quota windows.
 - Authenticated Management UI/API workflow for previewing and activating fresh Codex quota windows exactly once per observed account cycle.
@@ -139,7 +139,9 @@ The URL is the CPA root URL. Environment variables override the corresponding pl
 
 The controller supports uniquely identified physical Codex OAuth auth files. It sends only `{name, auth_index, disabled}` to `PATCH /v0/management/auth-files/status`, then verifies both the file and runtime state and checks that credential/custom/routing fields were preserved. HTTP 200 alone is insufficient. SQLite stores fingerprints, intent, state versions and sanitized audit evidence. Existing disabled files are treated as manually disabled unless a completed plugin operation proves ownership.
 
-Only unchanged, plugin-owned quota or rate-limit isolation is automatically enabled when its recovery time is reached. Ordinary 429 uses the server retry/reset time, or a 60-second local backoff if none is provided; the local backoff is not a quota reset estimate. Multiple exhausted windows use their latest reset. Recovery is lazy: the lifecycle controller, dashboard browsing and page refreshes never query upstream quota. Unknown reset times wait for an explicit **Check and recover / 检查并恢复** action. Normal requests still record returned quota headers, but successful in-flight requests and cached percentages never clear isolation. 401 never has timer recovery. 402 and account-level 403 require manual review. External changes pause control, and Recheck never implicitly enables an account. If an operator enables a manually disabled account outside the plugin, the lifecycle state stops reporting `MANUAL_DISABLED` but remains paused until reviewed. CPA has no conditional update or operator marker, so a narrow concurrent external-write race remains possible.
+401/402 (and explicit account-level 403) disable the CPA auth file until same-account credentials update, then automatically enable it. Ordinary metadata changes and token refresh observations never impose a manual-review gate. 429 and explicit traffic limits use returned JSON/header deadlines; multiple exhausted windows use the latest known reset, and a missing window does not erase another valid reset. Without a valid deadline, cooldown lasts 60 seconds. Timer expiry automatically enables plugin-owned isolation. Explicit manual disables remain manual.
+
+Lifecycle polling, dashboard browsing, refreshes and sync actions never query upstream quota or send model probes. Normal requests may record quota observations; cached percentages and concurrent successes do not clear current isolation. Failures bind to credential generations so late old requests cannot disable new credentials. CPA writes and file/runtime read-back failures automatically retry. CPA has no conditional update or operator marker, so an indistinguishable concurrent manual write remains a platform limitation.
 
 Dashboard actions call the existing Management-authenticated endpoint:
 
@@ -147,12 +149,14 @@ Dashboard actions call the existing Management-authenticated endpoint:
 POST /v0/management/plugins/codex-token-usage/auth-states/action
 Content-Type: application/json
 
-{"auth_index":"exact-index","version":3,"action":"recheck"}
+{"auth_index":"exact-index","version":3,"action":"retry_sync"}
 ```
 
-Actions are `check_and_recover`, `recheck`, `enable`, `disable`, and `clear`; use the latest lifecycle version from Summary. A stale version returns 409. `check_and_recover` is available only for unchanged plugin-owned 429 disables: it makes one quota request and enables only when all applicable windows explicitly have available quota, then verifies physical and runtime status. Exhaustion updates a reliable recovery time; incomplete quota, errors or new pending failures keep the account disabled. A 401 during this check upgrades the account to authentication-invalid with no recovery timer. Recheck remains check-only, and HTTP 200 with exhausted or unknown quota is not a successful quota recovery check. Billing/permission Recheck requires `confirm_model_probe: true` and can include `probe_model` (default `gpt-5.5`); this sends a real request and respects auth-file model exclusions. Other Rechecks use read-only quota requests. A successful check is valid for five minutes for explicit Enable. Disable withdraws automatic recovery ownership. Clear stops plugin management without enabling the account and retains audit history.
+The normal dashboard offers only **重试同步** (`retry_sync`) for pending/failed synchronization. Use the latest lifecycle version from Summary; stale versions return 409. Compatibility `recheck` and `check_and_recover` actions perform the same local reconciliation without upstream requests. Legacy explicit `enable`, `disable`, and `clear` actions remain available through the API; Disable/Clear relinquish automatic recovery ownership.
 
-Request records and native lifecycle events commit atomically before auxiliary accounting. Missing identities or temporarily unreadable auth snapshots keep events pending for retry; identity matching never falls back to email. Pending 429 isolation can be upgraded by a later 401, and queued failures are processed before timer recovery. Summary exposes sanitized `auth_controller.events` with disposition counts plus bounded `pending` and `recent` lists (up to 100 each). Dispositions distinguish pending identity/snapshot, pending disable, confirmed disable, stale observations and conflicts. Upgrades retain unfinished events without replaying historical request failures as new disables.
+Confirmed automatic disables appear in `autobans`; unconfirmed writes and sync failures appear separately in `auth_controller.pending_accounts`. Each account shows its failure, disable time and either “重新登录后自动恢复” or a cooldown countdown. Healthy, enabled accounts leave the list.
+
+Request records and native lifecycle events commit atomically before auxiliary accounting. Missing identities or temporarily unreadable auth snapshots keep events pending for retry; identity matching never falls back to email. Pending 429 isolation can be upgraded by a later 401, and queued failures are processed before timer recovery. Summary exposes sanitized `auth_controller.events` with disposition counts plus bounded `pending` and `recent` lists (up to 100 each). Dispositions distinguish pending identity/snapshot, pending disable, confirmed disable, stale observations and conflicts. Upgrades retain unfinished events and replay existing failures previously suppressed by erroneous metadata conflicts, except failures superseded by newer login/success and expired cooldowns. Migration is idempotent and preserves explicit manual disables; historical usage errors are not bulk converted into new events.
 
 The old release/resolve routes remain registered. Native callers must supply exact `auth_index` and `version`; unversioned requests return `409 refresh_required` without changing auth. Legacy keeps its original route semantics.
 
@@ -238,11 +242,11 @@ python3 integration/run_cpa_native.py # Go >=1.26; pinned CPA v7.2.145
 Release assets are named in the CLIProxyAPI plugin store format:
 
 ```text
-codex-token-usage_0.1.46_linux_amd64.zip
-codex-token-usage_0.1.46_linux_arm64.zip
-codex-token-usage_0.1.46_windows_amd64.zip
-codex-token-usage_0.1.46_darwin_amd64.zip
-codex-token-usage_0.1.46_darwin_arm64.zip
+codex-token-usage_0.1.47_linux_amd64.zip
+codex-token-usage_0.1.47_linux_arm64.zip
+codex-token-usage_0.1.47_windows_amd64.zip
+codex-token-usage_0.1.47_darwin_amd64.zip
+codex-token-usage_0.1.47_darwin_arm64.zip
 checksums.txt
 ```
 
@@ -257,7 +261,7 @@ checksums.txt
 ## Common Issues
 
 - `未注册 / 未生效`: confirm the file is under the correct plugin directory and restart CLIProxyAPI.
-- Native `401`: isolation requires configured Management access; verify credentials with Recheck, then explicitly Enable. Replacement alone does not restore an ambiguous account.
+- Native `401`/`402`: isolation requires configured Management access; log in again for the same account to restore it automatically.
 - Native `429`: ordinary rate limits and confirmed quota exhaustion both disable the auth through CPA. Unknown quota resets are queried without inventing a recovery time; ordinary 429 without retry metadata uses a 60-second local backoff.
 - Provider not visible: confirm the endpoint still exists in CPA config and refresh the dashboard.
 - Price missing: check `model_prices.cache` status in the summary JSON and the model price update error if present.
