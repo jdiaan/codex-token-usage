@@ -2651,7 +2651,11 @@ ORDER BY observed_at DESC, id DESC`
 		if snapshot.ResetAt.Valid {
 			snapshot.ResetAt.Int64 = normalizeUnixSeconds(snapshot.ResetAt.Int64)
 			if snapshot.ResetAt.Int64 <= now {
-				continue
+				// Keep the server-reported window shape after reset.  The values are
+				// stale, but dropping the snapshot altogether loses the distinction
+				// between an absent window and a window that simply needs refreshing.
+				snapshot.Percent = sql.NullFloat64{}
+				snapshot.ResetAt = sql.NullInt64{}
 			}
 		}
 		accountIndex, ok := index.match(accounts, snapshot)
@@ -3612,6 +3616,14 @@ func applySecondaryQuotaEstimates(ctx context.Context, db *sql.DB, accounts []ac
 		accounts[i].SecondaryQuotaEstimateSource = ""
 		accounts[i].SecondaryQuotaEstimateMethod = ""
 		accounts[i].QuotaEstimateNote = ""
+		accounts[i].SecondaryQuotaTotalEstimate = 0
+		accounts[i].SecondaryQuotaRemainingEstimate = 0
+		if isFreePlan(accounts[i].PlanType) {
+			// Free accounts have one quota window.  A secondary snapshot may
+			// exist in legacy data, but it must not affect estimates or totals.
+			applyAccountQuotaSource(&accounts[i])
+			continue
+		}
 		total, remaining := int64(0), int64(0)
 		if accounts[i].Requests <= 0 {
 			applyAccountQuotaSource(&accounts[i])
@@ -3647,6 +3659,11 @@ func applySecondaryQuotaEstimates(ctx context.Context, db *sql.DB, accounts []ac
 		applyAccountQuotaSource(&accounts[i])
 	}
 	totals.SecondaryQuotaEstimatedAccounts = estimatedAccounts
+}
+
+func isFreePlan(plan string) bool {
+	plan = strings.ToLower(strings.TrimSpace(plan))
+	return plan == "free" || plan == "trial" || strings.Contains(plan, "free") || strings.Contains(plan, "trial")
 }
 
 type secondaryQuotaCapacitySnapshot struct {

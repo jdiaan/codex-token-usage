@@ -24,6 +24,24 @@ func TestDashboardCacheTokensDoesNotDoubleCountOverlappingFields(t *testing.T) {
 	}
 }
 
+func TestDashboardQuotaLayoutSeparatesFreeAndPaidWindows(t *testing.T) {
+	for _, marker := range []string{
+		"function quotaPlanKind(r)",
+		"function quotaDisplayPrefix(r)",
+		"Free 仅单窗口",
+		"尚未探测，待刷新",
+		"function quotaWindowCellForDisplay(r,prefix)",
+		"if(quotaPlanKind(r)==='free')return Number.MAX_SAFE_INTEGER",
+	} {
+		if !strings.Contains(dashboardScripts, marker) {
+			t.Fatalf("quota layout marker %q not found", marker)
+		}
+	}
+	if strings.Contains(dashboardScripts, "function quotaText(percent,tokens){const p=pct(percent); const tok=Number(tokens||0)>0?compact(tokens)+' tok':'无窗口 Token'") {
+		t.Fatal("quota text must not label an empty window as zero-token quota")
+	}
+}
+
 func TestNativeLifecycleFailuresAreVisible(t *testing.T) {
 	markers := []string{
 		"function lifecycleAuthInvalid(r)",

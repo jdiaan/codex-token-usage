@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"net/http"
 	"testing"
 	"time"
@@ -115,5 +116,78 @@ INSERT INTO quota_trigger_runs (
 	}
 	if accounts[0].SecondaryQuotaWindowPresence != string(quotaWindowPresent) || accounts[0].SecondaryQuotaWindow != "14d" || accounts[0].SecondaryQuotaWindowSeconds != 14*24*60*60 {
 		t.Fatalf("secondary dynamic snapshot=%+v", accounts[0])
+	}
+}
+
+func TestPlanQuotaWindowsKeepReportedSlots(t *testing.T) {
+	primaryPercent, secondaryPercent := 12.0, 34.0
+	primaryReset, secondaryReset := int64(4102444800), int64(4103049600)
+	primary := quotaWindowSnapshot{
+		Presence: quotaWindowPresent,
+		Percent:  sql.NullFloat64{Float64: primaryPercent, Valid: true},
+		ResetAt:  sql.NullInt64{Int64: primaryReset, Valid: true},
+		LimitWindowSeconds: sql.NullInt64{
+			Int64: int64((5 * time.Hour) / time.Second), Valid: true,
+		},
+	}
+	secondary := quotaWindowSnapshot{
+		Presence: quotaWindowPresent,
+		Percent:  sql.NullFloat64{Float64: secondaryPercent, Valid: true},
+		ResetAt:  sql.NullInt64{Int64: secondaryReset, Valid: true},
+		LimitWindowSeconds: sql.NullInt64{
+			Int64: int64((7 * 24 * time.Hour) / time.Second), Valid: true,
+		},
+	}
+	plus := accountRow{PlanType: "plus"}
+	applyAccountQuotaSnapshot(&plus, primary, secondary)
+	if plus.PrimaryUsedPercent == nil || plus.SecondaryUsedPercent == nil || plus.PrimaryQuotaWindow != "5h" || plus.SecondaryQuotaWindow != "7d" {
+		t.Fatalf("plus must retain both reported windows: %+v", plus)
+	}
+	free := accountRow{PlanType: "free"}
+	applyAccountQuotaSnapshot(&free, primary, quotaWindowSnapshot{Presence: quotaWindowAbsent})
+	if free.PrimaryUsedPercent == nil || free.SecondaryUsedPercent != nil || free.SecondaryQuotaWindowPresence != string(quotaWindowAbsent) {
+		t.Fatalf("free single reported window=%+v", free)
+	}
+}
+
+func TestFreePlansDoNotContributeSecondaryQuotaEstimates(t *testing.T) {
+	s := newTestStore(t)
+	db, _, err := s.open(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	used := 50.0
+	accounts := []accountRow{{
+		AuthID: "free", AuthIndex: "free.json", PlanType: "free", Requests: 1,
+		SecondaryUsedPercent: &used, SecondaryWindowTokens: 500,
+	}}
+	totals := totalsRow{}
+	applySecondaryQuotaEstimates(context.Background(), db, accounts, &totals, time.Now().Add(-time.Hour).Unix())
+	if accounts[0].SecondaryQuotaTotalEstimate != 0 || accounts[0].SecondaryQuotaRemainingEstimate != 0 || totals.SecondaryQuotaEstimatedAccounts != 0 || totals.SecondaryQuotaTotalEstimate != 0 {
+		t.Fatalf("free account must not contribute window 2 estimates: account=%+v totals=%+v", accounts[0], totals)
+	}
+}
+
+func TestExpiredQuotaProbePreservesWindowShapeButClearsStaleValues(t *testing.T) {
+	s := newTestStore(t)
+	db, _, err := s.open(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().Unix()
+	if _, err := db.Exec(`
+INSERT INTO quota_trigger_runs (
+  auth_id, auth_index, source, provider, auth_file, auth_file_mtime, mode, status, http_status,
+  started_at, finished_at, primary_used_percent, primary_reset_at,
+  primary_window_presence, primary_limit_window_seconds, primary_reset_after_seconds
+) VALUES ('expired', 'expired.json', 'expired', 'codex', 'expired.json', 7, 'probe', 'success', 200,
+  ?, ?, 88, ?, 'present', ?, ?)`,
+		now-20, now-10, now-1, 5*60*60, 5*60*60); err != nil {
+		t.Fatal(err)
+	}
+	accounts := []accountRow{{AuthID: "expired", AuthIndex: "expired.json", Source: "expired", AuthFile: "expired.json", AuthFileMTime: 7}}
+	applyLatestQuotaSnapshots(context.Background(), db, accounts, now-3600)
+	if accounts[0].PrimaryQuotaWindowPresence != string(quotaWindowPresent) || accounts[0].PrimaryQuotaWindow != "5h" || accounts[0].PrimaryUsedPercent != nil || accounts[0].PrimaryResetAt != nil {
+		t.Fatalf("expired snapshot=%+v", accounts[0])
 	}
 }
