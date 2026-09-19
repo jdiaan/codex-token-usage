@@ -2660,10 +2660,8 @@ function renderPoolPage(source){
   if(!lifecycleBanner){lifecycleBanner=document.createElement('p');lifecycleBanner.id='lifecycle-banner';document.getElementById('pool-hero-hint').after(lifecycleBanner)}
   lifecycleBanner.hidden=data.provider==='xai';
   const recent401=((source&&source.recent)||[]).filter(r=>Number(r.status_code)===401).length;
-  const managementConfig=controller.management_config||{};
-  const missing=(managementConfig.missing_fields||[]).join(' / ');
   lifecycleBanner.className=controller.scheduling_mode==='native'&&(!controller.management_configured||controller.last_error)?'lifecycle-danger':'lifecycle-ok';
-  lifecycleBanner.textContent=controller.scheduling_mode==='native'?'Native · CPA 原生调度；Token 统计/告警保留，插件并发硬限制及 Token 降级未执行。'+(controller.management_configured?' 自动启停已配置。':(' 危险：账号状态写入不可用'+(recent401?('；最近列表已有 '+recent401+' 条 401，但无法自动禁用。'):'。')+' 请在插件配置中填写 management_url / management_key，或设置同名环境变量。'+(missing?(' 缺少：'+missing+'。'):'')))+(controller.last_error?' 控制器错误：'+controller.last_error:''):'Legacy · 插件调度与原有账号保护。';
+  lifecycleBanner.textContent=lifecycleBannerText(controller,recent401);
 
   document.getElementById('m-requests').textContent=fmt(t.requests);
   document.getElementById('m-success').textContent='成功率 '+pct(ratio(okReq,t.requests));
@@ -3061,6 +3059,24 @@ function quotaEstimateCell(r){
 function quotaWindow2Cell(r){if(quotaPlanKind(r)==='free')return '';const missing=quotaWindowMissingCell(r,'secondary');const label=quotaWindowLabel(r,'secondary')||'窗口';const cell=missing|| (r.secondary_used_percent==null?'<span class="metric-stack"><b class="muted">待刷新</b><span>'+esc(label)+' 已知，暂无百分比</span></span>':quotaCompact(label,r.secondary_used_percent,r.secondary_window_tokens,r.secondary_reset_at));return '<div class="metric-stack">'+cell+quotaEstimateCell(r)+'</div>'}
 function quotaSummaryText(r){const parts=[];if(quotaPlanKind(r)==='free'){const source=quotaDisplayPrefix(r);if(quotaWindowHasData(r,source))parts.push((quotaWindowLabel(r,source)||'窗口 1')+' '+pct(r[source+'_used_percent']));else parts.push('单窗口待刷新');return parts.join(' · ')}if(quotaWindowHasData(r,'primary'))parts.push((quotaWindowLabel(r,'primary')||'窗口 1')+' '+pct(r.primary_used_percent));else if(quotaWindowPresence(r,'primary')==='absent')parts.push('窗口 1 无');if(quotaWindowHasData(r,'secondary'))parts.push((quotaWindowLabel(r,'secondary')||'窗口 2')+' '+pct(r.secondary_used_percent));else if(quotaWindowPresence(r,'secondary')==='absent')parts.push('窗口 2 无');return parts.length?parts.join(' · '):'暂无额度快照'}
 function tokenCostStack(r,total){const cost=r.cost_available||Number(r.cost_usd||0)>0?money(r.cost_usd):'缺价格'; const cls=r.cost_available?'cost-line':'cost-weak'; return '<span class="metric-stack"><b>'+compact(r.total_tokens)+'</b><span>占 '+pct(ratio(r.total_tokens,total))+'</span><span class="'+cls+'">'+esc(cost)+'</span></span>'}
+function lifecycleBannerText(controller,recent401){
+  if(controller.scheduling_mode!=='native')return 'Legacy · 插件调度与原有账号保护。';
+  let text='Native · CPA 原生调度；Token 统计/告警保留，插件并发硬限制及 Token 降级未执行。';
+  const config=controller.management_config||{};
+  const reasons={not_initialized:'插件尚未初始化',file_missing:'未找到私密配置文件',invalid_path:'配置路径必须为绝对路径',file_unreadable:'无法读取私密配置文件',invalid_file:'私密配置文件类型或大小无效',unsafe_permissions:'私密配置文件权限过宽',invalid_yaml:'私密配置文件格式错误',unknown_field:'私密配置文件包含未知字段',duplicate_field:'私密配置文件包含重复字段',invalid_type:'私密配置字段必须为字符串',missing_fields:'私密配置缺少必填项',invalid_url:'管理地址无效',invalid_key:'管理密钥格式无效'};
+  if(controller.management_configured){
+    text+=' 自动启停已配置（服务器本地文件；连接结果以实际请求为准）。';
+  }else{
+    const absent=!config.error_code||config.error_code==='file_missing'||config.error_code==='not_initialized';
+    text+=' 危险：账号状态写入不可用；'+(absent?'未配置':'配置无效')+'。';
+    if(recent401)text+='最近列表已有 '+recent401+' 条 401，但无法自动禁用。';
+    text+=' '+(reasons[config.error_code]||'无法使用服务器私密配置')+'。请管理员修改服务器私密配置文件并重启 CPA。';
+    const missing=(config.missing_fields||[]).join(' / ');
+    if(missing)text+=' 缺少：'+missing+'。';
+  }
+  if(controller.last_error)text+=' 控制器错误：'+controller.last_error;
+  return text;
+}
 function renderProviders(rows,total){
   document.getElementById('providers').innerHTML=rows.map(r=>'<tr>'+
     td('<span class="pill">'+esc(r.provider||'unknown')+'</span>')+td(fmt(r.requests),'num')+td(pct(successRate(r)),'num')+

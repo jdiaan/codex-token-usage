@@ -21,6 +21,7 @@ outputs/
 
 # Secrets and local overrides
 .env
+codex-token-usage-management.yaml
 model_prices.json
 *.cpa.json
 *.auth.json

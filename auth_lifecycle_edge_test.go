@@ -249,43 +249,24 @@ func TestNativeDefaultAndInvalidMode(t *testing.T) {
 	}
 }
 
-func TestManagementConfigFieldsAndEnvironmentPrecedence(t *testing.T) {
+func TestManagementConfigRemovedFromPluginFields(t *testing.T) {
 	fields := pluginConfigFields()
 	seen := map[string]bool{}
 	for _, field := range fields {
 		seen[field.Name] = true
 	}
-	if !seen["management_url"] || !seen["management_key"] {
-		t.Fatalf("management fields missing from plugin registration: %+v", seen)
+	if seen["management_url"] || seen["management_key"] || seen["management_config_file"] {
+		t.Fatal("private management configuration exposed in plugin registration")
 	}
 
 	cfg := parsePluginConfigYAML([]byte("management_url: http://127.0.0.1:8317\nmanagement_key: plugin-secret\nFree 5 分钟 Token 上限: 12345\n"), defaultPluginConfig())
-	if cfg.ManagementURL != "http://127.0.0.1:8317" || cfg.ManagementKey != "plugin-secret" {
-		t.Fatalf("management plugin config was not parsed: url=%q key=%q", cfg.ManagementURL, cfg.ManagementKey)
-	}
 	if cfg.AccountProtectionFreeTokenLimit != 12345 {
 		t.Fatalf("config key containing spaces was ignored: %d", cfg.AccountProtectionFreeTokenLimit)
 	}
 
-	t.Setenv("CPA_TOKEN_USAGE_MANAGEMENT_URL", "")
-	t.Setenv("CPA_TOKEN_USAGE_MANAGEMENT_KEY", "")
-	client := newManagementAuthClient(cfg)
-	if !client.Ready() || client.baseURL != cfg.ManagementURL || client.key != cfg.ManagementKey {
-		t.Fatalf("plugin config did not configure management client: ready=%v url=%q", client.Ready(), client.baseURL)
-	}
-	t.Setenv("CPA_TOKEN_USAGE_MANAGEMENT_URL", "http://127.0.0.1:9999/")
-	t.Setenv("CPA_TOKEN_USAGE_MANAGEMENT_KEY", "environment-secret")
-	client = newManagementAuthClient(cfg)
-	if client.baseURL != "http://127.0.0.1:9999" || client.key != "environment-secret" {
-		t.Fatalf("environment did not override plugin config: url=%q", client.baseURL)
-	}
-	status := managementAuthConfigStatus(cfg)
-	if status["url_source"] != "environment" || status["key_source"] != "environment" {
-		t.Fatalf("management source status = %+v", status)
-	}
-	encoded, _ := json.Marshal(status)
-	if strings.Contains(string(encoded), "secret") {
-		t.Fatalf("management status leaked a key: %s", encoded)
+	encoded, _ := json.Marshal(cfg)
+	if strings.Contains(string(encoded), "plugin-secret") || strings.Contains(string(encoded), "management_url") || strings.Contains(string(encoded), "ManagementKey") {
+		t.Fatal("legacy management credentials survived ordinary config parsing")
 	}
 }
 
@@ -309,7 +290,7 @@ func TestNativeDashboardJavaScript(t *testing.T) {
 	// Parse the entire shipped script, then execute the new status rendering with
 	// hostile labels. This catches broken JS and attribute-injection regressions.
 	source := `new Function(` + jsQuoted(dashboardScripts) + `);`
-	start := strings.Index(dashboardScripts, "function lifecycleStatus(s){")
+	start := strings.Index(dashboardScripts, "function lifecycleStatusLabel(s){")
 	end := strings.Index(dashboardScripts[start:], "\ndocument.addEventListener")
 	escStart := strings.Index(dashboardScripts, "function esc(v){")
 	escEnd := strings.Index(dashboardScripts[escStart:], "\n")

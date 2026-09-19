@@ -50,6 +50,37 @@ function row(index, state = 'RATE_LIMITED', extra = {}) {
   };
 }
 
+function privateConfigBanner(controller, recent401 = 0) {
+  const start = source.indexOf('function lifecycleBannerText(');
+  const end = source.indexOf('function renderProviders(', start);
+  assert.ok(start >= 0 && end > start);
+  const context = vm.createContext({controller, recent401});
+  vm.runInContext(source.slice(start, end), context);
+  return vm.runInContext('lifecycleBannerText(controller,recent401)', context);
+}
+
+test('private management banner distinguishes missing, invalid, configured and request failures', () => {
+  const base = {scheduling_mode:'native', management_configured:false};
+  const missing = privateConfigBanner({...base, management_config:{error_code:'file_missing',missing_fields:['management_url','management_key']}}, 3);
+  assert.match(missing, /未配置/);
+  assert.match(missing, /最近列表已有 3 条 401/);
+  assert.match(missing, /修改服务器私密配置文件并重启 CPA/);
+  for (const code of ['invalid_path','file_unreadable','invalid_file','unsafe_permissions','invalid_yaml','unknown_field','duplicate_field','invalid_type','missing_fields','invalid_url','invalid_key']) {
+    const text = privateConfigBanner({...base,management_config:{error_code:code}});
+    assert.match(text, /配置无效/);
+    assert.match(text, /重启 CPA/);
+    assert.doesNotMatch(text, /请在插件配置中填写|同名环境变量/);
+  }
+  const configured = privateConfigBanner({...base,management_configured:true,management_config:{error_code:''}});
+  assert.match(configured, /自动启停已配置.*服务器本地文件/);
+  assert.match(configured, /连接结果以实际请求为准/);
+  assert.doesNotMatch(configured, /危险|连接成功/);
+  const failed = privateConfigBanner({...base,management_configured:true,last_error:'CPA management authentication failed (HTTP 401)'});
+  assert.match(failed, /控制器错误：CPA management authentication failed/);
+  assert.equal(privateConfigBanner({scheduling_mode:'legacy'}), 'Legacy · 插件调度与原有账号保护。');
+  assert.doesNotMatch(source, /请在插件配置中填写 management_url|或设置同名环境变量/);
+});
+
 test('19 native 429 accounts populate table and card dialog with pagination', () => {
   const rows = Array.from({ length: 19 }, (_, i) => row('account-' + i));
   const { context, elements, run } = dashboard(rows);

@@ -10,8 +10,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
-	"os"
 	"strings"
 	"time"
 )
@@ -36,44 +34,16 @@ type managementAuthClient struct {
 	client       *http.Client
 }
 
-func newManagementAuthClient(cfg pluginConfig) *managementAuthClient {
-	baseURL := strings.TrimSpace(os.Getenv("CPA_TOKEN_USAGE_MANAGEMENT_URL"))
-	if baseURL == "" {
-		baseURL = strings.TrimSpace(cfg.ManagementURL)
+func newManagementAuthClient(config managementConfigSnapshot) *managementAuthClient {
+	client := &managementAuthClient{call: hostAuthCaller, client: &http.Client{Timeout: 10 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}
+	if config.ready() {
+		client.baseURL, client.key = config.baseURL, config.key
 	}
-	key := strings.TrimSpace(os.Getenv("CPA_TOKEN_USAGE_MANAGEMENT_KEY"))
-	if key == "" {
-		key = strings.TrimSpace(cfg.ManagementKey)
-	}
-	return &managementAuthClient{call: hostAuthCaller, baseURL: strings.TrimRight(baseURL, "/"), key: key, client: &http.Client{Timeout: 10 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}
-}
-
-func managementAuthConfigStatus(cfg pluginConfig) map[string]any {
-	urlSource := "missing"
-	if strings.TrimSpace(os.Getenv("CPA_TOKEN_USAGE_MANAGEMENT_URL")) != "" {
-		urlSource = "environment"
-	} else if strings.TrimSpace(cfg.ManagementURL) != "" {
-		urlSource = "plugin_config"
-	}
-	keySource := "missing"
-	if strings.TrimSpace(os.Getenv("CPA_TOKEN_USAGE_MANAGEMENT_KEY")) != "" {
-		keySource = "environment"
-	} else if strings.TrimSpace(cfg.ManagementKey) != "" {
-		keySource = "plugin_config"
-	}
-	missing := make([]string, 0, 2)
-	if urlSource == "missing" {
-		missing = append(missing, "management_url")
-	}
-	if keySource == "missing" {
-		missing = append(missing, "management_key")
-	}
-	return map[string]any{"url_source": urlSource, "key_source": keySource, "missing_fields": missing}
+	return client
 }
 
 func (c *managementAuthClient) Ready() bool {
-	u, err := url.Parse(c.baseURL)
-	return err == nil && (u.Scheme == "http" || u.Scheme == "https") && u.Host != "" && u.User == nil && u.RawQuery == "" && u.Fragment == "" && c.key != ""
+	return validManagementURL(c.baseURL) && c.key != ""
 }
 
 func (c *managementAuthClient) List(ctx context.Context) ([]hostAuthFileEntry, error) {
@@ -194,7 +164,7 @@ func lifecycleHash(data map[string]json.RawMessage) string {
 
 func (c *managementAuthClient) SetDisabled(ctx context.Context, s lifecycleSnapshot, disabled bool) error {
 	if !c.Ready() {
-		return errors.New("management API environment is not configured")
+		return errors.New("management API local file configuration is unavailable; update the server private configuration file and restart CPA")
 	}
 	raw, _ := json.Marshal(map[string]any{"name": s.Entry.Name, "auth_index": s.Entry.AuthIndex, "disabled": disabled})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPatch, c.baseURL+"/v0/management/auth-files/status", bytes.NewReader(raw))
@@ -210,7 +180,7 @@ func (c *managementAuthClient) SetDisabled(ctx context.Context, s lifecycleSnaps
 	defer response.Body.Close()
 	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4096))
 	if response.StatusCode == http.StatusUnauthorized {
-		return errors.New("CPA management authentication failed (HTTP 401); check management_key; this is not an account credential error")
+		return errors.New("CPA management authentication failed (HTTP 401); check management_key in the server private configuration file and restart CPA; this is not an account credential error")
 	}
 	if response.StatusCode != http.StatusOK {
 		return fmt.Errorf("management status HTTP %d", response.StatusCode)

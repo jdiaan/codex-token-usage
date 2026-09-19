@@ -1,0 +1,5 @@
+# Copy to the server private configuration location; never put real keys here.
+# Changes require a CPA process restart. On Unix, prefer root ownership with
+# service-group read access (0640) and a parent directory the service cannot write.
+management_url: "http://127.0.0.1:8317"
+management_key: "REPLACE_WITH_YOUR_PLAINTEXT_MANAGEMENT_KEY"

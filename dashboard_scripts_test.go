@@ -79,7 +79,7 @@ func TestNativeLifecycleFailuresAreVisible(t *testing.T) {
 		"function lifecycleRisk(r)",
 		"lifecycleAccounts.filter(r=>lifecycleAuthInvalid(r)&&r.lifecycle.disabled).length",
 		"最近列表已有 ",
-		"请在插件配置中填写 management_url / management_key",
+		"请管理员修改服务器私密配置文件并重启 CPA",
 		"data-lifecycle-action=\"retry_sync\"",
 	}
 	for _, marker := range markers {

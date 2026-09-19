@@ -3,11 +3,12 @@
 自动测试使用 Mock 和 CPA v7.2.145 源码，不需要耗尽额度。
 
 1. 停止 CPA，备份原数据目录（包含 `usage.db` 及存在的 WAL/SHM 文件），只替换动态库。重启后核对 Summary 的 `version=0.1.49` 和 `db_path`；默认应迁移到 `$HOME/.cli-proxy-api/data/codex-token-usage/usage.db`，旧库仍保留。设置过 `CPA_TOKEN_USAGE_DIR` 时应继续使用指定目录。
-2. 配置 `CPA_TOKEN_USAGE_MANAGEMENT_URL`、`CPA_TOKEN_USAGE_MANAGEMENT_KEY`，确认 Dashboard 为 native、管理 API 已配置，原 Usage/Quota/xAI 页面正常；用量、自动禁用归属、人工禁用、恢复时间在升级后保持。
+2. 在服务器准备 `~/.cli-proxy-api/secrets/codex-token-usage-management.yaml`，填写 `management_url`、`management_key`；自定义位置通过 `CPA_TOKEN_USAGE_MANAGEMENT_CONFIG_FILE` 指定绝对路径。按 README 设置文件权限，重启 CPA 后确认 Dashboard 为 native、自动启停已配置，原 Usage/Quota/xAI 页面正常；用量、自动禁用归属、人工禁用、恢复时间在升级后保持。旧插件字段和旧凭据环境变量均不再生效。
 3. 在 CPA 管理页手动禁用一个测试账号，确认插件显示人工停用；重启后不会自动启用。在插件账号表点击“启用 (Enable)”，确认出现明确结果，CPA 文件与运行时均恢复，不需要 Recheck。
 4. 对已有 401 测试账号重新登录，确认同账号凭据更新后自动恢复。若旧版已丢失凭据变化证据，逐账号点击“启用”，确认退出当前 401 待处理列表。启用仅恢复调度，不等于凭据已验证。
-5. 在测试环境使用错误的管理密钥，确认启用失败明确提示 Management 401 和 management_key；修正后重试同步。分别验证账号表和管理弹窗中的按钮，以及过期页面的版本冲突提示。
+5. 在测试环境的私密文件使用错误管理密钥并重启，确认启用失败明确提示 Management 401 和 management_key；修正文件并重启后重试同步。分别验证账号表和管理弹窗中的按钮，以及过期页面的版本冲突提示。编辑文件但不重启、保存普通插件设置时，已加载的凭据和配置状态均不得改变。
 6. 再次停止并启动 CPA，确认使用新库且新增用量未被旧库覆盖。缺失旧库的测试实例应显示“禁用来源未知”，不应自动批量启用。
+7. 测试实例移走私密文件或制造 YAML 错误，重启后确认显示“未配置”或“配置无效”、账号状态写入暂停而统计继续正常。恢复文件但不重启时状态应保持；重启后恢复配置。检查插件配置页面、状态响应和日志中不出现私密密钥、文件原文或私密文件绝对路径；最后清理 CPA 普通配置中的旧字段及旧环境变量。
 
 不要为了验证而消耗真实额度。Quota 到期、401、402、403、429、崩溃窗口和重启恢复已由 Fake Clock/Mock 覆盖。
 

@@ -53,7 +53,7 @@ func (c *authLifecycleController) configure(cfg pluginConfig) {
 	c.lifeMu.Lock()
 	defer c.lifeMu.Unlock()
 	c.opMu.Lock()
-	c.host = newManagementAuthClient(cfg)
+	c.host = newManagementAuthClient(globalManagementConfig.current())
 	c.opMu.Unlock()
 	ctx, cancel := context.WithCancel(context.Background())
 	c.cancel = cancel
@@ -91,13 +91,12 @@ func (c *authLifecycleController) status() map[string]any {
 	c.statusMu.Lock()
 	last := c.lastError
 	c.statusMu.Unlock()
-	cfg := globalAccountProtection.config()
-	client := newManagementAuthClient(cfg)
+	config := globalManagementConfig.current()
 	mode := "native"
 	if !nativeScheduling() {
 		mode = "legacy"
 	}
-	return map[string]any{"scheduling_mode": mode, "management_configured": client.Ready(), "management_config": managementAuthConfigStatus(cfg), "last_error": last, "concurrency_enforced": mode == "legacy" && globalAccountProtection.enabled(), "token_demotion_enforced": mode == "legacy" && globalAccountProtection.enabled(), "reconcile_interval_seconds": 30}
+	return map[string]any{"scheduling_mode": mode, "management_configured": config.ready(), "management_config": config.status(), "last_error": last, "concurrency_enforced": mode == "legacy" && globalAccountProtection.enabled(), "token_demotion_enforced": mode == "legacy" && globalAccountProtection.enabled(), "reconcile_interval_seconds": 30}
 }
 
 type lifecycleExecer interface {

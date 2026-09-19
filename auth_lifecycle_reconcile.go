@@ -314,7 +314,7 @@ func (c *authLifecycleController) transition(ctx context.Context, db *sql.DB, s 
 	}
 	s.PendingOwner = owner
 	if !c.host.Ready() {
-		c.retry(ctx, db, s, "management API is not configured; check management_url and management_key; retrying status sync")
+		c.retry(ctx, db, s, "management API local file configuration is unavailable; update the server private configuration file and restart CPA; retrying status sync")
 		return errors.New(s.SyncError)
 	}
 	current, err := c.host.Read(ctx, s.AuthIndex)

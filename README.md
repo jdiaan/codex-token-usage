@@ -51,6 +51,14 @@ Old external-change conflicts are migrated automatically when same-account crede
 
 ## Configuration
 
+### Breaking change: private management configuration
+
+Background account status writes now require a server-local private file. The ordinary plugin fields `management_url` / `management_key` and the old `CPA_TOKEN_USAGE_MANAGEMENT_URL` / `CPA_TOKEN_USAGE_MANAGEMENT_KEY` environment variables are ignored. An upgrade with only those old settings pauses automatic account enable/disable operations; statistics and native scheduling continue normally.
+
+Before upgrading, prepare the private file and its permissions as described below. Then replace the plugin, restart the CPA process, check the dashboard configuration status and confirm an actual account-control request. Finally, remove the obsolete fields from CPA's ordinary configuration and remove the old environment variables. The plugin never rewrites the CPA configuration or copies old credentials automatically. Administrators should clean up old plaintext configuration backups and rotate the key if exposure is suspected.
+
+This change concerns background account control only. CPA login and dashboard manual operations retain their existing browser authentication; it does not remove CPA management credentials from the browser.
+
 The plugin is configured under:
 
 ```yaml
@@ -61,8 +69,6 @@ plugins:
       enabled: true
       priority: 120
       scheduling_mode: native # native (default) or legacy
-      management_url: http://127.0.0.1:8317
-      management_key: <your plaintext management key>
 
       开启定时额度触发（不建议账号多的情况下开启）: false
       触发间隔分钟: 10
@@ -99,8 +105,6 @@ plugins:
 English config keys are also accepted:
 
 ```yaml
-management_url: http://127.0.0.1:8317
-management_key: <your plaintext management key>
 quota_trigger_enabled: false
 quota_trigger_interval_minutes: 10
 quota_trigger_mode: probe
@@ -138,14 +142,70 @@ Quota trigger defaults to off and is not recommended for large account pools. `p
 
 Token windows and warnings remain available in native mode. Plugin concurrency hard limits and Token soft demotion are **not executed**. Select `legacy` to retain those older scheduling behaviors. xAI behavior is unchanged.
 
-Set the `management_url` and `management_key` plugin fields shown above, or set these environment variables on the CPA process, to enable status writes:
+### Server-private management file
 
-```text
-CPA_TOKEN_USAGE_MANAGEMENT_URL=http://127.0.0.1:8317
-CPA_TOKEN_USAGE_MANAGEMENT_KEY=<your plaintext management key>
+The default file is `$HOME/.cli-proxy-api/secrets/codex-token-usage-management.yaml`, where `$HOME` belongs to the user running CPA. This location is separate from plugin data, installation files and ordinary CPA configuration. Set `CPA_TOKEN_USAGE_MANAGEMENT_CONFIG_FILE` on the CPA process to use another **absolute** path. This environment variable selects a file only; no environment variable supplies the URL or key, and the web/plugin configuration cannot select the path.
+
+Copy [the placeholder example](codex-token-usage-management.example.yaml) into the chosen private location, then edit it locally on the server:
+
+```yaml
+management_url: "http://127.0.0.1:8317"
+management_key: "REPLACE_WITH_YOUR_PLAINTEXT_MANAGEMENT_KEY"
 ```
 
-The URL is the CPA root URL. Environment variables override the corresponding plugin fields. The key must be plaintext; a configuration password hash is not a usable substitute. CPA 7.2.145 does not provide a masked secret field for plugin configuration, so `management_key` is stored visibly in the CPA YAML and should only be used where access to that file and Management UI is trusted. Prefer the environment variable when the config must not contain the key. Missing or invalid configuration leaves statistics and native scheduling working, but the dashboard shows a prominent warning that 401/402/403/429 state writes cannot run. API errors never reactivate the old native candidate filters.
+The URL is the CPA root URL. Use loopback when CPA is on the same host; use HTTPS with valid certificates across machines. HTTP redirects are not followed. The key must be the usable plaintext management key, not its password hash. Both fields must be nonempty YAML strings; quote numeric-looking keys. Duplicate or unknown fields, non-string values, multiple YAML documents and invalid addresses are rejected. The file must be a regular file no larger than 64 KiB.
+
+The file is read once on the first successful plugin initialization in each CPA process. A failed read is also cached. **Restart the CPA process after creating, repairing, rotating or editing the file, or changing its path.** Saving web settings, reconfiguring the plugin and polling the dashboard do not reload it. The plugin never creates or edits this file, and there is no fallback to the old configuration sources.
+
+On Linux/macOS, any permission for other users, or group write/execute permission, is rejected. Recommended deployment: an administrator owns the file, the service account has read-only group access (`0640`), and the service cannot write its parent directory. A file readable only by its owner (`0600`/`0400`) is also accepted, but service ownership provides a weaker write boundary. Keep the file outside served directories, repositories, auth-file directories and ordinary configuration exports/backups. On Windows, configure NTFS ACLs explicitly; this version does **not** automatically validate Windows ACLs. These controls reduce configuration-channel exposure; they do not protect a key from a compromised service process or server administrator.
+
+Example Linux installation, assuming the CPA service belongs to the `cpa` group (substitute your actual service group):
+
+```sh
+sudo install -d -o root -g cpa -m 0750 /etc/cpa/secrets
+sudo install -o root -g cpa -m 0640 codex-token-usage-management.example.yaml /etc/cpa/secrets/codex-token-usage-management.yaml
+sudoedit /etc/cpa/secrets/codex-token-usage-management.yaml
+```
+
+Set the following in the service's environment and restart it:
+
+```text
+CPA_TOKEN_USAGE_MANAGEMENT_CONFIG_FILE=/etc/cpa/secrets/codex-token-usage-management.yaml
+```
+
+Docker Compose fragment for an existing CPA service (the source file must already exist; replace the host path and match the container service UID/GID to the file's read permissions):
+
+```yaml
+services:
+  cpa:
+    environment:
+      CPA_TOKEN_USAGE_MANAGEMENT_CONFIG_FILE: /run/secrets/codex-token-usage-management.yaml
+    volumes:
+      - type: bind
+        source: /etc/cpa/secrets/codex-token-usage-management.yaml
+        target: /run/secrets/codex-token-usage-management.yaml
+        read_only: true
+        bind:
+          create_host_path: false
+```
+
+`127.0.0.1` refers to the container itself; use an appropriate service address if CPA is in a different container. Recreate the container after replacing a bind-mounted file so that it sees the new file, then verify configuration and an actual request.
+
+Windows example from an elevated PowerShell, assuming the service identity is `NT SERVICE\CPA` (replace it with the actual identity). Use a new dedicated directory; review any pre-existing explicit ACL entries if reusing one:
+
+```powershell
+New-Item -ItemType Directory -Force 'C:\ProgramData\CPA\secrets'
+icacls 'C:\ProgramData\CPA\secrets' /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' 'NT SERVICE\CPA:(OI)(CI)RX'
+Copy-Item '.\codex-token-usage-management.example.yaml' 'C:\ProgramData\CPA\secrets\codex-token-usage-management.yaml'
+icacls 'C:\ProgramData\CPA\secrets\codex-token-usage-management.yaml' /inheritance:r /grant:r '*S-1-5-32-544:F' '*S-1-5-18:F' 'NT SERVICE\CPA:R'
+notepad 'C:\ProgramData\CPA\secrets\codex-token-usage-management.yaml'
+```
+
+Set `CPA_TOKEN_USAGE_MANAGEMENT_CONFIG_FILE=C:\ProgramData\CPA\secrets\codex-token-usage-management.yaml` in the service launcher and restart CPA. The service identity needs traversal/read access to the directory and read access to the file; only administrators should be able to replace or edit it.
+
+The dashboard distinguishes missing, invalid and locally configured settings, and separately displays request failures. `auth_controller.management_configured` means the cached configuration is valid; it is **not** a connection/authentication health check. `management_config` exposes only `url_source` / `key_source` (`local_file` or `missing`), `missing_fields`, and `error_code` (empty on success). Error codes are `not_initialized`, `invalid_path`, `file_missing`, `file_unreadable`, `invalid_file`, `unsafe_permissions`, `invalid_yaml`, `unknown_field`, `duplicate_field`, `invalid_type`, `missing_fields`, `invalid_url`, and `invalid_key`. API responses and errors never include the private path, file contents or key. No private-file download/edit endpoint is provided.
+
+Missing or invalid configuration leaves statistics and native scheduling working, but the dashboard warns that 401/402/403/429 state writes cannot run. API errors never reactivate the old native candidate filters. Only the dynamic library is included in release archives; the real private file is never packaged.
 
 The controller supports uniquely identified physical Codex OAuth auth files. It sends only `{name, auth_index, disabled}` to `PATCH /v0/management/auth-files/status`, then verifies both the file and runtime state and checks that credential/custom/routing fields were preserved. HTTP 200 alone is insufficient. SQLite stores fingerprints, intent, state versions and sanitized audit evidence. Existing disabled files without plugin history retain unknown ownership; explicit manual disables remain manual.
 
