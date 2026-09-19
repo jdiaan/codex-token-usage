@@ -343,8 +343,8 @@ func convertImportRecord(record map[string]any, index int) (authImportItem, erro
 	)
 	planType := strings.ToLower(firstNonEmptyString(
 		importString(record, "account.planType", "account.plan_type", "planType", "plan_type", "credentials.plan_type", "providerSpecificData.chatgptPlanType", "providerSpecificData.chatgpt_plan_type"),
-		importString(accessClaims, "https://api.openai.com/auth.chatgpt_plan_type"),
-		importString(idClaims, "https://api.openai.com/auth.chatgpt_plan_type"),
+		planTypeFromJWT(accessToken),
+		planTypeFromJWT(idToken),
 	))
 	expiresAt := importTimestamp(firstNonEmptyString(
 		importString(record, "expires", "expiresAt", "expired", "expires_at", "credentials.expires_at"),

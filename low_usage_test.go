@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -392,6 +394,36 @@ func TestConfiguredAuthFilesCacheInvalidatesOnFileChange(t *testing.T) {
 	third := readConfiguredAuthFiles()
 	if len(third) != 1 || third[0].PlanType != "team" {
 		t.Fatalf("cache did not invalidate: %+v", third)
+	}
+}
+
+func TestConfiguredAuthPlanTypeUsesExplicitValueThenJWTFallback(t *testing.T) {
+	jwt := func(claims map[string]any) string {
+		t.Helper()
+		header, err := json.Marshal(map[string]any{"alg": "none"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		payload, err := json.Marshal(claims)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return base64.RawURLEncoding.EncodeToString(header) + "." + base64.RawURLEncoding.EncodeToString(payload) + ".test"
+	}
+	access := jwt(map[string]any{"https://api.openai.com/auth": map[string]any{"chatgpt_plan_type": "plus"}})
+	idToken := jwt(map[string]any{"https://api.openai.com/auth.chatgpt_plan_type": "team"})
+
+	if got := configuredAuthPlanType(map[string]any{"plan_type": "Pro", "access_token": access}); got != "pro" {
+		t.Fatalf("explicit plan type = %q, want pro", got)
+	}
+	if got := configuredAuthPlanType(map[string]any{"access_token": access}); got != "plus" {
+		t.Fatalf("access token plan type = %q, want plus", got)
+	}
+	if got := configuredAuthPlanType(map[string]any{"id_token": idToken}); got != "team" {
+		t.Fatalf("id token plan type = %q, want team", got)
+	}
+	if got := configuredAuthPlanType(map[string]any{"access_token": "not-a-jwt"}); got != "" {
+		t.Fatalf("unknown plan type = %q, want empty", got)
 	}
 }
 

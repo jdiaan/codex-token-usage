@@ -90,6 +90,20 @@ func TestParseAuthImportNestedFormatsAndRefreshToken(t *testing.T) {
 	}
 }
 
+func TestParseAuthImportReadsPlanTypeFromJWT(t *testing.T) {
+	token := importTestJWT(map[string]any{
+		"https://api.openai.com/auth": map[string]any{"chatgpt_plan_type": "plus"},
+	})
+	raw, _ := json.Marshal(map[string]any{"email": "jwt-plan@example.com", "access_token": token})
+	items, errors := parseAuthImportText(string(raw))
+	if len(errors) != 0 || len(items) != 1 {
+		t.Fatalf("items=%+v errors=%+v", items, errors)
+	}
+	if items[0].PlanType != "plus" {
+		t.Fatalf("JWT plan type = %q, want plus", items[0].PlanType)
+	}
+}
+
 func TestParseAuthImportPrettyJSONFilesWithHeaders(t *testing.T) {
 	token := importTestJWT(map[string]any{"exp": float64(time.Now().Add(time.Hour).Unix())})
 	document := map[string]any{"email": "pretty@example.com", "access_token": token, "account_id": "account-pretty"}

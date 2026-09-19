@@ -2389,13 +2389,10 @@ const i18nEn={
   '未发现一号多卖迹象':'No shared-account signal found',
   '暂无账号':'No accounts',
   '暂无额度快照':'No quota snapshots',
-  'Free 仅单窗口':'Free plan has one window',
   '不适用':'Not applicable',
-  '尚未探测，待刷新':'Not probed; refresh pending',
   '待刷新':'Refresh pending',
   '暂无百分比':'No percentage reported',
   '单窗口待刷新':'Single window; refresh pending',
-  '无本地 Token':'No local tokens',
   '次':'times'
 };
 function tr(text){
@@ -2919,15 +2916,19 @@ function accountName(r){return r.email||r.source||r.name||r.auth_id||r.auth_file
 function maxQuota(r){if(quotaPlanKind(r)==='free'){const source=quotaDisplayPrefix(r);return Number(r[source+'_used_percent']||0)}return Math.max(r.primary_used_percent||0,r.secondary_used_percent||0)}
 function triggerRisk(r){return r.quota_trigger_status&&r.quota_trigger_status!=='success'&&r.quota_trigger_status!=='skipped'}
 function triggerSortScore(r){return triggerRisk(r)?3:(r.quota_trigger_status==='skipped'?2:(r.quota_trigger_status==='success'?1:0))}
-function lifecycleStatus(s){
+function lifecycleStatusLabel(s){
   const syncing=Boolean(s.pending_action||s.sync_error);
   const labels={HEALTHY:s.control_since_ns?(syncing||s.disabled?'启用待确认':'已启用'):'健康',AUTH_INVALID:'401 · 认证失效',BILLING_BLOCKED:'402 · 账号／工作区不可用',QUOTA_COOLDOWN:'429 · 额度限制',RATE_LIMITED:'429 · 请求限流',PERMISSION_BLOCKED:'403 · 账号权限受限',MANUAL_DISABLED:'人工停用',DISABLED_UNKNOWN:'禁用来源未知'};
   const label=(syncing?(s.sync_error?'同步失败 · ':'正在同步 · '):s.disabled?'已禁用 · ':'')+(labels[s.state]||s.state);
+  return '<span class="status-pill '+(s.state==='HEALTHY'&&!s.disabled&&!syncing?'ok':'warn')+'">'+esc(label)+'</span>';
+}
+function lifecycleStatus(s){
+  const syncing=Boolean(s.pending_action||s.sync_error);
   const recovery=['AUTH_INVALID','BILLING_BLOCKED','PERMISSION_BLOCKED'].includes(s.state)?'重新登录后自动恢复':['QUOTA_COOLDOWN','RATE_LIMITED'].includes(s.state)?(s.recover_at?'恢复时间：'+new Date(s.recover_at*1000).toLocaleString():'默认冷却 1 分钟'):'';
   const detail=[recovery,s.disable_reason==='disabled_origin_unknown'?'缺少原禁用记录；确认后可手动启用':s.disable_reason==='rate_limit_backoff'?'上游未返回有效时间，使用默认冷却':s.disable_reason||'',s.sync_error||''].filter(Boolean).join(' · ');
   const retry=syncing?'<button type="button" class="btn" data-lifecycle-action="retry_sync" data-auth-index="'+esc(s.auth_index)+'" data-version="'+Number(s.version)+'">重试同步</button>':'';
   const enable=s.disabled||s.state!=='HEALTHY'||s.paused||syncing?'<button type="button" class="btn" data-lifecycle-action="enable" data-auth-index="'+esc(s.auth_index)+'" data-version="'+Number(s.version)+'">启用 (Enable)</button>':'';
-  return '<span class="status-pill '+(s.state==='HEALTHY'&&!s.disabled&&!syncing?'ok':'warn')+'">'+esc(label)+'</span>'+(detail?'<details><summary>详情</summary><div>'+esc(detail)+'</div></details>':'')+retry+enable;
+  return lifecycleStatusLabel(s)+(detail?'<details><summary>详情</summary><div>'+esc(detail)+'</div></details>':'')+retry+enable;
 }
 function renderNativeLifecycleModal(prefix,page,pageNumber,title){
   if(!isNativeLifecycle())return false;
@@ -2970,7 +2971,7 @@ document.addEventListener('click',async event=>{
   }
 });
 function accountStatus(r){
-  if(r.lifecycle&&((lastData||{}).auth_controller||{}).scheduling_mode==='native')return lifecycleStatus(r.lifecycle);
+  if(r.lifecycle&&((lastData||{}).auth_controller||{}).scheduling_mode==='native')return lifecycleStatusLabel(r.lifecycle);
   const ban=findBan(r);
   if(r.xai_state)return '<span class="status-pill danger" title="'+esc(r.xai_state_reason||xaiStateLabel(r.xai_state))+'">'+esc(xaiStateLabel(r.xai_state))+'</span>';
   if(r.invalid_auth){const forbidden=Number(r.invalid_auth_status_code)===403;return '<span class="status-pill danger" title="'+esc(r.invalid_auth_reason||(forbidden?'403 forbidden':'401 unauthorized'))+'">'+(forbidden?'403 拒绝':'401 失效')+'</span>'}
@@ -3045,18 +3046,18 @@ function quotaWindowLabel(r,prefix){prefix=prefix||'secondary';const presence=qu
 function quotaWindowLabelFromSeconds(value){const seconds=Number(value||0);if(!Number.isFinite(seconds)||seconds<=0)return '';if(seconds>=4*3600&&seconds<=6*3600)return '5h';if(seconds>=6*86400&&seconds<=10*86400)return '7d';if(seconds>=25*86400&&seconds<=35*86400)return '月';if(seconds%86400===0)return (seconds/86400)+'d';if(seconds%3600===0)return (seconds/3600)+'h';return Math.round(seconds)+'s'}
 function quotaWindowExists(r,prefix){return quotaWindowPresence(r,prefix)!=='absent'&&(quotaWindowPresence(r,prefix)==='present'||quotaWindowHasData(r,prefix))}
 function quotaWindowHasData(r,prefix){return quotaWindowPresence(r,prefix)!=='absent'&&((r&&r[prefix+'_used_percent']!=null)||Number(r&&r[prefix+'_reset_at']||0)>0||Number(r&&r[prefix+'_window_tokens']||0)>0)}
-function quotaDisplayPrefix(r){if(quotaPlanKind(r)!=='free')return 'primary';if(quotaWindowHasData(r,'primary'))return 'primary';const secondaryLegacy=quotaWindowPresence(r,'secondary')==='present'||Number(r&&r.secondary_used_percent||0)>0||Number(r&&r.secondary_reset_at||0)>0||Number(r&&r.secondary_window_tokens||0)>0;if(secondaryLegacy)return 'secondary';return 'primary'}
-function quotaWindowMissingCell(r,prefix){const presence=quotaWindowPresence(r,prefix);if(presence==='absent')return '<span class="metric-stack"><b class="muted">无窗口</b><span>最近探测未上报</span></span>';if(!quotaWindowHasData(r,prefix))return '<span class="metric-stack"><b class="muted">-</b><span>尚未探测，待刷新</span></span>';return ''}
+function quotaDisplayPrefix(r){if(quotaPlanKind(r)!=='free')return 'primary';if(quotaWindowHasData(r,'primary'))return 'primary';if(quotaWindowHasData(r,'secondary'))return 'secondary';return 'primary'}
+function quotaWindowMissingCell(r,prefix){if(!quotaWindowHasData(r,prefix))return '<span class="metric-stack"><b class="muted">待刷新</b></span>';return ''}
 function quotaWindowCell(r,prefix){const missing=quotaWindowMissingCell(r,prefix);if(missing)return missing;const label=quotaWindowLabel(r,prefix)||'窗口';if(r[prefix+'_used_percent']==null)return '<span class="metric-stack"><b class="muted">待刷新</b><span>'+esc(label)+' 已知，暂无百分比</span></span>';return quotaCompact(label,r[prefix+'_used_percent'],r[prefix+'_window_tokens'],r[prefix+'_reset_at'])}
-function quotaWindowCellForDisplay(r,prefix){if(quotaPlanKind(r)==='free'){const source=quotaDisplayPrefix(r);return prefix==='primary'?quotaWindowCell(r,source):'<span class="metric-stack"><b class="muted">Free 仅单窗口</b><span>不适用</span></span>'}return quotaWindowCell(r,prefix)}
+function quotaWindowCellForDisplay(r,prefix){if(quotaPlanKind(r)==='free'){const source=quotaDisplayPrefix(r);return prefix==='primary'?quotaWindowCell(r,source):''}return quotaWindowCell(r,prefix)}
 function quotaEstimateCell(r){
   const total=Number(r.secondary_quota_total_estimate||0), remaining=Number(r.secondary_quota_remaining_estimate||0);
-  if(total<=0)return '<span class="metric-stack"><b class="muted">-</b><span>'+(!quotaWindowHasData(r,'secondary')?'尚未探测':'暂无 Token 容量')+'</span></span>';
+  if(total<=0)return '';
   const usedPct=ratio(total-remaining,total);
   const tone=usedPct>=90?'danger':usedPct>=70?'warn':'ok';
   return '<span class="metric-stack" title="按当前 '+(quotaWindowLabel(r,'secondary')||'动态')+' 窗口已用 Token、额度百分比和最近 quota trigger 快照实时估算"><b class="'+tone+'">余 '+quotaValue(remaining,true)+'</b><span>总 '+quotaValue(total)+' · 已用 '+pct(usedPct)+'</span></span>';
 }
-function quotaWindow2Cell(r){if(quotaPlanKind(r)==='free')return '<div class="metric-stack"><span class="muted">Free 仅单窗口</span><span>不适用</span></div>';const missing=quotaWindowMissingCell(r,'secondary');const label=quotaWindowLabel(r,'secondary')||'窗口';const cell=missing|| (r.secondary_used_percent==null?'<span class="metric-stack"><b class="muted">待刷新</b><span>'+esc(label)+' 已知，暂无百分比</span></span>':quotaCompact(label,r.secondary_used_percent,r.secondary_window_tokens,r.secondary_reset_at));return '<div class="metric-stack">'+cell+quotaEstimateCell(r)+'</div>'}
+function quotaWindow2Cell(r){if(quotaPlanKind(r)==='free')return '';const missing=quotaWindowMissingCell(r,'secondary');const label=quotaWindowLabel(r,'secondary')||'窗口';const cell=missing|| (r.secondary_used_percent==null?'<span class="metric-stack"><b class="muted">待刷新</b><span>'+esc(label)+' 已知，暂无百分比</span></span>':quotaCompact(label,r.secondary_used_percent,r.secondary_window_tokens,r.secondary_reset_at));return '<div class="metric-stack">'+cell+quotaEstimateCell(r)+'</div>'}
 function quotaSummaryText(r){const parts=[];if(quotaPlanKind(r)==='free'){const source=quotaDisplayPrefix(r);if(quotaWindowHasData(r,source))parts.push((quotaWindowLabel(r,source)||'窗口 1')+' '+pct(r[source+'_used_percent']));else parts.push('单窗口待刷新');return parts.join(' · ')}if(quotaWindowHasData(r,'primary'))parts.push((quotaWindowLabel(r,'primary')||'窗口 1')+' '+pct(r.primary_used_percent));else if(quotaWindowPresence(r,'primary')==='absent')parts.push('窗口 1 无');if(quotaWindowHasData(r,'secondary'))parts.push((quotaWindowLabel(r,'secondary')||'窗口 2')+' '+pct(r.secondary_used_percent));else if(quotaWindowPresence(r,'secondary')==='absent')parts.push('窗口 2 无');return parts.length?parts.join(' · '):'暂无额度快照'}
 function tokenCostStack(r,total){const cost=r.cost_available||Number(r.cost_usd||0)>0?money(r.cost_usd):'缺价格'; const cls=r.cost_available?'cost-line':'cost-weak'; return '<span class="metric-stack"><b>'+compact(r.total_tokens)+'</b><span>占 '+pct(ratio(r.total_tokens,total))+'</span><span class="'+cls+'">'+esc(cost)+'</span></span>'}
 function renderProviders(rows,total){
@@ -3121,7 +3122,7 @@ function renderInsights(data){
   document.getElementById('insights').innerHTML=items.map(r=>'<div class="insight '+r[3]+'"><span>'+r[0]+'</span><b title="'+esc(r[1])+'">'+esc(r[1])+'</b><span>'+r[2]+'</span></div>').join('');
 }
 function meterCell(value,width,color){width=Math.max(0,Math.min(100,Number(width||0)));return '<div class="cell-meter"><b>'+esc(value)+'</b><div class="bar"><span style="--color:'+color+';width:'+width.toFixed(1)+'%"></span></div></div>'}
-function quotaText(percent,tokens){const p=pct(percent); const tok=Number(tokens||0)>0?compact(tokens)+' tok':'无本地 Token'; return p+' · '+tok}
+function quotaText(percent,tokens){return pct(percent)}
 function quotaCompact(label,value,tokens,resetAt){const width=value==null?0:Math.min(100,Number(value));const title=quotaText(value,tokens);return '<div class="quota-compact" title="'+esc(resetText(resetAt))+'"><span>'+label+'</span><div class="bar"><span style="--color:'+colorForPct(width)+';width:'+width.toFixed(1)+'%"></span></div><b class="'+health(width)+'">'+esc(title)+'</b></div>'}
 function sortAutobansByRemaining(rows){
   return [...(rows||[])].sort((a,b)=>autobanRemainingSortValue(a)-autobanRemainingSortValue(b)||Number(a.reset_at||0)-Number(b.reset_at||0));
@@ -3142,7 +3143,7 @@ function renderAutobans(rows){
   document.getElementById('autoban-next').disabled=autobanPage>=pages;
   const heads=document.getElementById('autobans').closest('table').querySelectorAll('thead th'); if(heads[4])heads[4].textContent=isXAIPool()?'检测时间':'封禁时间'; if(heads[5])heads[5].textContent=isXAIPool()?'恢复时间':'解禁时间'; if(heads[7])heads[7].textContent=isXAIPool()?'HTTP':'窗口 1'; if(heads[8])heads[8].textContent=isXAIPool()?'类型':'窗口 2';
   document.getElementById('autobans').innerHTML=pageRows.map(r=>'<tr>'+
-    td(esc(r.source||r.auth_id||'-'))+td(esc(r.auth_index||'-'))+td(esc(r.window||'-'))+td(r.lifecycle?lifecycleStatus(r.lifecycle):esc(r.reason||'-'),r.lifecycle?'lifecycle-state-cell':'')+
+    td(esc(r.source||r.auth_id||'-'))+td(esc(r.auth_index||'-'))+td(esc(r.window||'-'))+td(r.lifecycle?lifecycleStatusLabel(r.lifecycle):esc(r.reason||'-'),r.lifecycle?'lifecycle-state-cell':'')+
     td(esc(r.banned_at_text||'-'))+td(esc(isXAIPool()?r.reset_at_text:autobanResetText(r)))+td(esc(isXAIPool()?(Number(r.seconds_remaining)>=0?duration(r.seconds_remaining):'需处理'):autobanRemainingText(r)),'num')+
     td(isXAIPool()?fmt(r.last_status_code||0):pct(r.primary_used_percent),'num')+td(isXAIPool()?esc(xaiStateLabel(r.state)):pct(r.secondary_used_percent),'num')+'</tr>').join('') || '<tr><td colspan="9" class="muted">'+(isXAIPool()?'当前没有 xAI 异常账号':'当前没有被自动禁用的 Codex 账号')+'</td></tr>';
 }

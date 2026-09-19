@@ -1792,6 +1792,7 @@ func readConfiguredAuthFiles() []configuredAccount {
 		if strings.EqualFold(authType, "xai") {
 			xaiTier = classifyXAITierDocument(doc)
 		}
+		planType := configuredAuthPlanType(doc)
 		out = append(out, configuredAccount{
 			AuthIndex:        authFile,
 			AuthID:           email,
@@ -1805,7 +1806,7 @@ func readConfiguredAuthFiles() []configuredAccount {
 			ProviderExplicit: explicitCodexHostProvider(rawProvider) || (!isCodexAuthProvider(authType) && strings.TrimSpace(rawProvider) != ""),
 			Disabled:         boolFromAny(doc["disabled"]),
 			Expired:          boolFromAny(doc["expired"]),
-			PlanType:         firstNonEmptyString(stringFromAny(doc["plan_type"]), stringFromAny(doc["plan"])),
+			PlanType:         planType,
 			XAITier:          xaiTier.Tier,
 			XAITierSource:    xaiTier.Source,
 			XAITierDetail:    xaiTier.Detail,
@@ -1828,6 +1829,34 @@ func readConfiguredAuthFiles() []configuredAccount {
 	configuredAuthFilesCache.accounts = cloneConfiguredAccounts(out)
 	configuredAuthFilesCache.mu.Unlock()
 	return cloneConfiguredAccounts(out)
+}
+
+func configuredAuthPlanType(doc map[string]any) string {
+	explicit := firstNonEmptyString(stringFromAny(doc["plan_type"]), stringFromAny(doc["plan"]))
+	if explicit != "" {
+		return strings.ToLower(explicit)
+	}
+	accessToken := firstNonEmptyString(stringFromAny(doc["access_token"]), stringFromAny(doc["accessToken"]), stringFromAny(doc["token"]))
+	idToken := firstNonEmptyString(stringFromAny(doc["id_token"]), stringFromAny(doc["idToken"]))
+	return strings.ToLower(firstNonEmptyString(planTypeFromJWT(accessToken), planTypeFromJWT(idToken)))
+}
+
+func planTypeFromJWT(token string) string {
+	claims := parseImportJWTPayload(token)
+	if len(claims) == 0 {
+		return ""
+	}
+	if plan := firstNonEmptyString(
+		stringFromAny(claims["https://api.openai.com/auth.chatgpt_plan_type"]),
+		stringFromAny(claims["chatgpt_plan_type"]),
+		stringFromAny(claims["plan_type"]),
+	); plan != "" {
+		return plan
+	}
+	if auth, ok := claims["https://api.openai.com/auth"].(map[string]any); ok {
+		return firstNonEmptyString(stringFromAny(auth["chatgpt_plan_type"]), stringFromAny(auth["plan_type"]))
+	}
+	return ""
 }
 
 func configuredAuthDirectorySnapshot(authDir string) ([]os.DirEntry, string, error) {

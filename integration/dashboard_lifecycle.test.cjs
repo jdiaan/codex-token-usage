@@ -20,8 +20,13 @@ function dashboard(rows) {
     td: (value, cls) => '<td class="' + (cls || '') + '">' + value + '</td>',
     pct: value => value == null ? '-' : value + '%',
     fmt: String,
+    compact: String,
+    ratio: (a, b) => b ? a / b * 100 : 0,
+    resetText: () => '-',
+    colorForPct: () => '#000',
+    health: () => 'ok',
   });
-  for (const name of ['isXAIPool', 'isNativeLifecycle', 'nativeLifecycleRows', 'lifecycleCurrentState', 'lifecycleAuthInvalid', 'lifecycleWorkspaceBlocked', 'lifecycleRateLimited', 'isInvalidAuthBan', 'isWorkspaceDeactivatedBan', 'is429Autoban', 'isPermanentAuthBan', 'duration', 'autobanResetText', 'autobanRemainingText', 'autobanRemainingSortValue', 'sortAutobansByRemaining', 'autobanReleaseRows', 'invalidAuthRows', 'workspaceDeactivatedRows', 'lifecycleStatus', 'accountName', 'renderNativeLifecycleModal', 'renderAutobans']) {
+  for (const name of ['isXAIPool', 'isNativeLifecycle', 'nativeLifecycleRows', 'lifecycleCurrentState', 'lifecycleAuthInvalid', 'lifecycleWorkspaceBlocked', 'lifecycleRateLimited', 'isInvalidAuthBan', 'isWorkspaceDeactivatedBan', 'is429Autoban', 'isPermanentAuthBan', 'duration', 'autobanResetText', 'autobanRemainingText', 'autobanRemainingSortValue', 'sortAutobansByRemaining', 'autobanReleaseRows', 'invalidAuthRows', 'workspaceDeactivatedRows', 'lifecycleStatusLabel', 'lifecycleStatus', 'accountName', 'renderNativeLifecycleModal', 'renderAutobans', 'firstText', 'quotaPlanKind', 'quotaWindowPresence', 'quotaWindowLabelFromSeconds', 'quotaWindowLabel', 'quotaWindowHasData', 'quotaDisplayPrefix', 'quotaWindowMissingCell', 'quotaText', 'quotaCompact', 'quotaWindowCell', 'quotaWindowCellForDisplay', 'quotaEstimateCell', 'quotaWindow2Cell']) {
     const start = source.indexOf('function ' + name + '(');
     assert.ok(start >= 0, name + ' exists');
     let extracted = '';
@@ -111,6 +116,34 @@ test('blocked and unknown accounts offer Enable without the former recheck requi
   assert.doesNotMatch(pending,/已启用/);
   context.account.lifecycle.pending_action='';
   assert.match(run('lifecycleStatus(account.lifecycle)'),/已启用/);
+});
+
+test('account status labels omit details and actions while management status retains them', () => {
+  const {context,run}=dashboard([]);
+  context.account=row('a','AUTH_INVALID',{disable_reason:'expired credential'});
+  const label=run('lifecycleStatusLabel(account.lifecycle)');
+  assert.match(label,/401 · 认证失效/);
+  assert.doesNotMatch(label,/<details|<button|data-lifecycle-action/);
+  const management=run('lifecycleStatus(account.lifecycle)');
+  assert.match(management,/<details/);
+  assert.match(management,/data-lifecycle-action="enable"/);
+});
+
+test('quota cells separate paid windows and leave the free secondary cell empty', () => {
+  const {context,run}=dashboard([]);
+  context.account={plan_type:'plus',primary_quota_window_presence:'present',primary_quota_window:'5h',primary_used_percent:0,primary_window_tokens:123};
+  const zero=run("quotaWindowCellForDisplay(account,'primary')");
+  assert.match(zero,/5h/);
+  assert.match(zero,/0%/);
+  assert.doesNotMatch(zero,/123|Token|tok/);
+  context.account={plan_type:'plus',primary_quota_window_presence:'present',primary_quota_window:'5h'};
+  assert.match(run("quotaWindowCellForDisplay(account,'primary')"),/待刷新/);
+  context.account={plan_type:'free',primary_quota_window_presence:'present',primary_quota_window:'5h',primary_used_percent:25};
+  assert.match(run("quotaWindowCellForDisplay(account,'primary')"),/25%/);
+  assert.equal(run('quotaWindow2Cell(account)'),'');
+  context.account={plan_type:'free',secondary_quota_window:'7d',secondary_used_percent:0};
+  assert.match(run("quotaWindowCellForDisplay(account,'primary')"),/0%/);
+  assert.equal(run('quotaWindow2Cell(account)'),'');
 });
 
 test('Enable reports confirmed success, partial sync, management failure and stale version', async () => {
