@@ -1,165 +1,83 @@
 # CPA Token Usage
 
-CPA Token Usage is a CLIProxyAPI plugin for Codex account operation dashboards and AI provider usage analytics.
+CLIProxyAPI（CPA）的用量统计与账号管理插件，提供 Codex、xAI 账号看板及 AI 服务商用量分析。
 
-Current version: `0.1.49`
+当前版本：`0.1.49`。原生调度接口测试基于 CPA `7.2.145`。
 
-## Features
+## 主要功能
 
-- Codex account pool dashboard with pagination, saved sorting, quota bars, 7d/month quota estimates, cost estimates, and light/dark compatible UI.
-- AI provider pages grouped by CPA endpoint name, separated from Codex OAuth account-pool pricing and quota calculations.
-- Native Codex scheduling delegates to CPA; confirmed quota exhaustion is isolated through the CPA Management status API and recovered at reliable reset times.
-- Automatic 401/402/account-level 403 isolation, restored after same-account credentials update; timed 429 recovery with a 60-second fallback.
-- Suspicious external quota consumption detection for shared or resold accounts.
-- Optional periodic Codex quota trigger that sends a tiny real Codex request to refresh/start server-reported quota windows.
-- Authenticated Management UI/API workflow for previewing and activating fresh Codex quota windows exactly once per observed account cycle.
-- Runtime diagnostics and local alerts are exposed in summary JSON for troubleshooting and plugin-store validation.
-- CSV / JSON export support; the dashboard exposes account export buttons and the backend can export accounts, providers, models, and recent requests.
-- Built-in price fallbacks plus automatic LiteLLM model price updates.
-- Manual Chinese / English language switch saved in the browser.
-- xAI account-pool dashboard for xAI OAuth JSON credentials, with xAI-specific 401/403/429 and free-usage-exhausted states.
-- xAI accounts are read through CPA `host.auth.list/get/get_runtime` when available, with filesystem fallback for older CPA versions; account rows classify Free, Super, and Heavy tiers from auth metadata.
-- Non-standard Codex credential import converts ChatGPT Session, sub2api/account-product, 9router, Codex auth.json, AxonHub, Codex-Manager, and generic nested token JSON through CPA `host.auth.save`, with preview, conflict detection, and no-refresh-token warnings.
-- In legacy mode, optional Codex/xAI Session affinity for scheduler requests: the same Session can stay on the same account; without a usable binding, filtered candidates follow CPA `routing.strategy` (`fill-first` or `round-robin`).
-- Legacy-only account-protection scheduling for Codex OAuth accounts: per-plan concurrency hard limits and rolling-window Token soft demotion.
-- Legacy account-protection and error filtering preserve CPA `fill-first` or `round-robin` selection within the highest-priority candidate tier.
-- Configured accounts with no real requests display zero quota even when background health probes have captured quota headers.
-- Provider-aware cache read/write normalization keeps OpenAI-compatible and Anthropic-style usage, cache hit rates, and cost estimates consistent.
-- Summary cache keys are canonicalized and bounded in memory and SQLite for long-running installations.
+- 按账号、服务商和模型统计请求数、Token、缓存命中率及估算费用，支持 CSV / JSON 导出。
+- 展示 Codex 额度窗口、恢复时间、账号异常及疑似外部额度消耗。
+- 自动禁用异常 Codex 账号，并在凭据更新或冷却结束后恢复。
+- 支持定时额度触发、一次性启动额度窗口和非标准 Codex 凭据导入。
+- 提供 xAI 账号看板、模型价格自动更新、中英文界面及深浅色主题。
 
-## Install Manually
+## 安装与启用
 
-Download the matching release zip, then place the dynamic library under the CLIProxyAPI plugin directory:
+1. 下载与系统、架构对应的发布压缩包。
+2. 停止 CPA，将动态库放入对应插件目录。例如：
+
+   ```text
+   plugins/linux/amd64/codex-token-usage.so
+   plugins/windows/amd64/codex-token-usage.dll
+   plugins/darwin/arm64/codex-token-usage.dylib
+   ```
+
+3. 在 CPA 配置中启用插件：
+
+   ```yaml
+   plugins:
+     enabled: true
+     configs:
+       codex-token-usage:
+         enabled: true
+         priority: 120
+         scheduling_mode: native
+   ```
+
+4. 如需自动启停账号，按下文配置服务器私密文件。
+5. 启动 CPA，在管理页面打开 Token Usage，确认插件版本、数据目录和账号控制状态。
+
+## 账号控制的私密配置
+
+**后台账号控制只从服务器本地文件读取管理地址和密钥。** 普通插件配置中的 `management_url`、`management_key`，以及旧环境变量 `CPA_TOKEN_USAGE_MANAGEMENT_URL`、`CPA_TOKEN_USAGE_MANAGEMENT_KEY` 均已停用。
+
+未配置或配置无效时，自动启停暂停，统计与原生调度继续工作。此改动只涉及后台凭据；CPA 登录和网页手动操作仍沿用原有认证方式。
+
+### 文件位置与内容
+
+默认位置如下，`$HOME` 指运行 CPA 的用户主目录：
 
 ```text
-plugins/linux/amd64/codex-token-usage.so
-plugins/windows/amd64/codex-token-usage.dll
-plugins/darwin/arm64/codex-token-usage.dylib
+$HOME/.cli-proxy-api/secrets/codex-token-usage-management.yaml
 ```
 
-Restart CLIProxyAPI after replacing the file.
+也可在 CPA 进程环境中指定其他**绝对路径**：
 
-### Upgrading to 0.1.49
-
-The default persistent directory is now `$HOME/.cli-proxy-api/data/codex-token-usage`, outside the plugin installation directory. On first use, the plugin snapshots the old `$HOME/.cli-proxy-api/plugins/codex-token-usage/usage.db`, including committed WAL data, checks its integrity, and copies the price cache before publishing the new database. The old files are retained. An existing destination database is authoritative and is never overwritten or merged. Migration errors stop database initialization instead of silently starting with an empty database. The filesystem must support hard links for atomic publication (for example ext4 or NTFS).
-
-`CPA_TOKEN_USAGE_DIR` remains authoritative: explicitly configured directories are not relocated. Set it to an absolute persistent path if the CPA service user or container changes; replacing the binary cannot preserve a home directory or volume that is itself deleted. `CPA_MODEL_PRICE_FILE` still overrides the price cache location.
-
-Before replacing the library, stop CPA and back up `usage.db` together with any `usage.db-wal` and `usage.db-shm` files. Restart CPA, then check Summary's `version` and `db_path` to confirm the loaded build and data location. Preserve the new data directory on future upgrades. For rollback, stop CPA and point `CPA_TOKEN_USAGE_DIR` at the active data directory rather than resuming the stale copy in the old directory.
-
-Old external-change conflicts are migrated automatically when same-account credential evidence is available. The oldest releases sometimes overwrote the only old fingerprint; when neither the saved state nor failure evidence can establish a credential change, use **启用 (Enable)** for that account after signing in again. Do not clear the database to recover accounts. If the old database is already missing, disabled accounts display **禁用来源未知** (`DISABLED_UNKNOWN`) and remain disabled until explicitly enabled.
-
-## Configuration
-
-### Breaking change: private management configuration
-
-Background account status writes now require a server-local private file. The ordinary plugin fields `management_url` / `management_key` and the old `CPA_TOKEN_USAGE_MANAGEMENT_URL` / `CPA_TOKEN_USAGE_MANAGEMENT_KEY` environment variables are ignored. An upgrade with only those old settings pauses automatic account enable/disable operations; statistics and native scheduling continue normally.
-
-Before upgrading, prepare the private file and its permissions as described below. Then replace the plugin, restart the CPA process, check the dashboard configuration status and confirm an actual account-control request. Finally, remove the obsolete fields from CPA's ordinary configuration and remove the old environment variables. The plugin never rewrites the CPA configuration or copies old credentials automatically. Administrators should clean up old plaintext configuration backups and rotate the key if exposure is suspected.
-
-This change concerns background account control only. CPA login and dashboard manual operations retain their existing browser authentication; it does not remove CPA management credentials from the browser.
-
-The plugin is configured under:
-
-```yaml
-plugins:
-  enabled: true
-  configs:
-    codex-token-usage:
-      enabled: true
-      priority: 120
-      scheduling_mode: native # native (default) or legacy
-
-      开启定时额度触发（不建议账号多的情况下开启）: false
-      触发间隔分钟: 10
-      触发模式: probe
-      最大并发账号数: 1
-      单账号超时秒数: 20
-      单账号最小冷却分钟: 10
-
-      同一个Session优先固定到同一个账号: true
-      自动更新模型价格表: true
-      模型价格更新间隔小时: 6
-      模型价格表地址: https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json
-      模型价格更新超时秒数: 20
-
-      用量保留天数: 90
-      额度触发记录保留天数: 30
-      请求明细保留天数: 30
-
-      开启账号保护调度（可能会影响缓存）: false
-      Free 并发上限: 2
-      Plus 并发上限: 5
-      K12 并发上限: 5
-      Team 并发上限: 5
-      Pro 并发上限: 10
-      Free 5 分钟 Token 上限: 2000000
-      Plus 5 分钟 Token 上限: 8000000
-      K12 5 分钟 Token 上限: 8000000
-      Team 5 分钟 Token 上限: 8000000
-      Pro 5 分钟 Token 上限: 12000000
-      账号保护 Token 窗口秒数: 300
-      账号保护预约超时秒数: 900
+```text
+CPA_TOKEN_USAGE_MANAGEMENT_CONFIG_FILE=/etc/cpa/secrets/codex-token-usage-management.yaml
 ```
 
-English config keys are also accepted:
-
-```yaml
-quota_trigger_enabled: false
-quota_trigger_interval_minutes: 10
-quota_trigger_mode: probe
-quota_trigger_max_concurrency: 1
-quota_trigger_timeout_seconds: 20
-quota_trigger_min_account_cooldown_minutes: 10
-scheduler_session_affinity_enabled: true
-model_price_auto_update_enabled: true
-model_price_update_interval_hours: 6
-model_price_update_url: https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json
-model_price_update_timeout_seconds: 20
-usage_retention_days: 90
-quota_trigger_retention_days: 30
-request_detail_retention_days: 30
-account_protection_enabled: false
-account_protection_free_concurrency: 2
-account_protection_plus_concurrency: 5
-account_protection_k12_concurrency: 5
-account_protection_team_concurrency: 5
-account_protection_pro_concurrency: 10
-account_protection_free_token_limit: 2000000
-account_protection_plus_token_limit: 8000000
-account_protection_k12_token_limit: 8000000
-account_protection_team_token_limit: 8000000
-account_protection_pro_token_limit: 12000000
-account_protection_token_window_seconds: 300
-account_protection_reservation_ttl_seconds: 900
-```
-
-Quota trigger defaults to off and is not recommended for large account pools. `probe` sends a real minimal Codex model request and can consume tokens. In native mode its failures use the same classifier as normal Usage: explicit 401, 402, account/workspace 403 and 429 request auth isolation; unknown/model 403 and transient failures remain with CPA cooldown/retry. Successful responses reporting an exhausted quota window also request isolation. A terminal `refresh_token_invalidated` exposed on an exact CPA runtime auth is also isolated even when refresh failed before CPA emitted a Usage event. Success does not automatically clear isolation. Disabled accounts are checked through the state controller without temporarily enabling them. Legacy retains its existing probe, auto-ban and successful-probe recovery behavior. The old Chinese trigger key and `quota` mode remain accepted.
-
-## Native scheduling and account state
-
-`scheduling_mode` defaults to `native`; invalid values reject configuration. Native returns control to CPA before old Codex filters, reservations or selectors run. Configure Priority, Weight, fallback, excluded models and Codex Session Affinity in CPA. The plugin does not rewrite CPA routing configuration. The old Session Affinity key continues to apply to legacy Codex and existing xAI behavior.
-
-Token windows and warnings remain available in native mode. Plugin concurrency hard limits and Token soft demotion are **not executed**. Select `legacy` to retain those older scheduling behaviors. xAI behavior is unchanged.
-
-### Server-private management file
-
-The default file is `$HOME/.cli-proxy-api/secrets/codex-token-usage-management.yaml`, where `$HOME` belongs to the user running CPA. This location is separate from plugin data, installation files and ordinary CPA configuration. Set `CPA_TOKEN_USAGE_MANAGEMENT_CONFIG_FILE` on the CPA process to use another **absolute** path. This environment variable selects a file only; no environment variable supplies the URL or key, and the web/plugin configuration cannot select the path.
-
-Copy [the placeholder example](codex-token-usage-management.example.yaml) into the chosen private location, then edit it locally on the server:
+参考[配置示例](codex-token-usage-management.example.yaml)，在服务器上创建文件：
 
 ```yaml
 management_url: "http://127.0.0.1:8317"
-management_key: "REPLACE_WITH_YOUR_PLAINTEXT_MANAGEMENT_KEY"
+management_key: "替换为实际管理密钥"
 ```
 
-The URL is the CPA root URL. Use loopback when CPA is on the same host; use HTTPS with valid certificates across machines. HTTP redirects are not followed. The key must be the usable plaintext management key, not its password hash. Both fields must be nonempty YAML strings; quote numeric-looking keys. Duplicate or unknown fields, non-string values, multiple YAML documents and invalid addresses are rejected. The file must be a regular file no larger than 64 KiB.
+- 地址填写 CPA 根地址。同机访问使用回环地址，跨机器建议使用 HTTPS；客户端不跟随重定向。
+- 密钥必须是可用的原始密钥，不能填写密码哈希。
+- 两项均为非空字符串；建议加引号。文件不超过 64 KiB，重复字段、未知字段、非字符串值和多份 YAML 文档均会被拒绝。
+- 文件在进程首次初始化插件时读取一次，读取失败也会缓存。**创建、修改、修复文件或更换路径后，必须重启 CPA。** 网页保存设置和插件重新配置不会重新读取。
+- 插件不自动创建、迁移或修改私密文件，也不回退到旧配置。
 
-The file is read once on the first successful plugin initialization in each CPA process. A failed read is also cached. **Restart the CPA process after creating, repairing, rotating or editing the file, or changing its path.** Saving web settings, reconfiguring the plugin and polling the dashboard do not reload it. The plugin never creates or edits this file, and there is no fallback to the old configuration sources.
+页面显示“未配置”“配置无效”或“已配置”。“已配置”只表示本地配置有效，连接和认证是否成功以实际请求结果为准。状态接口不返回私密路径、文件原文或密钥。
 
-On Linux/macOS, any permission for other users, or group write/execute permission, is rejected. Recommended deployment: an administrator owns the file, the service account has read-only group access (`0640`), and the service cannot write its parent directory. A file readable only by its owner (`0600`/`0400`) is also accepted, but service ownership provides a weaker write boundary. Keep the file outside served directories, repositories, auth-file directories and ordinary configuration exports/backups. On Windows, configure NTFS ACLs explicitly; this version does **not** automatically validate Windows ACLs. These controls reduce configuration-channel exposure; they do not protect a key from a compromised service process or server administrator.
+### 文件权限
 
-Example Linux installation, assuming the CPA service belongs to the `cpa` group (substitute your actual service group):
+Linux/macOS 推荐管理员持有文件，服务账号通过所属组只读，文件权限为 `0640`，父目录不允许服务账号写入。`0600`、`0400` 也可使用，但应注意文件所有者的修改权限。其他用户有任何权限，或所属组有写入、执行权限时，插件会拒绝加载。
+
+下面以服务组 `cpa` 为例，请替换为实际组名：
 
 ```sh
 sudo install -d -o root -g cpa -m 0750 /etc/cpa/secrets
@@ -167,13 +85,15 @@ sudo install -o root -g cpa -m 0640 codex-token-usage-management.example.yaml /e
 sudoedit /etc/cpa/secrets/codex-token-usage-management.yaml
 ```
 
-Set the following in the service's environment and restart it:
+然后在服务环境中设置 `CPA_TOKEN_USAGE_MANAGEMENT_CONFIG_FILE` 并重启 CPA。
 
-```text
-CPA_TOKEN_USAGE_MANAGEMENT_CONFIG_FILE=/etc/cpa/secrets/codex-token-usage-management.yaml
-```
+Windows 可将文件放在 `C:\ProgramData\CPA\secrets\codex-token-usage-management.yaml`，并在服务启动环境中指定此绝对路径。通过 NTFS 权限关闭不必要的继承，仅允许管理员修改，CPA 服务账号读取文件及访问父目录。**当前版本不自动检查 Windows ACL。**
 
-Docker Compose fragment for an existing CPA service (the source file must already exist; replace the host path and match the container service UID/GID to the file's read permissions):
+私密文件应放在网页目录、账号认证目录、代码仓库和普通配置导出范围之外。文件权限不能防止已取得服务进程或管理员权限的人读取密钥。
+
+### Docker 部署
+
+先在宿主机创建私密文件，再为现有 CPA 服务增加只读挂载：
 
 ```yaml
 services:
@@ -189,164 +109,182 @@ services:
           create_host_path: false
 ```
 
-`127.0.0.1` refers to the container itself; use an appropriate service address if CPA is in a different container. Recreate the container after replacing a bind-mounted file so that it sees the new file, then verify configuration and an actual request.
+确保容器内服务的 UID/GID 有读取权限。容器中的 `127.0.0.1` 指容器自身；连接其他容器时应使用对应服务地址。替换宿主机挂载文件后，重新创建容器，使其读取新文件。
 
-Windows example from an elevated PowerShell, assuming the service identity is `NT SERVICE\CPA` (replace it with the actual identity). Use a new dedicated directory; review any pre-existing explicit ACL entries if reusing one:
+## 调度与账号状态
 
-```powershell
-New-Item -ItemType Directory -Force 'C:\ProgramData\CPA\secrets'
-icacls 'C:\ProgramData\CPA\secrets' /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' 'NT SERVICE\CPA:(OI)(CI)RX'
-Copy-Item '.\codex-token-usage-management.example.yaml' 'C:\ProgramData\CPA\secrets\codex-token-usage-management.yaml'
-icacls 'C:\ProgramData\CPA\secrets\codex-token-usage-management.yaml' /inheritance:r /grant:r '*S-1-5-32-544:F' '*S-1-5-18:F' 'NT SERVICE\CPA:R'
-notepad 'C:\ProgramData\CPA\secrets\codex-token-usage-management.yaml'
+| 模式 | 行为 |
+| --- | --- |
+| `native`（默认） | Codex 调度交给 CPA，插件负责统计、告警和账号状态管理。优先级、权重、回退、模型排除及会话亲和在 CPA 中配置。 |
+| `legacy` | 使用旧版插件调度，可启用并发限制、Token 软降级和会话亲和。 |
+
+`native` 不执行插件的并发硬限制和 Token 软降级。旧会话亲和配置仍适用于 `legacy` Codex 和现有 xAI 调度。
+
+### 原生模式的自动启停
+
+| 情况 | 处理方式 |
+| --- | --- |
+| 401、402、明确的账号或工作区级 403 | 自动禁用；检测到同一账号凭据更新后恢复。 |
+| 429、明确的额度耗尽 | 禁用并按服务端恢复时间冷却；多个耗尽窗口取最晚时间，无有效时间时冷却 60 秒。 |
+| 模型权限问题、无法分类的 403、网络错误或 5xx | 不据此禁用整个账号，由 CPA 继续处理冷却或重试。 |
+| 人工禁用 | 保持人工管理，不自动启用。 |
+| 已禁用但缺少插件历史记录 | 显示“禁用来源未知”，需人工确认后启用。 |
+
+插件通过 CPA 管理接口修改启停状态，并核对账号文件和运行时结果。写入或核对失败会重试；未确认的操作显示为待同步，不计作已完成禁用。
+
+网页提供“启用”和“重试同步”。启用后恢复调度，但不代表凭据已验证；后续请求仍可能触发禁用。普通浏览、账号状态轮询和重试同步不会发送模型探测请求，也不会主动查询上游额度。
+
+自动恢复只处理插件负责的禁用。切换到 `legacy` 后不再新增原生禁用，但会继续处理此前由插件负责的额度冷却恢复。
+
+## 常用设置
+
+以下选项写在 CPA 配置的 `plugins.configs.codex-token-usage` 下，也可在插件设置页面修改。示例为默认值；未填写的选项使用默认值。
+
+```yaml
+开启定时额度触发（不建议账号多的情况下开启）: false
+触发间隔分钟: 10
+触发模式: probe
+最大并发账号数: 1
+单账号超时秒数: 20
+单账号最小冷却分钟: 10
+
+自动更新模型价格表: true
+模型价格更新间隔小时: 6
+模型价格更新超时秒数: 20
+
+用量保留天数: 90
+额度触发记录保留天数: 30
+请求明细保留天数: 30
 ```
 
-Set `CPA_TOKEN_USAGE_MANAGEMENT_CONFIG_FILE=C:\ProgramData\CPA\secrets\codex-token-usage-management.yaml` in the service launcher and restart CPA. The service identity needs traversal/read access to the directory and read access to the file; only administrators should be able to replace or edit it.
+模型价格默认每 6 小时从 [LiteLLM 价格表](https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json)更新，也可通过“模型价格表地址”指定来源。插件内置少量回退价格；页面费用为估算值。
 
-The dashboard distinguishes missing, invalid and locally configured settings, and separately displays request failures. `auth_controller.management_configured` means the cached configuration is valid; it is **not** a connection/authentication health check. `management_config` exposes only `url_source` / `key_source` (`local_file` or `missing`), `missing_fields`, and `error_code` (empty on success). Error codes are `not_initialized`, `invalid_path`, `file_missing`, `file_unreadable`, `invalid_file`, `unsafe_permissions`, `invalid_yaml`, `unknown_field`, `duplicate_field`, `invalid_type`, `missing_fields`, `invalid_url`, and `invalid_key`. API responses and errors never include the private path, file contents or key. No private-file download/edit endpoint is provided.
+### 旧版账号保护
 
-Missing or invalid configuration leaves statistics and native scheduling working, but the dashboard warns that 401/402/403/429 state writes cannot run. API errors never reactivate the old native candidate filters. Only the dynamic library is included in release archives; the real private file is never packaged.
+以下设置用于 `legacy` Codex 调度，默认关闭账号保护：
 
-The controller supports uniquely identified physical Codex OAuth auth files. It sends only `{name, auth_index, disabled}` to `PATCH /v0/management/auth-files/status`, then verifies both the file and runtime state and checks that credential/custom/routing fields were preserved. HTTP 200 alone is insufficient. SQLite stores fingerprints, intent, state versions and sanitized audit evidence. Existing disabled files without plugin history retain unknown ownership; explicit manual disables remain manual.
-
-401/402 (and explicit account-level 403) disable the CPA auth file until same-account credentials update, then automatically enable it. Ordinary metadata changes and token refresh observations never impose a manual-review gate. 429 and explicit traffic limits use returned JSON/header deadlines; multiple exhausted windows use the latest known reset, and a missing window does not erase another valid reset. Without a valid deadline, cooldown lasts 60 seconds. Timer expiry automatically enables plugin-owned isolation. Explicit manual disables remain manual.
-
-Lifecycle polling, dashboard browsing, refreshes and sync actions never query upstream quota or send model probes. Normal requests may record quota observations; cached percentages and concurrent successes do not clear current isolation. Failures bind to credential generations so late old requests cannot disable new credentials. CPA writes and file/runtime read-back failures automatically retry. CPA has no conditional update or operator marker, so an indistinguishable concurrent manual write remains a platform limitation.
-
-Dashboard actions call the existing Management-authenticated endpoint:
-
-```http
-POST /v0/management/plugins/codex-token-usage/auth-states/action
-Content-Type: application/json
-
-{"auth_index":"exact-index","version":3,"action":"retry_sync"}
+```yaml
+同一个Session优先固定到同一个账号: true
+开启账号保护调度（可能会影响缓存）: false
+Free 并发上限: 2
+Plus 并发上限: 5
+K12 并发上限: 5
+Team 并发上限: 5
+Pro 并发上限: 10
+Free 5 分钟 Token 上限: 2000000
+Plus 5 分钟 Token 上限: 8000000
+K12 5 分钟 Token 上限: 8000000
+Team 5 分钟 Token 上限: 8000000
+Pro 5 分钟 Token 上限: 12000000
+账号保护 Token 窗口秒数: 300
+账号保护预约超时秒数: 900
 ```
 
-The dashboard offers **启用 (Enable)** (`enable`) for blocked/disabled accounts and **重试同步** (`retry_sync`) for pending/failed synchronization. Enable supersedes old failures using a durable nanosecond control boundary (`control_since_ns`) and synchronizes CPA without requiring Recheck or sending upstream probes. It reports success only after file and runtime read-back confirms enabled state; this permits scheduling but does not assert that credentials have been validated. New request failures still trigger isolation. Management HTTP 401 explicitly identifies the management key problem, separately from account credential failures.
+普通设置仍支持原有英文键名，例如 `quota_trigger_enabled`、`model_price_auto_update_enabled`、`account_protection_enabled`。
 
-Use the latest lifecycle version from Summary; stale versions return 409 and the dashboard refreshes before another action. Compatibility `recheck` and `check_and_recover` actions perform the same local reconciliation without upstream requests. Explicit `disable` and `clear` actions remain available through the API; Disable/Clear relinquish automatic recovery ownership. The compact `relogin-required-accounts` response shape is unchanged.
+### 额度触发与一次性启动
 
-External programs can query confirmed native-mode accounts that are waiting for re-login without fetching the full Summary or changing account state:
+定时额度触发默认关闭。开启后会定期发送少量真实 Codex 请求，可能消耗额度，账号较多时不建议开启。
 
-```bash
-curl -H "Authorization: Bearer <CPA management key>" \
-  http://127.0.0.1:8317/v0/management/plugins/codex-token-usage/relogin-required-accounts
-```
+“一次性启动额度窗口”与定时触发独立：先读取额度并预览，确认后才向所选账号发送真实请求。同一已识别周期会防止重复发送；结果不明确或只验证了部分窗口时，不自动重发。默认只接受已启用、凭据有效、已上报窗口均为全新状态的账号。强制模式仅放宽窗口新鲜度条件，不绕过账号、身份和额度读取检查。
 
-`GET /v0/management/plugins/codex-token-usage/relogin-required-accounts` returns only plugin-owned, confirmed 401, 402, and account-level 403 disables. It excludes timed 429 cooldowns, manual disables, and pending or failed synchronization. The response contains `generated_at`, `count`, and a stable `accounts` list with `auth_index`, `auth_id`, `name`, `state`, `http_status`, `reason`, `disabled_at`, and `version`. The route returns `409 unsupported_scheduling_mode` in legacy mode and is protected by the same CPA Management Bearer authentication as other plugin routes.
+额度窗口时长以服务端上报为准，不固定为 5 小时或 7 天；未上报或过期的数据不视为剩余额度充足。一次性启动不保证只消耗一个 Token，停止功能也无法撤回已发出的请求。
 
-Confirmed automatic disables appear in `autobans`; unconfirmed writes and sync failures appear separately in `auth_controller.pending_accounts`. Each account shows its failure, disable time and either “重新登录后自动恢复” or a cooldown countdown. Healthy, enabled accounts leave the list.
+## 数据目录与升级
 
-Request records and native lifecycle events commit atomically before auxiliary accounting. Missing identities or temporarily unreadable auth snapshots keep events pending for retry; identity matching never falls back to email. Pending 429 isolation can be upgraded by a later 401, and queued failures are processed before timer recovery. Summary exposes sanitized `auth_controller.events` with disposition counts plus bounded `pending` and `recent` lists (up to 100 each). Dispositions distinguish pending identity/snapshot, pending disable, confirmed disable, stale observations and conflicts. Upgrades retain unfinished events and replay existing failures previously suppressed by erroneous metadata conflicts, except failures superseded by newer login/success and expired cooldowns. Migration is idempotent and preserves explicit manual disables; historical usage errors are not bulk converted into new events.
-
-The old release/resolve routes remain registered. Native callers must supply exact `auth_index` and `version`; unversioned requests return `409 refresh_required` without changing auth. Legacy keeps its original route semantics.
-
-Before uninstalling or downgrading to an old binary, review every plugin-owned disabled account and either explicitly recover it after verification or hand responsibility to an operator using Disable/Clear. Keep the database for audit. Replacing a DLL alone does not undo disabled auth files. Switching to legacy stops new native isolation while continuing previously owned quota recovery.
-
-See [architecture audit](CODEX_ARCHITECTURE_AUDIT.md), [implementation report](CODEX_REFACTOR_REPORT.md), and [manual smoke test](MANUAL_SMOKE_TEST.md).
-
-The auto-disable table and 401/402/429 cards use the same native lifecycle records, including accounts without usage in the selected window. Pending status writes, confirmed plugin disables and manual disables remain visible. The 401/429 card counts include confirmed disables; pending accounts and unresolved event evidence are shown separately. Recovery times and pending recovery are shown explicitly; recovered accounts are removed even if their last historical HTTP status was 429. Native card dialogs use versioned actions, including one-click Check and recover for eligible 429 accounts.
-
-## One-shot quota-window activation
-
-The dashboard action **Activate quota windows once** is independent of the periodic trigger and works while `quota_trigger_enabled` remains `false`:
-
-1. Preview reads quota without model generation and lists every exact Codex auth record separately, including multiple seats with the same email.
-2. The default decision requires an enabled, unexpired Codex credential with at least one explicitly reported quota window and every reported window completely fresh. An explicitly `null` window is absent and does not block another valid reported window; omitted presence, zero reported windows, contradictory values, positive usage/tokens, or a countdown shorter than the server-reported duration are not fresh eligibility.
-3. Window names are opaque API slots, not duration promises: the UI shows each window's server-reported `limit_window_seconds`, `reset_after_seconds`, presence, usage, and reset time. The dashboard keeps a stable layout by plan: Plus/Pro/Team/K12 retain two window columns, while Free/Trial expose one window and mark the second column as not applicable. Missing or expired observations are shown as pending refresh; an empty slot is never rendered as a fabricated `0.0%` quota. For example, an account may report a seven-day `primary_window` and an explicitly null `secondary_window`.
-4. After explicit acknowledgement, a confirmed run revalidates the exact auth identity and quota, reserves a stable cycle key, and sends one fixed compact Codex request per selected account. A fresh full-duration window's moving `reset_at` is not part of that key. A later fresh cycle becomes distinct either after a prior safe window boundary has passed or after durable valid observations show the guarded cycle active and then show every reported window full/fresh again. The active-to-fresh policy intentionally accepts one authoritative fresh server read after prior active evidence so event-driven or manual resets need not wait for a scheduled boundary. That refresh observation is persisted once on the predecessor, making its successor key stable across preview, run revalidation, restart, and definite pre-send retry. Repeated fresh reads cannot mint another successor; the successor must itself be observed active before a later fresh read can create another generation. An ambiguous send without active-to-fresh evidence or a safe elapsed boundary stays blocked rather than risking a duplicate.
-5. The result reports `verified`, `partial`, `failed_before_send`, `sent_unknown`, or an explainable skip. Verification requires positive usage/tokens or a full-duration-to-shorter-countdown transition for every reported target window. Reset-time movement alone is not evidence, explicitly absent windows do not force `partial`, and ambiguous or partially verified sends are never retried automatically.
-
-The request is the smallest fixed request currently used by this plugin; it is a real request and can consume a small amount of quota. The API does not enforce an exact one-token output, so this feature makes no exact-token-cost claim. Force recovery mode bypasses only the fresh-window decision and requires explicit auth indexes; it never bypasses disabled, expired, provider, identity, credential, unknown-presence, zero-window, contradictory-quota, or quota-read safety checks.
-
-Management routes (all protected by CPA Management authentication) are:
+默认数据目录为运行 CPA 用户的：
 
 ```text
-POST /v0/management/plugins/codex-token-usage/quota-activation/preview
-GET  /v0/management/plugins/codex-token-usage/quota-activation/preview?id=<preview-id>
-POST /v0/management/plugins/codex-token-usage/quota-activation/run
-GET  /v0/management/plugins/codex-token-usage/quota-activation/run?id=<run-id>
+$HOME/.cli-proxy-api/data/codex-token-usage/
+├── usage.db
+└── model_prices.cache
 ```
 
-Example preview body:
+`usage.db` 保存用量和账号管理状态；价格缓存使用 JSON 内容，但以 `.cache` 为扩展名，避免被 CPA 误识别为账号认证文件。
+
+| 环境变量 | 用途 |
+| --- | --- |
+| `CPA_TOKEN_USAGE_DIR` | 指定持久化数据目录，建议使用绝对路径。 |
+| `CPA_MODEL_PRICE_FILE` | 单独指定模型价格文件位置。 |
+| `CPA_TOKEN_USAGE_MANAGEMENT_CONFIG_FILE` | 指定私密配置文件的绝对路径。 |
+| `CPA_CONFIG_PATH` | 指定插件读取的 CPA 主配置位置；兼容旧名称 `CPA_CONFIG_FILE`。 |
+
+CPA 主配置查找顺序：`CPA_CONFIG_PATH` → `CPA_CONFIG_FILE` → 进程 `-config` / `--config` 参数 → 工作目录中的 `config.yaml` → `$HOME/.cli-proxy-api/config.yaml` → `$HOME/config.yaml`。未找到已有文件时，默认使用 `$HOME/.cli-proxy-api/config.yaml`。
+
+### 升级步骤
+
+1. 准备私密配置文件及读取权限；旧网页配置和旧凭据环境变量不会自动迁移。
+2. 停止 CPA，备份 `usage.db` 及存在的 `usage.db-wal`、`usage.db-shm` 文件。
+3. 替换动态库并启动 CPA，核对汇总接口的 `version`、`db_path`，确认账号控制配置及实际请求结果。
+4. 删除 CPA 普通配置中的旧管理地址、密钥和旧凭据环境变量；检查历史明文备份，有泄露疑虑时轮换密钥。
+
+从旧版升级时，插件会将默认旧目录 `$HOME/.cli-proxy-api/plugins/codex-token-usage` 中的数据库和价格缓存迁移到新数据目录，并保留旧文件。已有目标数据库不会被覆盖或合并；指定了 `CPA_TOKEN_USAGE_DIR` 时不自动迁移目录。迁移失败会阻止数据库初始化，文件系统需支持硬链接。
+
+容器或服务账号变更时，须保留原数据卷或指定持久化目录。卸载、回滚前逐一核对插件禁用的账号，决定恢复或交由人工管理。**更换动态库不会自动解除禁用，不要通过删除数据库恢复账号。** 回滚时让 `CPA_TOKEN_USAGE_DIR` 指向当前数据目录，避免重新使用旧副本。
+
+## 管理接口
+
+所有接口均使用 CPA 管理认证，路径前缀为 `/v0/management/plugins/codex-token-usage`。
+
+| 方法与路径 | 用途 |
+| --- | --- |
+| `GET /summary` | 用量、账号状态和运行诊断。 |
+| `GET /export` | 导出账号、服务商、模型或请求统计。 |
+| `GET /relogin-required-accounts` | 查询已确认由插件禁用、等待重新登录的 401、402 和账号级 403 账号。 |
+| `POST /auth-states/action` | 执行启用或重试同步等账号操作。 |
+| `POST /quota-activation/preview` | 创建额度启动预览。 |
+| `GET /quota-activation/preview?id=...` | 查询预览结果。 |
+| `POST /quota-activation/run` | 提交已确认的额度启动请求。 |
+| `GET /quota-activation/run?id=...` | 查询执行结果。 |
+
+账号操作示例：
 
 ```json
-{"force": false, "auth_indexes": []}
+{"auth_index":"目标账号索引","version":3,"action":"retry_sync"}
 ```
 
-A completed preview returns a short-lived one-time confirmation token. Pass that token, the preview ID, and an explicit subset of preview-eligible auth indexes to the run endpoint. Preview/run state and cycle reservations are persisted in the plugin SQLite database. Credentials, internal auth IDs/file names, authorization headers, cookies, and raw upstream bodies are not returned; credentials, headers, cookies, and raw bodies are not persisted. A periodic trigger round and a one-shot run share an exclusion gate and cannot dispatch concurrently.
+`version` 必须取自最新汇总结果；版本过期返回 HTTP 409。`enable` 表示启用，`retry_sync` 表示重试同步。旧接口在原生模式下同样要求准确的账号索引与版本。
 
-Stopping the activation feature stops future requests but cannot undo a successful upstream request or its quota-window effect. Before removing the plugin, also complete the account-state ownership handoff described above.
+待重新登录接口返回 `generated_at`、`count` 和 `accounts`，排除人工禁用、429 冷却及未确认同步的账号；`legacy` 模式返回 `409 unsupported_scheduling_mode`。
 
-## Model Price Table
+额度启动需先获取预览及一次性确认令牌，再提交预览内允许启动的账号。账号操作、导出和诊断不会返回账号访问令牌、刷新令牌或管理密钥；本地告警仅出现在汇总或导出结果中，不发送外部通知。
 
-The plugin includes a small built-in fallback price table. By default it also downloads and refreshes the full LiteLLM-style model price table from:
+## 常见问题
 
-```text
-https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json
-```
+| 问题 | 检查方法 |
+| --- | --- |
+| 插件未注册或未生效 | 检查动态库的系统、架构和目录，重启 CPA。 |
+| 自动启停显示未配置或配置无效 | 检查私密文件路径、字段和权限；修复后重启 CPA。 |
+| 管理接口返回 401 | 检查对应请求使用的 CPA 管理密钥。后台控制报错时修改私密文件并重启；这与上游账号凭据的 401 不同。 |
+| 账号重新登录后仍禁用 | 检查是否同一账号、凭据是否更新及状态是否同步；缺少历史记录时可人工确认后启用。 |
+| 429 后何时恢复 | 有有效恢复时间时按时间恢复，否则冷却 60 秒；同步失败会显示原因并重试。 |
+| 列表显示“已启用”后又被禁用 | 启用仅恢复调度，新的账号请求失败仍会触发禁用。 |
+| 服务商未显示或模型缺少价格 | 检查 CPA 中对应服务商配置、模型价格更新状态和缓存文件。 |
 
-The downloaded file is stored under the current CPA user's data directory:
+## 构建与验证
 
-```text
-$HOME/.cli-proxy-api/data/codex-token-usage/model_prices.cache
-```
+需要 Go 1.21 或更新版本、支持 CGO 的 C 编译器；前端测试需要 Node.js。构建与打包脚本使用 Bash，Windows 可使用相应终端环境。
 
-The file is about 1.5 MB and is not bundled into release zips, so plugin binaries stay smaller and prices can be refreshed without rebuilding the plugin.
-
-To override the location, set:
-
-```bash
-CPA_MODEL_PRICE_FILE=/path/to/model_prices.json
-```
-
-`CPA_TOKEN_USAGE_DIR` overrides the shared plugin data directory used by both `usage.db` and, unless `CPA_MODEL_PRICE_FILE` is set, `model_prices.cache`. The cache content is JSON, but the non-JSON extension prevents CPA from treating it as an authentication file. Existing plugin-owned `model_prices.json` files are migrated automatically. `CPA_CONFIG_PATH` (or the legacy `CPA_CONFIG_FILE`) overrides the CPA config path. Otherwise the plugin follows CPA's `-config` / `--config` process argument. Without either override, the canonical `$HOME/.cli-proxy-api/config.yaml` is preferred when present, followed by an existing `$HOME/config.yaml` or `config.yaml` in the process working directory; the final fallback remains `$HOME/.cli-proxy-api/config.yaml`.
-
-## Data Safety
-
-- Access tokens, refresh tokens, id tokens, and API keys are not written to summary JSON, UI, alert output, or exports.
-- Exported account labels that look like API keys are masked as `sk-****abcd`.
-- Local alert data is generated inside summary/export responses only; this version does not send webhooks.
-- Auth JSON is read for identity, quota access and conflict detection. Native status operations ask CPA to persist only disabled/enabled state, with field-preservation checks; the existing explicitly requested import workflow remains separate. Tokens are used in memory and never included in lifecycle logs, Summary or exports.
-
-## Build
-
-```bash
-CGO_ENABLED=1 go test ./...
+```sh
+export CGO_ENABLED=1
+go test ./...
 go test -race ./...
 go vet ./...
-python3 integration/run_cpa_native.py # Go >=1.26; pinned CPA v7.2.145
-./build.sh
-./package-release.sh dist
+node --test integration/dashboard_lifecycle.test.cjs
+bash ./build.sh
+bash ./package-release.sh dist
 ```
 
-Release assets are named in the CLIProxyAPI plugin store format:
+CPA 原生接口兼容性测试需要 Python 3、Go 1.26 或更新版本及网络连接，测试固定版本 CPA `7.2.145`：
 
-```text
-codex-token-usage_0.1.49_linux_amd64.zip
-codex-token-usage_0.1.49_linux_arm64.zip
-codex-token-usage_0.1.49_windows_amd64.zip
-codex-token-usage_0.1.49_darwin_amd64.zip
-codex-token-usage_0.1.49_darwin_arm64.zip
-checksums.txt
+```sh
+python3 integration/run_cpa_native.py
 ```
 
-## Plugin Store Checklist
+发布包按 `codex-token-usage_版本_系统_架构.zip` 命名，支持 Linux amd64/arm64、Windows amd64、macOS amd64/arm64，并生成 `checksums.txt`。压缩包仅包含动态库，不包含私密配置、数据库或下载的价格表。
 
-- Build and upload all required OS / architecture zip files.
-- Include `checksums.txt`.
-- Add screenshots for the Codex account pool, AI provider overview, and a selected AI endpoint page.
-- Document default-off quota trigger behavior and real-probe token cost risk.
-- Confirm `go test ./...` passes before publishing.
+真实环境验证见[手动验证说明](MANUAL_SMOKE_TEST.md)。[架构审查](CODEX_ARCHITECTURE_AUDIT.md)和[重构报告](CODEX_REFACTOR_REPORT.md)记录历史设计，当前行为以代码和本说明为准。
 
-## Common Issues
+## 许可证
 
-- `未注册 / 未生效`: confirm the file is under the correct plugin directory and restart CLIProxyAPI.
-- Native `401`/`402`: isolation requires configured Management access; log in again for the same account to restore it automatically.
-- Native `429`: ordinary rate limits and confirmed quota exhaustion both disable the auth through CPA. Unknown quota resets are queried without inventing a recovery time; ordinary 429 without retry metadata uses a 60-second local backoff.
-- Provider not visible: confirm the endpoint still exists in CPA config and refresh the dashboard.
-- Price missing: check `model_prices.cache` status in the summary JSON and the model price update error if present.
-
-## License
-
-MIT
+[MIT 许可证](LICENSE)
