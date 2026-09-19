@@ -5,6 +5,26 @@ import (
 	"testing"
 )
 
+func TestDashboardRecentRequestsHaveSeparateTimeColumn(t *testing.T) {
+	const header = `<th>模型</th><th>时间</th><th>耗时</th><th>Tokens</th><th>费用</th><th>详情</th>`
+	if got := strings.Count(dashboardBody, header); got != 2 {
+		t.Fatalf("static recent request tables with time column = %d, want 2", got)
+	}
+	for _, marker := range []string{
+		header,
+		`'时间':'Time'`,
+		`td(esc(r.time||'-'),'recent-time')`,
+		`colspan="6" class="muted">暂无请求记录`,
+	} {
+		if !strings.Contains(dashboardScripts, marker) {
+			t.Fatalf("recent request time column marker %q not found", marker)
+		}
+	}
+	if strings.Contains(dashboardScripts, `esc(who)+' · '+esc(r.time||'-')`) {
+		t.Fatal("recent request time is still rendered in the model metadata")
+	}
+}
+
 func TestDashboardCacheTokensDoesNotDoubleCountOverlappingFields(t *testing.T) {
 	markers := []string{
 		`const cached=Number(r.cached_tokens||0),read=Number(r.cache_read_tokens||0),creation=Number(r.cache_creation_tokens||0);`,

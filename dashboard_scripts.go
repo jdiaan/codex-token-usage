@@ -1894,7 +1894,7 @@ function providerPageHTML(name){
       '<section class="section"><h2><span>Token 结构</span><span class="mini">'+esc(name)+'</span></h2><div class="section-body"><div class="mix" id="'+id+'-mix"></div></div></section>'+
     '</div>'+
     '<section class="section" style="margin-top:8px"><h2><span>模型排行</span><span class="mini">'+esc(name)+'</span></h2><div class="scroll model-table-wrap"><table><thead><tr><th>模型</th><th>别名</th><th>Provider</th><th>请求</th><th>总 Token</th><th>费用</th><th>性能</th><th>输入</th><th>输出</th><th>缓存</th><th>缓存率</th></tr></thead><tbody id="'+id+'-models"></tbody></table></div></section>'+
-    '<section class="section" style="margin-top:8px"><h2><span>最近请求</span><span class="mini">'+esc(name)+' 最近 30 条</span></h2><div class="scroll recent-table-wrap"><table><thead><tr><th>模型</th><th>耗时</th><th>Tokens</th><th>费用</th><th>详情</th></tr></thead><tbody id="'+id+'-recent"></tbody></table></div></section>'+
+    '<section class="section" style="margin-top:8px"><h2><span>最近请求</span><span class="mini">'+esc(name)+' 最近 30 条</span></h2><div class="scroll recent-table-wrap"><table><thead><tr><th>模型</th><th>时间</th><th>耗时</th><th>Tokens</th><th>费用</th><th>详情</th></tr></thead><tbody id="'+id+'-recent"></tbody></table></div></section>'+
   '</section>';
 }
 const i18nEn={
@@ -2215,6 +2215,7 @@ const i18nEn={
   '类型':'Type',
   '剩余':'Remaining',
   '最近请求':'Recent requests',
+  '时间':'Time',
   'Codex 最近 30 条':'Latest 30 Codex requests',
   'xAI 最近 30 条':'Latest 30 xAI requests',
   '耗时':'Latency',
@@ -3160,13 +3161,14 @@ function renderRecent(target,rows,mode){
     const detail=[tierText(r.service_tier),r.price_detail||'缺价格'].filter(Boolean).join(' · ');
     const reasoning=r.reasoning_effort?('推理 '+r.reasoning_effort+' · '):'';
     return '<tr>'+
-      td('<div class="recent-model"><div class="recent-primary"><span class="model-chip" title="'+esc(firstText(r.model,model))+'">'+esc(model)+'</span></div><span class="recent-sub" title="'+esc(who+' · '+(r.time||'-'))+'">'+esc(who)+' · '+esc(r.time||'-')+'</span></div>','recent-model')+
+      td('<div class="recent-model"><div class="recent-primary"><span class="model-chip" title="'+esc(firstText(r.model,model))+'">'+esc(model)+'</span></div><span class="recent-sub" title="'+esc(who)+'">'+esc(who)+'</span></div>','recent-model')+
+      td(esc(r.time||'-'),'recent-time')+
       td('<div class="recent-badges"><span class="latency-pill '+latencyTone(r.latency_ms)+'">'+fmtLatencyMs(r.latency_ms)+'</span><span class="latency-pill '+latencyTone(r.ttft_ms)+'">'+fmtLatencyMs(r.ttft_ms)+'</span></div><span class="token-sub">流 · '+esc(throughput(r))+'</span>')+
       td('<span class="token-main">'+fmt(r.input_tokens)+' / '+fmt(r.output_tokens)+'</span><span class="token-sub">缓存 ↓ '+compact(cache)+(cacheWrite?(' · 写入 ↑ '+compact(cacheWrite)):'')+(r.reasoning_tokens?(' · 推理 '+compact(r.reasoning_tokens)):'')+'</span>','num')+
       td(price,'num')+
       td('<span class="detail-main">'+esc(detail)+'</span><span class="detail-sub">'+reasoning+'<span class="status-pill '+statusClass+'">'+esc(requestStatusText(r))+'</span></span>')+
     '</tr>';
-  }).join('') || '<tr><td colspan="5" class="muted">暂无请求记录</td></tr>';
+  }).join('') || '<tr><td colspan="6" class="muted">暂无请求记录</td></tr>';
 }
 applyLocale();
 load();
