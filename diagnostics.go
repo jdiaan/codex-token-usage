@@ -35,62 +35,12 @@ type authDiagnostics struct {
 	Anthropic             int `json:"anthropic"`
 	Antigravity           int `json:"antigravity"`
 	Gemini                int `json:"gemini"`
-	XAI                   int `json:"xai"`
 	Disabled              int `json:"disabled"`
 	Expired               int `json:"expired"`
 	Invalid401            int `json:"invalid_401"`
 	Autoban429            int `json:"autoban_429"`
 	ExternalUseSuspected  int `json:"external_use_suspected"`
 	QuotaTriggerAvailable int `json:"quota_trigger_available"`
-}
-
-type schedulerDiagnostics struct {
-	ActiveBanCount           int    `json:"active_ban_count"`
-	FilteredCandidates       int    `json:"filtered_candidates"`
-	UnmatchedActiveBans      int    `json:"unmatched_active_bans"`
-	RequestCandidates        int    `json:"request_candidates"`
-	CandidateHighestPriority int    `json:"candidate_highest_priority"`
-	MissingHealthyAccounts   int    `json:"missing_healthy_accounts"`
-	CandidatePoolStale       bool   `json:"candidate_pool_stale"`
-	LastFilteredAt           string `json:"last_filtered_at,omitempty"`
-	LastCandidatePoolCheckAt string `json:"last_candidate_pool_check_at,omitempty"`
-}
-
-func (t *schedulerDiagnosticsTracker) recordCandidatePool(requestCandidates, highestPriority, missingHealthyAccounts int) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.state.RequestCandidates = requestCandidates
-	t.state.CandidateHighestPriority = highestPriority
-	t.state.MissingHealthyAccounts = missingHealthyAccounts
-	t.state.CandidatePoolStale = missingHealthyAccounts > 0
-	t.state.LastCandidatePoolCheckAt = time.Now().Format(time.RFC3339)
-}
-
-type schedulerDiagnosticsTracker struct {
-	mu    sync.Mutex
-	state schedulerDiagnostics
-}
-
-func (t *schedulerDiagnosticsTracker) record(activeBans int, filteredCandidates int, unmatchedActiveBans int) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.state.ActiveBanCount = activeBans
-	t.state.FilteredCandidates = filteredCandidates
-	t.state.UnmatchedActiveBans = unmatchedActiveBans
-	if filteredCandidates > 0 {
-		t.state.LastFilteredAt = time.Now().Format(time.RFC3339)
-	}
-}
-
-func (t *schedulerDiagnosticsTracker) status(activeBans int) schedulerDiagnostics {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	out := t.state
-	out.ActiveBanCount = activeBans
-	if activeBans == 0 {
-		out.UnmatchedActiveBans = 0
-	}
-	return out
 }
 
 type providerDiagnostics struct {
@@ -120,15 +70,12 @@ type modelPriceDiagnostics struct {
 }
 
 type diagnosticsSummary struct {
-	Database     databaseDiagnostics      `json:"database"`
-	AuthFiles    authDiagnostics          `json:"auth_files"`
-	CodexAuth    xaiAuthSourceDiagnostics `json:"codex_auth"`
-	XAIAuth      xaiAuthSourceDiagnostics `json:"xai_auth"`
-	Scheduler    schedulerDiagnostics     `json:"scheduler"`
-	Providers    providerDiagnostics      `json:"providers"`
-	ModelPrices  modelPriceDiagnostics    `json:"model_prices"`
-	QuotaTrigger quotaTriggerState        `json:"quota_trigger"`
-	Retention    retentionState           `json:"retention"`
+	Database     databaseDiagnostics   `json:"database"`
+	AuthFiles    authDiagnostics       `json:"auth_files"`
+	CodexAuth    authSourceDiagnostics `json:"codex_auth"`
+	ModelPrices  modelPriceDiagnostics `json:"model_prices"`
+	QuotaTrigger quotaTriggerState     `json:"quota_trigger"`
+	Retention    retentionState        `json:"retention"`
 }
 
 type dashboardAlert struct {
@@ -261,15 +208,12 @@ func execDelete(ctx context.Context, db *sql.DB, query string, cutoff int64) (in
 	return n, nil
 }
 
-func buildDiagnostics(ctx context.Context, db *sql.DB, dbPath string, accounts []accountRow, providers []providerRow, invalidAuths []invalidAuthRow, autobans []autobanRow, externalAlerts []externalUseAlert) diagnosticsSummary {
+func buildDiagnostics(ctx context.Context, db *sql.DB, dbPath string, accounts []accountRow, _ []providerRow, invalidAuths []invalidAuthRow, autobans []autobanRow, externalAlerts []externalUseAlert) diagnosticsSummary {
 	priceState := globalModelPriceUpdater.status()
 	return diagnosticsSummary{
 		Database:     queryDatabaseDiagnostics(ctx, db, dbPath),
 		AuthFiles:    buildAuthDiagnostics(accounts, invalidAuths, autobans, externalAlerts),
 		CodexAuth:    globalCodexAuthSource.status(),
-		XAIAuth:      globalXAIAuthSource.status(),
-		Scheduler:    globalSchedulerDiagnostics.status(len(autobans)),
-		Providers:    buildProviderDiagnostics(providers),
 		ModelPrices:  buildModelPriceDiagnostics(priceState),
 		QuotaTrigger: globalQuotaTrigger.status(),
 		Retention:    globalRetentionCleaner.status(),
@@ -325,7 +269,6 @@ func buildAuthDiagnostics(accounts []accountRow, invalidAuths []invalidAuthRow, 
 	out := authDiagnostics{
 		Files:                len(files),
 		Codex:                codexStatus.Accounts,
-		XAI:                  globalXAIAuthSource.status().Accounts,
 		Invalid401:           len(invalidAuths),
 		Autoban429:           count429Autobans(autobans),
 		ExternalUseSuspected: len(externalAlerts),
@@ -519,17 +462,6 @@ func buildAlerts(data map[string]any) []dashboardAlert {
 		if diagnostics.Database.UsageEvents > 0 && diagnostics.Database.LatestEventAgeSecs > 6*3600 {
 			alerts = append(alerts, dashboardAlert{ID: "stale-usage", Severity: "info", Type: "stale_data", Scope: "system", Target: "usage_events", Message: "长时间没有新的 usage 事件", Detail: "最近事件 " + diagnostics.Database.LatestEventAt, CreatedAt: now, Active: true})
 		}
-		if len(diagnostics.Providers.UnmatchedConfigured) > 0 {
-			alerts = append(alerts, dashboardAlert{ID: "provider-unmatched", Severity: "info", Type: "provider_config", Scope: "provider", Target: "CPA config", Message: "存在已配置但暂无流量的接入点", Detail: strings.Join(diagnostics.Providers.UnmatchedConfigured, " / "), CreatedAt: now, Active: true})
-		}
-		if diagnostics.Scheduler.CandidatePoolStale {
-			alerts = append(alerts, dashboardAlert{
-				ID: "scheduler-candidate-pool", Severity: "critical", Type: "scheduler_candidate_pool", Scope: "system", Target: "CPA scheduler",
-				Message:   "CPA 调度候选池未包含健康账号",
-				Detail:    fmt.Sprintf("当前候选 %d 个，另有 %d 个健康注册账号未进入候选；插件不会绕过限制选择未知账号", diagnostics.Scheduler.RequestCandidates, diagnostics.Scheduler.MissingHealthyAccounts),
-				CreatedAt: diagnostics.Scheduler.LastCandidatePoolCheckAt, Active: true,
-			})
-		}
 	}
 	sort.SliceStable(alerts, func(i, j int) bool {
 		return alertSeverityRank(alerts[i].Severity) > alertSeverityRank(alerts[j].Severity)
@@ -568,6 +500,17 @@ func handleExport(ctx context.Context, window, kind, format string, limit int) m
 }
 
 func handleExportWithFilters(ctx context.Context, window, kind, format string, limit int, query map[string][]string) managementResponse {
+	if scope := strings.ToLower(strings.TrimSpace(firstQuery(query, "scope", "codex"))); scope != "codex" {
+		return jsonResponse(http.StatusBadRequest, map[string]any{"error": "unsupported_scope", "message": "only Codex OAuth exports are supported"})
+	}
+	if firstQuery(query, "provider", "") != "" {
+		return jsonResponse(http.StatusBadRequest, map[string]any{"error": "unsupported_provider", "message": "provider exports are not supported"})
+	}
+	switch strings.ToLower(strings.TrimSpace(kind)) {
+	case "", "accounts", "models", "recent", "logs":
+	default:
+		return jsonResponse(http.StatusBadRequest, map[string]any{"error": "unsupported_export", "message": "only Codex OAuth exports are supported"})
+	}
 	if strings.EqualFold(strings.TrimSpace(kind), "logs") {
 		filters := logExportFilter{
 			Window:   window,
@@ -679,14 +622,10 @@ func exportHeaders(contentType, name string) map[string][]string {
 
 func exportRecords(data map[string]any, kind string) ([]map[string]string, []string) {
 	switch strings.ToLower(strings.TrimSpace(kind)) {
-	case "providers":
-		return providerExportRows(anySlice[providerRow](data["providers"])), []string{"provider", "requests", "success_rate", "total_tokens", "cost_usd", "avg_latency_ms", "rate_limited", "last_seen"}
 	case "models":
-		rows := append(anySlice[modelRow](data["models"]), anySlice[modelRow](data["provider_models"])...)
-		return modelExportRows(rows), []string{"provider", "model", "alias", "requests", "total_tokens", "cost_usd", "avg_latency_ms", "cache_rate"}
+		return modelExportRows(anySlice[modelRow](data["models"])), []string{"provider", "model", "alias", "requests", "total_tokens", "cost_usd", "avg_latency_ms", "cache_rate"}
 	case "recent":
-		rows := append(anySlice[recentRow](data["recent"]), anySlice[recentRow](data["provider_recent"])...)
-		return recentExportRows(rows), []string{"time", "provider", "account", "model", "alias", "status_code", "failed", "total_tokens", "input_tokens", "output_tokens", "cost_usd", "latency_ms"}
+		return recentExportRows(anySlice[recentRow](data["recent"])), []string{"time", "provider", "account", "model", "alias", "status_code", "failed", "total_tokens", "input_tokens", "output_tokens", "cost_usd", "latency_ms"}
 	default:
 		return accountExportRows(anySlice[accountRow](data["accounts"])), []string{"account", "auth_index", "provider", "requests", "success_rate", "total_tokens", "cost_usd", "quota_total_estimate", "quota_remaining_estimate", "invalid_auth", "external_use_suspected", "last_seen"}
 	}
@@ -712,15 +651,7 @@ func exportLogRecords(ctx context.Context, db *sql.DB, filters logExportFilter, 
 		where = append(where, "requested_at >= ?")
 		args = append(args, since)
 	}
-	scope := strings.ToLower(strings.TrimSpace(filters.Scope))
-	switch scope {
-	case "providers", "provider":
-		where = append(where, usageScopeSQL("other"))
-	case "xai":
-		where = append(where, usageScopeSQL("xai"))
-	default:
-		where = append(where, usageScopeSQL("codex"))
-	}
+	where = append(where, usageScopeSQL("codex"))
 	providerExpr := cpaProviderSQL()
 	if provider := strings.TrimSpace(filters.Provider); provider != "" {
 		where = append(where, providerExpr+" = ?")
@@ -752,7 +683,7 @@ func exportLogRecords(ctx context.Context, db *sql.DB, filters logExportFilter, 
 	}
 	query := `
 SELECT requested_at,
-CASE WHEN ` + usageScopeSQL("codex") + ` THEN 'codex' WHEN ` + usageScopeSQL("xai") + ` THEN 'xai' ELSE 'providers' END AS scope_key,
+ 'codex' AS scope_key,
 ` + providerExpr + ` AS provider_key,
 api_key, auth_id, auth_index, source, model, alias, reasoning_effort, service_tier,
 latency_ms, ttft_ms, status_code, failed, input_tokens, output_tokens, reasoning_tokens,

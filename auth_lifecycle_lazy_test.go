@@ -110,7 +110,7 @@ func TestLazyMissingIdentityDeferredAndVisible(t *testing.T) {
 }
 
 func TestLazyUsageAndFailureAtomicity(t *testing.T) {
-	for _, kind := range []string{"event_failure", "auxiliary_failure"} {
+	for _, kind := range []string{"event_failure"} {
 		t.Run(kind, func(t *testing.T) {
 			c, _, _ := nativeTestController(t)
 			db, _, _ := c.store.open(context.Background())

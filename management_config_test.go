@@ -272,43 +272,6 @@ func TestManagementConfigNewProcessReloads(t *testing.T) {
 	}
 }
 
-func TestManagementConfigProcessHelper(t *testing.T) {
-	if os.Getenv("CPA_PRIVATE_CONFIG_TEST_HELPER") != "1" {
-		return
-	}
-	configure := func(extra string) {
-		t.Helper()
-		raw, err := json.Marshal(map[string]string{"config_yaml": "model_price_auto_update_enabled: false\nquota_trigger_enabled: false\nsummary_precompute_enabled: false\n" + extra})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := configurePlugin(raw); err != nil {
-			t.Fatal(err)
-		}
-	}
-	configure("")
-	defer globalAuthLifecycle.stop()
-	if value := globalManagementConfig.current(); !value.ready() || value.key != os.Getenv("CPA_PRIVATE_CONFIG_EXPECTED") {
-		t.Fatal("new process did not load the current private file")
-	}
-	before := globalManagementConfig.current()
-	writeManagementConfig(t, os.Getenv("CPA_TOKEN_USAGE_MANAGEMENT_CONFIG_FILE"), "management_key: [")
-	t.Setenv("CPA_TOKEN_USAGE_MANAGEMENT_CONFIG_FILE", filepath.Join(t.TempDir(), "replacement.yaml"))
-	t.Setenv("CPA_TOKEN_USAGE_MANAGEMENT_URL", "http://attacker.test")
-	t.Setenv("CPA_TOKEN_USAGE_MANAGEMENT_KEY", "legacy-secret")
-	configure("management_url: http://attacker.test\nmanagement_key: legacy-secret\naccount_protection_free_token_limit: 12345\n")
-	if globalAccountProtection.config().AccountProtectionFreeTokenLimit != 12345 {
-		t.Fatal("ordinary plugin reconfiguration did not run")
-	}
-	globalAuthLifecycle.opMu.Lock()
-	client, ok := globalAuthLifecycle.host.(*managementAuthClient)
-	unchanged := ok && client.baseURL == before.baseURL && client.key == before.key
-	globalAuthLifecycle.opMu.Unlock()
-	if !unchanged || !reflect.DeepEqual(before, globalManagementConfig.current()) || globalAuthLifecycle.status()["management_configured"] != true {
-		t.Fatal("plugin reconfiguration changed the active private client or status")
-	}
-}
-
 func TestManagementConfigClientWritesAndRejectsRedirects(t *testing.T) {
 	for _, status := range []int{http.StatusOK, http.StatusUnauthorized, http.StatusTemporaryRedirect} {
 		t.Run(http.StatusText(status), func(t *testing.T) {

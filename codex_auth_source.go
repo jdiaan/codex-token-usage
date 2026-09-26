@@ -27,7 +27,7 @@ type codexAuthSourceManager struct {
 	inventory   []configuredAccount
 	revision    string
 	lastError   error
-	diagnostics xaiAuthSourceDiagnostics
+	diagnostics authSourceDiagnostics
 	epoch       uint64
 }
 
@@ -121,7 +121,7 @@ func (m *codexAuthSourceManager) refreshHostInventory() error {
 		m.inventory = cloneConfiguredAccounts(inventory)
 		m.revision = revision
 		m.lastError = nil
-		m.diagnostics = xaiAuthSourceDiagnostics{
+		m.diagnostics = authSourceDiagnostics{
 			Source:            "host_callback",
 			Authoritative:     true,
 			Accounts:          len(accounts),
@@ -515,7 +515,7 @@ func (m *codexAuthSourceManager) authoritative() bool {
 	return m.diagnostics.Authoritative
 }
 
-func (m *codexAuthSourceManager) status() xaiAuthSourceDiagnostics {
+func (m *codexAuthSourceManager) status() authSourceDiagnostics {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.diagnostics

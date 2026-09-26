@@ -90,7 +90,7 @@ func TestSummarySQLiteCacheIsCanonicalAndBounded(t *testing.T) {
 func TestSummarySyncRefreshesAfterUsageRevisionChange(t *testing.T) {
 	ctx := context.Background()
 	s := newTestStore(t)
-	cfg := normalizePluginConfig(legacyPluginConfig())
+	cfg := normalizePluginConfig(defaultPluginConfig())
 	cfg.SummaryPrecomputeMode = "active_dirty"
 
 	m := &summaryPrecomputeManager{}
@@ -172,7 +172,7 @@ func TestSummaryReturnsStaleCacheWhileRevisionRefreshRuns(t *testing.T) {
 }
 
 func TestSummaryAsyncRefreshIsThrottledWithinPrecomputeInterval(t *testing.T) {
-	cfg := normalizePluginConfig(legacyPluginConfig())
+	cfg := normalizePluginConfig(defaultPluginConfig())
 	key := normalizeSummaryCacheKey(summaryCacheKey{Window: "24h", Limit: 50})
 	m := &summaryPrecomputeManager{
 		entries: map[summaryCacheKey]summaryCacheEntry{
@@ -255,120 +255,6 @@ func TestSummaryMaintenanceUsesLightModeAfterNewUsageWithoutAuthFileChange(t *te
 	}
 	if second.SkippedReason != "" {
 		t.Fatalf("light maintenance should run, not skip: %+v", second)
-	}
-}
-
-func TestParseLowUsageConfigDefaultsAndOverrides(t *testing.T) {
-	cfg := normalizePluginConfig(legacyPluginConfig())
-	if cfg.SummaryPrecomputeMode != "active_dirty" {
-		t.Fatalf("default precompute mode = %q, want active_dirty", cfg.SummaryPrecomputeMode)
-	}
-	if cfg.SummaryCacheMaxAgeSeconds != 30 {
-		t.Fatalf("default cache max age = %d, want 30", cfg.SummaryCacheMaxAgeSeconds)
-	}
-	if cfg.SummaryMaintenanceIntervalSeconds != 180 {
-		t.Fatalf("default maintenance interval = %d, want 180", cfg.SummaryMaintenanceIntervalSeconds)
-	}
-	if cfg.SummaryPrecomputeActiveWindowTTLSeconds != 120 {
-		t.Fatalf("default active window TTL = %d, want 120", cfg.SummaryPrecomputeActiveWindowTTLSeconds)
-	}
-
-	cfg = parsePluginConfigYAML([]byte(`
-summary_precompute_mode: legacy
-summary_cache_max_age_seconds: 9
-summary_maintenance_interval_seconds: 240
-summary_precompute_active_window_ttl_seconds: 900
-`), cfg)
-	cfg = normalizePluginConfig(cfg)
-	if cfg.SummaryPrecomputeMode != "legacy" || cfg.SummaryCacheMaxAgeSeconds != 9 || cfg.SummaryMaintenanceIntervalSeconds != 240 || cfg.SummaryPrecomputeActiveWindowTTLSeconds != 900 {
-		t.Fatalf("overridden config not applied: %+v", cfg)
-	}
-}
-
-func TestQuotaTriggerWarningLabelAndConfigCompatibility(t *testing.T) {
-	const warningName = "开启定时额度触发（不建议账号多的情况下开启）"
-	found := false
-	for _, field := range pluginConfigFields() {
-		if field.Name == warningName {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Fatalf("plugin config fields do not contain %q", warningName)
-	}
-	for _, key := range []string{"quota_trigger_enabled", warningName, "开启定时额度触发"} {
-		cfg := legacyPluginConfig()
-		cfg.QuotaTriggerEnabled = false
-		cfg = parsePluginConfigYAML([]byte(key+": true\n"), cfg)
-		if !cfg.QuotaTriggerEnabled {
-			t.Fatalf("quota trigger config key %q was not accepted", key)
-		}
-	}
-}
-
-func TestSessionAffinityConfigLabelAndCompatibility(t *testing.T) {
-	const label = "同一个Session优先固定到同一个账号"
-	fields := pluginConfigFields()
-	index := -1
-	for i, field := range fields {
-		if field.Name == label {
-			index = i
-			break
-		}
-	}
-	if index < 0 {
-		t.Fatalf("plugin config fields do not contain %q", label)
-	}
-	if index+1 >= len(fields) || fields[index+1].Name != "自动更新模型价格表" {
-		t.Fatalf("session affinity field should be immediately above model price auto-update field, got %q", fields[index+1].Name)
-	}
-	if !legacyPluginConfig().SchedulerSessionAffinityEnabled {
-		t.Fatal("session affinity should remain enabled by default for compatibility")
-	}
-	for _, key := range []string{"scheduler_session_affinity_enabled", "session_affinity_enabled", label} {
-		cfg := legacyPluginConfig()
-		cfg = parsePluginConfigYAML([]byte(key+": false\n"), cfg)
-		if cfg.SchedulerSessionAffinityEnabled {
-			t.Fatalf("session affinity config key %q was not accepted", key)
-		}
-	}
-}
-
-func TestAccountProtectionWarningLabelIsLastConfigGroupAndKeepsCompatibility(t *testing.T) {
-	const warningName = "开启账号保护调度（可能会影响缓存）"
-	wantLastGroup := []string{
-		warningName,
-		"Free 并发上限",
-		"Plus 并发上限",
-		"K12 并发上限",
-		"Team 并发上限",
-		"Pro 并发上限",
-		"Free 5 分钟 Token 上限",
-		"Plus 5 分钟 Token 上限",
-		"K12 5 分钟 Token 上限",
-		"Team 5 分钟 Token 上限",
-		"Pro 5 分钟 Token 上限",
-		"账号保护 Token 窗口秒数",
-		"账号保护预约超时秒数",
-	}
-	fields := pluginConfigFields()
-	if len(fields) < len(wantLastGroup) {
-		t.Fatalf("plugin config fields = %d, want at least %d", len(fields), len(wantLastGroup))
-	}
-	lastGroup := fields[len(fields)-len(wantLastGroup):]
-	for i, want := range wantLastGroup {
-		if lastGroup[i].Name != want {
-			t.Fatalf("last config group field %d = %q, want %q", i, lastGroup[i].Name, want)
-		}
-	}
-	for _, key := range []string{"account_protection_enabled", warningName, "开启账号保护调度"} {
-		cfg := legacyPluginConfig()
-		cfg.AccountProtectionEnabled = false
-		cfg = parsePluginConfigYAML([]byte(key+": true\n"), cfg)
-		if !cfg.AccountProtectionEnabled {
-			t.Fatalf("account protection config key %q was not accepted", key)
-		}
 	}
 }
 
@@ -457,78 +343,4 @@ func TestQueryHasXAIUsageUsesProviderIndexPath(t *testing.T) {
 	if found, err := queryHasXAIUsage(ctx, db, 0); err != nil || !found {
 		t.Fatalf("xAI usage found=%v err=%v", found, err)
 	}
-}
-
-func TestInvalidAuthUsesEventTimeSoNewAuthFileClearsOld401(t *testing.T) {
-	resetSchedulerStateForTest()
-	t.Cleanup(resetSchedulerStateForTest)
-	ctx := context.Background()
-	s := newTestStore(t)
-	authDir := os.Getenv("CPA_AUTH_DIR")
-	if err := os.MkdirAll(authDir, 0755); err != nil {
-		t.Fatalf("mkdir auth dir: %v", err)
-	}
-	authFile := "alice.cpa.json"
-	authPath := filepath.Join(authDir, authFile)
-	oldFailureAt := time.Now().Add(-10 * time.Minute).Truncate(time.Second)
-	newFileAt := oldFailureAt.Add(5 * time.Minute)
-	if err := os.WriteFile(authPath, []byte(`{"email":"alice@example.com","provider":"codex","access_token":"token"}`), 0600); err != nil {
-		t.Fatalf("write auth file: %v", err)
-	}
-	if err := os.Chtimes(authPath, newFileAt, newFileAt); err != nil {
-		t.Fatalf("chtimes auth file: %v", err)
-	}
-	db, _, err := s.open(ctx)
-	if err != nil {
-		t.Fatalf("open store: %v", err)
-	}
-
-	err = recordInvalidAuthIfNeeded(ctx, db, usageRecord{
-		Provider:    "codex",
-		AuthID:      "alice@example.com",
-		AuthIndex:   authFile,
-		AuthFile:    authFile,
-		Source:      "alice@example.com",
-		RequestedAt: oldFailureAt,
-		Failed:      true,
-		Failure:     usageFailure{StatusCode: 401},
-	}, 401)
-	if err != nil {
-		t.Fatalf("record invalid auth: %v", err)
-	}
-	invalids, err := queryActiveInvalidAuths(ctx, db)
-	if err != nil {
-		t.Fatalf("query invalids: %v", err)
-	}
-	if len(invalids) != 1 {
-		t.Fatalf("active invalids after record = %d, want 1", len(invalids))
-	}
-	if invalids[0].InvalidatedAt != oldFailureAt.Unix() {
-		t.Fatalf("invalidated_at = %d, want event time %d", invalids[0].InvalidatedAt, oldFailureAt.Unix())
-	}
-	generation := globalSchedulerState.generation("codex")
-	if err := clearReplacedInvalidAuths(ctx, db); err != nil {
-		t.Fatalf("clear replaced invalid auths: %v", err)
-	}
-	if globalSchedulerState.generation("codex") <= generation {
-		t.Fatal("replaced auth cleared 401 without invalidating scheduler state")
-	}
-	invalids, err = queryActiveInvalidAuths(ctx, db)
-	if err != nil {
-		t.Fatalf("query invalids after clear: %v", err)
-	}
-	if len(invalids) != 0 {
-		t.Fatalf("old 401 remained active after newer auth file: %+v", invalids)
-	}
-}
-
-func legacyPluginConfig() pluginConfig {
-	cfg := defaultPluginConfig()
-	cfg.SchedulingMode = "legacy"
-	return cfg
-}
-
-func TestMain(m *testing.M) {
-	globalAccountProtection.configure(legacyPluginConfig())
-	os.Exit(m.Run())
 }

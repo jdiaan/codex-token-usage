@@ -77,7 +77,8 @@ test('private management banner distinguishes missing, invalid, configured and r
   assert.doesNotMatch(configured, /危险|连接成功/);
   const failed = privateConfigBanner({...base,management_configured:true,last_error:'CPA management authentication failed (HTTP 401)'});
   assert.match(failed, /控制器错误：CPA management authentication failed/);
-  assert.equal(privateConfigBanner({scheduling_mode:'legacy'}), 'Legacy · 插件调度与原有账号保护。');
+  assert.match(privateConfigBanner({scheduling_mode:'legacy'}), /Codex 账号由 CPA 原生调度/);
+  assert.match(privateConfigBanner({...base, obsolete_config_keys:['scheduling_mode']}), /请从插件配置中删除废弃项：scheduling_mode/);
   assert.doesNotMatch(source, /请在插件配置中填写 management_url|或设置同名环境变量/);
 });
 

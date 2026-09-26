@@ -26,6 +26,25 @@ type fakeLifecycleHost struct {
 	mutateField    bool
 }
 
+func TestNativeProtocolFixture(t *testing.T) {
+	raw, err := handleMethod("scheduler.pick", []byte(`{"provider":"codex"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var response struct {
+		OK     bool                  `json:"ok"`
+		Result schedulerPickResponse `json:"result"`
+	}
+	if err := json.Unmarshal(raw, &response); err != nil || !response.OK || response.Result.Handled {
+		t.Fatalf("scheduler response: %s %v", raw, err)
+	}
+	if path := os.Getenv("CPA_NATIVE_RESPONSE_FIXTURE"); path != "" {
+		if err := os.WriteFile(path, raw, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 func (f *fakeLifecycleHost) Ready() bool { return f.ready }
 func (f *fakeLifecycleHost) List(context.Context) ([]hostAuthFileEntry, error) {
 	var list []hostAuthFileEntry
@@ -60,9 +79,6 @@ func (f *fakeLifecycleHost) SetDisabled(_ context.Context, s lifecycleSnapshot, 
 
 func nativeTestController(t *testing.T) (*authLifecycleController, *fakeLifecycleHost, *fakeLifecycleClock) {
 	t.Helper()
-	old := globalAccountProtection.config()
-	globalAccountProtection.configure(defaultPluginConfig())
-	t.Cleanup(func() { globalAccountProtection.configure(old) })
 	s := newTestStore(t)
 	clock := &fakeLifecycleClock{now: time.Date(2030, 1, 1, 10, 0, 0, 0, time.UTC)}
 	host := &fakeLifecycleHost{ready: true, accounts: map[string]lifecycleSnapshot{}}
@@ -143,10 +159,6 @@ func TestNativeIsolationAndRecoveryAcrossRestart(t *testing.T) {
 	lifecycleFailure(t, c, "b", 429, `{"error":{"type":"usage_limit_reached","resets_in_seconds":3600}}`)
 	if !host.accounts["a"].Entry.Disabled || !host.accounts["b"].Entry.Disabled || host.accounts["c"].Entry.Disabled || host.accounts["d"].Entry.Disabled {
 		t.Fatal("incorrect isolation")
-	}
-	resp, err := c.store.pickAuth(context.Background(), schedulerPickRequest{Provider: "codex", Candidates: []schedulerAuthCandidate{{ID: "a.json", Provider: "codex"}}})
-	if err != nil || resp.Handled || resp.AuthID != "" || resp.DelegateBuiltin != "" {
-		t.Fatalf("native interfered: %+v %v", resp, err)
 	}
 	c.store.close() // reopen durable state with a new controller
 	restarted := &authLifecycleController{store: c.store, host: host, clock: clock, wake: make(chan struct{}, 1)}
@@ -243,34 +255,6 @@ func TestNativeDisablesRateButNotModel403Or5xx(t *testing.T) {
 	}
 }
 
-func TestNativeVersionedActionsAndLegacyRecovery(t *testing.T) {
-	c, host, clock := nativeTestController(t)
-	s := lifecycleStateForTest(t, c, "a")
-	if _, err := c.action(context.Background(), lifecycleActionRequest{AuthIndex: "a", Version: s.Version + 1, Action: "disable"}); !errors.Is(err, errLifecycleConflict) {
-		t.Fatal("missing optimistic concurrency")
-	}
-	if _, err := c.action(context.Background(), lifecycleActionRequest{AuthIndex: "a", Version: s.Version, Action: "disable"}); err != nil {
-		t.Fatal(err)
-	}
-	s = lifecycleStateForTest(t, c, "a")
-	if s.DisabledByPlugin || !host.accounts["a"].Entry.Disabled {
-		t.Fatal("manual ownership incorrect")
-	}
-	if _, err := c.action(context.Background(), lifecycleActionRequest{AuthIndex: "a", Version: s.Version, Action: "clear"}); err != nil {
-		t.Fatal(err)
-	}
-	if !host.accounts["a"].Entry.Disabled {
-		t.Fatal("clear enabled account")
-	}
-	lifecycleFailure(t, c, "b", 429, `{"error":{"type":"usage_limit_reached","resets_in_seconds":30}}`)
-	globalAccountProtection.configure(legacyPluginConfig())
-	clock.now = clock.now.Add(time.Minute)
-	c.reconcile(context.Background())
-	if host.accounts["b"].Entry.Disabled || !host.accounts["a"].Entry.Disabled {
-		t.Fatal("legacy lost existing recovery obligation")
-	}
-}
-
 func TestNativeManagementClientPreservesJSONAndExactIdentity(t *testing.T) {
 	physical := `{"access_token":"test-access-secret","refresh_token":"test-refresh-secret","type":"codex","disabled":false,"priority":10,"weight":3,"excluded-models":["premium"],"unknown":{"number":9007199254740993}}`
 	entry := hostAuthFileEntry{AuthIndex: "index", ID: "auth.json", Name: "auth.json", Path: "/auth/auth.json", Provider: "codex"}
@@ -317,29 +301,5 @@ func TestNativeManagementClientPreservesJSONAndExactIdentity(t *testing.T) {
 	}
 	if _, err = client.Read(context.Background(), "other"); err == nil {
 		t.Fatal("ambiguous identity accepted")
-	}
-}
-
-func TestNativeProtocolFixture(t *testing.T) {
-	c, _, _ := nativeTestController(t)
-	response, err := c.store.pickAuth(context.Background(), schedulerPickRequest{Provider: "codex"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	raw, err := okJSON(response)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var envelopeValue envelope
-	if err = json.Unmarshal(raw, &envelopeValue); err != nil || !envelopeValue.OK {
-		t.Fatal("bad envelope")
-	}
-	if string(envelopeValue.Result) != `{"AuthID":"","DelegateBuiltin":"","Handled":false}` {
-		t.Fatalf("native wire response=%s", raw)
-	}
-	if path := os.Getenv("CPA_NATIVE_RESPONSE_FIXTURE"); path != "" {
-		if err = os.WriteFile(path, raw, 0600); err != nil {
-			t.Fatal(err)
-		}
 	}
 }

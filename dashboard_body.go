@@ -21,13 +21,6 @@ const dashboardBody = `</style>
   <div class="tabs" role="tablist" aria-label="统计页面">
     <div class="tab-strip" id="tab-strip">
       <button class="tab active" data-target="codex" role="tab" aria-selected="true">Codex 账号池<span class="tab-count" id="tab-codex-count">-</span></button>
-      <button class="tab" data-target="xai" role="tab" aria-selected="false" hidden>xAI 账号池<span class="tab-count" id="tab-xai-count">-</span></button>
-      <button class="tab" data-target="providers" role="tab" aria-selected="false">AI 总览<span class="tab-count" id="tab-provider-count">-</span></button>
-      <span id="provider-tabs" class="tab-strip"></span>
-    </div>
-    <div class="provider-picker" id="provider-picker">
-      <button class="ghost" id="provider-picker-button" type="button">显示接入点</button>
-      <div class="picker-panel" id="provider-picker-panel"></div>
     </div>
   </div>
   <section data-page="codex" class="page-on">
@@ -60,34 +53,7 @@ const dashboardBody = `</style>
   <section class="section" style="margin-top:8px"><h2><span>自动禁用状态</span><span class="mini">429 按 reset_at 恢复，401/402 处理认证文件后解除</span></h2><div class="section-body"><div class="autoban-toolbar"><span id="autoban-scope" class="autoban-scope">显示 0 / 0 个自动禁用账号</span><select id="autoban-page-size" aria-label="自动禁用每页数量"><option value="10">10 / 页</option><option value="25">25 / 页</option><option value="50">50 / 页</option></select><button id="autoban-prev" class="ghost" aria-label="上一页自动禁用账号">上一页</button><span id="autoban-page-label" class="page-label">1 / 1</span><button id="autoban-next" class="ghost" aria-label="下一页自动禁用账号">下一页</button></div><div class="scroll autoban-table-wrap"><table><thead><tr><th>账号</th><th>AuthIndex</th><th>窗口</th><th>原因</th><th>封禁时间</th><th>解禁时间</th><th>剩余</th><th>窗口 1</th><th>窗口 2</th></tr></thead><tbody id="autobans"></tbody></table></div></div></section>
   <section class="section" style="margin-top:8px"><h2><span>最近请求</span><span class="mini">Codex 最近 30 条</span></h2><div class="scroll recent-table-wrap"><table><thead><tr><th>模型</th><th>时间</th><th>耗时</th><th>Tokens</th><th>费用</th><th>详情</th></tr></thead><tbody id="recent"></tbody></table></div></section>
   </section>
-  <section data-page="providers">
-    <div class="command-grid">
-      <section class="section"><h2><span>AI 接入点总览</span><span class="mini">不计入 Codex 账号池价格和额度</span></h2><div class="section-body"><div class="cards">
-        <div class="metric" style="--accent:var(--blue)"><div class="label">请求数</div><div class="value" id="pm-requests">-</div><div class="sub" id="pm-success">成功率 -</div></div>
-        <div class="metric" style="--accent:var(--cyan)"><div class="label">总 Token</div><div class="value" id="pm-total">-</div><div class="sub">其他 AI Provider 合计</div></div>
-        <div class="metric" style="--accent:var(--blue)"><div class="label">费用估算</div><div class="value" id="pm-cost">-</div><div class="sub" id="pm-cost-sub">按模型价格估算</div></div>
-        <div class="metric" style="--accent:var(--cyan)"><div class="label">输入 Token</div><div class="value" id="pm-input">-</div><div class="sub" id="pm-input-share">占比 -</div></div>
-        <div class="metric" style="--accent:var(--violet)"><div class="label">输出 Token</div><div class="value" id="pm-output">-</div><div class="sub" id="pm-output-share">占比 -</div></div>
-        <div class="metric" style="--accent:var(--orange)"><div class="label">缓存 Token</div><div class="value" id="pm-cache">-</div><div class="sub" id="pm-cache-share">缓存率 -</div></div>
-        <div class="metric" style="--accent:var(--red)"><div class="label">429 次数</div><div class="value bad" id="pm-429">-</div><div class="sub">Provider 限流</div></div>
-        <div class="metric" style="--accent:var(--blue)"><div class="label">接入点</div><div class="value" id="pm-providers">-</div><div class="sub">Provider / endpoint</div></div>
-        <div class="metric" style="--accent:var(--cyan)"><div class="label">模型数</div><div class="value" id="pm-models">-</div><div class="sub">按模型聚合</div></div>
-        <div class="metric" style="--accent:var(--violet)"><div class="label">Top 接入点</div><div class="value" id="pm-topshare">-</div><div class="sub">Token 集中度</div></div>
-        <div class="metric" style="--accent:var(--blue)"><div class="label">平均耗时</div><div class="value" id="pm-latency">-</div><div class="sub" id="pm-latency-sub">慢请求 -</div></div>
-        <div class="metric" style="--accent:var(--cyan)"><div class="label">首 Token</div><div class="value" id="pm-ttft">-</div><div class="sub" id="pm-ttft-sub">慢首包 -</div></div>
-        <div class="metric" style="--accent:var(--violet)"><div class="label">输出速度</div><div class="value" id="pm-throughput">-</div><div class="sub">输出 Token / 秒</div></div>
-      </div></div></section>
-      <section class="section"><h2><span>Token 结构</span><span class="mini">其他 AI Provider</span></h2><div class="section-body"><div class="mix" id="provider-token-mix"></div></div></section>
-    </div>
-    <div class="layout">
-      <section class="section"><h2><span>Provider / 接入点总览</span><span class="mini">按 Provider 名称聚合，不进入 Codex 账号池</span></h2><div class="scroll"><table><thead><tr><th>Provider</th><th>请求</th><th>成功率</th><th>性能</th><th>总 Token</th><th>费用</th><th>输入</th><th>输出</th><th>缓存</th><th>缓存率</th><th>账号数</th><th>模型数</th><th>429</th><th>最近</th></tr></thead><tbody id="providers"></tbody></table></div></section>
-      <section class="section"><h2><span>用量趋势</span><span class="mini">其他 AI Provider</span></h2><div class="section-body"><svg id="provider-trend" class="chart" viewBox="0 0 900 270" preserveAspectRatio="none"></svg><div class="legend"><span><i class="dot" style="background:var(--blue)"></i>请求</span><span><i class="dot" style="background:var(--cyan)"></i>总 Token</span><span><i class="dot" style="background:var(--orange)"></i>输出 Token</span></div></div></section>
-    </div>
-    <section class="section" style="margin-top:8px"><h2><span>CPA 多 Key 用量</span><span class="mini">按 CPA 对外 Key 聚合模型、协议和 Token 额度</span></h2><div class="scroll key-summary-table-wrap"><table><thead><tr><th>Key</th><th>协议</th><th>接入点</th><th>请求</th><th>成功率</th><th>Token / 费用</th><th>模型数</th><th>429</th><th>最近</th></tr></thead><tbody id="key-summaries"></tbody></table></div></section>
-    <section class="section" style="margin-top:8px"><h2><span>模型排行</span><span class="mini">其他 AI Provider</span></h2><div class="scroll model-table-wrap"><table><thead><tr><th>模型</th><th>别名</th><th>Provider</th><th>请求</th><th>总 Token</th><th>费用</th><th>性能</th><th>输入</th><th>输出</th><th>缓存</th><th>缓存率</th></tr></thead><tbody id="provider-models"></tbody></table></div></section>
-    <section class="section" style="margin-top:8px"><h2><span>最近请求</span><span class="mini">其他 AI Provider 最近 30 条</span></h2><div class="scroll recent-table-wrap"><table><thead><tr><th>模型</th><th>时间</th><th>耗时</th><th>Tokens</th><th>费用</th><th>详情</th></tr></thead><tbody id="provider-recent"></tbody></table></div></section>
-  </section>
-  <div id="provider-pages"></div>
+
 </main>
 <div id="auth-import-modal" class="modal-backdrop" hidden>
   <div class="modal-panel auth-import-panel" role="dialog" aria-modal="true" aria-labelledby="auth-import-title">
@@ -195,7 +161,6 @@ const dashboardBody = `</style>
     <div class="modal-head"><h2 id="log-export-title">导出日志</h2><button id="log-export-close" class="icon-button ghost" type="button" aria-label="关闭导出日志">×</button></div>
     <div class="modal-body log-export-grid">
       <label class="form-row"><span>账号</span><select id="log-export-account"><option value="">全部账号</option></select></label>
-      <label class="form-row"><span>接入点</span><select id="log-export-provider"><option value="">全部接入点</option></select></label>
       <label class="form-row"><span>日期</span><input id="log-export-date" type="date"></label>
       <label class="form-row"><span>模型</span><select id="log-export-model"><option value="">全部模型</option></select></label>
       <label class="form-row"><span>状态</span><select id="log-export-status"><option value="all">全部状态</option><option value="success">成功</option><option value="failed">失败</option><option value="401">401</option><option value="402">402</option><option value="403">403</option><option value="429">429</option><option value="5xx">5xx</option></select></label>

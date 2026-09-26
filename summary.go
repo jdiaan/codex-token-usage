@@ -61,9 +61,6 @@ type storeRevision struct {
 	BanActive         int64
 	BanMaxChanged     int64
 	NextBanResetAt    int64
-	XAIStateActive    int64
-	XAIStateChanged   int64
-	NextXAIResetAt    int64
 	AuthFilesRevision string
 }
 
@@ -775,12 +772,6 @@ WHERE active=1`).Scan(&r.InvalidActive, &r.InvalidMaxChanged); err != nil {
 		return storeRevision{}, err
 	}
 	if err := db.QueryRowContext(ctx, `
-SELECT COUNT(*), COALESCE(MAX(observed_at),0), COALESCE(MIN(CASE WHEN active=1 AND reset_at>0 THEN reset_at END),0)
-FROM xai_account_states
-WHERE active=1`).Scan(&r.XAIStateActive, &r.XAIStateChanged, &r.NextXAIResetAt); err != nil {
-		return storeRevision{}, err
-	}
-	if err := db.QueryRowContext(ctx, `
 SELECT COUNT(*),
   COALESCE(MAX(CASE WHEN released_at > banned_at THEN released_at ELSE banned_at END),0),
   COALESCE(MIN(CASE WHEN active=1 THEN reset_at END),0)
@@ -795,12 +786,10 @@ WHERE active=1 OR released_at > 0`).Scan(&r.BanActive, &r.BanMaxChanged, &r.Next
 	r.AuthFilesRevision = authFilesRevision()
 	r.Revision = strings.Join([]string{
 		"l:" + strconv.FormatInt(lifecycleRevision, 10),
-		"mode:" + globalAccountProtection.config().SchedulingMode,
 		"u:" + strconv.FormatInt(r.UsageMaxID, 10),
 		"q:" + strconv.FormatInt(r.QuotaMaxID, 10),
 		"i:" + strconv.FormatInt(r.InvalidActive, 10) + ":" + strconv.FormatInt(r.InvalidMaxChanged, 10),
 		"b:" + strconv.FormatInt(r.BanActive, 10) + ":" + strconv.FormatInt(r.BanMaxChanged, 10) + ":" + strconv.FormatInt(r.NextBanResetAt, 10),
-		"x:" + strconv.FormatInt(r.XAIStateActive, 10) + ":" + strconv.FormatInt(r.XAIStateChanged, 10) + ":" + strconv.FormatInt(r.NextXAIResetAt, 10),
 		"a:" + r.AuthFilesRevision,
 	}, "|")
 	return r, nil
@@ -876,29 +865,7 @@ func (s *store) summaryOnce(ctx context.Context, window string, limit int) (map[
 	if err := applyCosts(ctx, db, since, &totals, prices, "codex"); err != nil {
 		return nil, err
 	}
-	providerTotals, err := queryOneTotals(ctx, db, since, "other")
-	if err != nil {
-		return nil, err
-	}
-	if err := applyCosts(ctx, db, since, &providerTotals, prices, "other"); err != nil {
-		return nil, err
-	}
 	now := time.Now().Unix()
-	configuredXAIAccounts := readConfiguredXAIAccounts()
-	xaiHasUsage, err := queryHasXAIUsage(ctx, db, since)
-	if err != nil {
-		return nil, err
-	}
-	var xaiTotals totalsRow
-	if xaiHasUsage {
-		xaiTotals, err = queryOneTotals(ctx, db, since, "xai")
-		if err != nil {
-			return nil, err
-		}
-		if err := applyCosts(ctx, db, since, &xaiTotals, prices, "xai"); err != nil {
-			return nil, err
-		}
-	}
 	accounts, err := queryAccounts(ctx, db, since, limit, "codex")
 	if err != nil {
 		return nil, err
@@ -912,27 +879,6 @@ func (s *store) summaryOnce(ctx context.Context, window string, limit int) (map[
 	hostAuthInventoryAuthoritative := hostAuthInventoryErr == nil
 	accounts = mergeConfiguredAccounts(accounts, configuredAccounts)
 	accounts = filterCurrentConfiguredAccounts(accounts, configuredAccounts, authDirReadable)
-	if globalAccountProtection.enabled() {
-		applyAccountProtectionState(ctx, db, accounts)
-	}
-	var xaiAccounts []accountRow
-	if xaiHasUsage {
-		xaiAccounts, err = queryAccounts(ctx, db, since, limit, "xai")
-		if err != nil {
-			return nil, err
-		}
-		if err := applyScopedAccountCosts(ctx, db, since, xaiAccounts, prices, "xai"); err != nil {
-			return nil, err
-		}
-	}
-	xaiAccounts = mergeConfiguredAccounts(xaiAccounts, configuredXAIAccounts)
-	xaiAccounts = filterCurrentConfiguredAccounts(xaiAccounts, configuredXAIAccounts, globalXAIAuthSource.authoritative())
-	xaiStates, err := queryActiveXAIStates(ctx, db, now)
-	if err != nil {
-		return nil, err
-	}
-	xaiStates = filterMissingXAIStateRows(xaiStates, configuredXAIAccounts, globalXAIAuthSource.authoritative())
-	applyXAIStates(xaiAccounts, xaiStates)
 	quotaSince := time.Now().Add(-35 * 24 * time.Hour).Unix()
 	applyLatestQuotaSnapshots(ctx, db, accounts, quotaSince)
 	applySecondaryQuotaEstimates(ctx, db, accounts, &totals, quotaSince)
@@ -959,21 +905,6 @@ func (s *store) summaryOnce(ctx context.Context, window string, limit int) (map[
 		return nil, err
 	}
 	applyQuotaTriggerStatuses(accounts, triggerRuns)
-	providers, err := queryProviders(ctx, db, since, limit, "other")
-	if err != nil {
-		return nil, err
-	}
-	if err := applyProviderCosts(ctx, db, since, providers, prices, "other"); err != nil {
-		return nil, err
-	}
-	providers = mergeConfiguredProviders(providers, readConfiguredProviderNames())
-	keySummaries, err := queryKeySummaries(ctx, db, since, limit)
-	if err != nil {
-		return nil, err
-	}
-	if err := applyKeySummaryCosts(ctx, db, since, keySummaries, prices); err != nil {
-		return nil, err
-	}
 	models, err := queryModels(ctx, db, since, limit, "codex")
 	if err != nil {
 		return nil, err
@@ -981,84 +912,34 @@ func (s *store) summaryOnce(ctx context.Context, window string, limit int) (map[
 	if err := applyModelCosts(ctx, db, since, models, prices, "codex"); err != nil {
 		return nil, err
 	}
-	providerModels, err := queryModels(ctx, db, since, limit, "other")
-	if err != nil {
-		return nil, err
-	}
-	if err := applyModelCosts(ctx, db, since, providerModels, prices, "other"); err != nil {
-		return nil, err
-	}
-	var xaiModels []modelRow
-	if xaiHasUsage {
-		xaiModels, err = queryModels(ctx, db, since, limit, "xai")
-		if err != nil {
-			return nil, err
-		}
-		if err := applyModelCosts(ctx, db, since, xaiModels, prices, "xai"); err != nil {
-			return nil, err
-		}
-	}
 	trend, err := queryTrend(ctx, db, since, label, "codex")
 	if err != nil {
 		return nil, err
-	}
-	providerTrend, err := queryTrend(ctx, db, since, label, "other")
-	if err != nil {
-		return nil, err
-	}
-	var xaiTrend []trendPoint
-	if xaiHasUsage {
-		xaiTrend, err = queryTrend(ctx, db, since, label, "xai")
-		if err != nil {
-			return nil, err
-		}
 	}
 	recent, err := queryRecent(ctx, db, since, 30, "codex", prices)
 	if err != nil {
 		return nil, err
 	}
-	providerRecent, err := queryProviderRecent(ctx, db, since, 30, providerRecentLimit(limit), prices)
+	autobans, err := queryLifecycleAutobans(ctx, db, now)
 	if err != nil {
 		return nil, err
-	}
-	var xaiRecent []recentRow
-	if xaiHasUsage {
-		xaiRecent, err = queryRecent(ctx, db, since, 30, "xai", prices)
-		if err != nil {
-			return nil, err
-		}
-	}
-	autobans, err := queryActiveAutobans(ctx, db, now)
-	if err != nil {
-		return nil, err
-	}
-	if nativeScheduling() {
-		autobans, err = queryLifecycleAutobans(ctx, db, now)
-		if err != nil {
-			return nil, err
-		}
-	} else {
-		autobans = filterMissingAutobanRows(autobans, configuredAccounts, authDirReadable)
-		autobans = mergeEffectiveAutobans(autobans, invalidAuths)
 	}
 	applyAccountQuotaToAutobans(autobans, accounts)
-	diagnostics := buildDiagnostics(ctx, db, path, accounts, providers, unauthorizedInvalidAuths, autobans, externalUseAlerts)
+	diagnostics := buildDiagnostics(ctx, db, path, accounts, nil, unauthorizedInvalidAuths, autobans, externalUseAlerts)
 	if err := applyLifecycleSummary(ctx, db, accounts); err != nil {
 		return nil, err
 	}
 	controllerStatus := globalAuthLifecycle.status()
-	if nativeScheduling() {
-		events, eventErr := queryLifecycleEventDiagnostics(ctx, db)
-		if eventErr != nil {
-			return nil, eventErr
-		}
-		controllerStatus["events"] = events
-		pendingAccounts, pendingErr := queryLifecycleRows(ctx, db, now, true)
-		if pendingErr != nil {
-			return nil, pendingErr
-		}
-		controllerStatus["pending_accounts"] = pendingAccounts
+	events, eventErr := queryLifecycleEventDiagnostics(ctx, db)
+	if eventErr != nil {
+		return nil, eventErr
 	}
+	controllerStatus["events"] = events
+	pendingAccounts, pendingErr := queryLifecycleRows(ctx, db, now, true)
+	if pendingErr != nil {
+		return nil, pendingErr
+	}
+	controllerStatus["pending_accounts"] = pendingAccounts
 	result := map[string]any{
 		"auth_controller":             controllerStatus,
 		"plugin":                      pluginID,
@@ -1068,22 +949,10 @@ func (s *store) summaryOnce(ctx context.Context, window string, limit int) (map[
 		"since_unix":                  since,
 		"db_path":                     path,
 		"totals":                      totals,
-		"provider_totals":             providerTotals,
-		"xai_totals":                  xaiTotals,
 		"accounts":                    accounts,
-		"xai_accounts":                xaiAccounts,
-		"providers":                   providers,
-		"key_summaries":               keySummaries,
 		"models":                      models,
-		"provider_models":             providerModels,
-		"xai_models":                  xaiModels,
 		"trend":                       trend,
-		"provider_trend":              providerTrend,
-		"xai_trend":                   xaiTrend,
 		"recent":                      recent,
-		"provider_recent":             providerRecent,
-		"xai_recent":                  xaiRecent,
-		"xai_states":                  xaiStates,
 		"autobans":                    autobans,
 		"invalid_auths":               unauthorizedInvalidAuths,
 		"forbidden_auths":             forbiddenInvalidAuths,
@@ -1252,19 +1121,9 @@ type accountRow struct {
 	WorkspaceDeactivatedAt          string              `json:"workspace_deactivated_at,omitempty"`
 	WorkspaceDeactivatedReason      string              `json:"workspace_deactivated_reason,omitempty"`
 	PlanType                        string              `json:"plan_type,omitempty"`
-	XAITier                         string              `json:"xai_tier,omitempty"`
-	XAITierSource                   string              `json:"xai_tier_source,omitempty"`
-	XAITierDetail                   string              `json:"xai_tier_detail,omitempty"`
 	RuntimeStatus                   string              `json:"runtime_status,omitempty"`
 	RuntimeMessage                  string              `json:"runtime_message,omitempty"`
 	RuntimeUnavailable              bool                `json:"runtime_unavailable,omitempty"`
-	XAIState                        string              `json:"xai_state,omitempty"`
-	XAIStateReason                  string              `json:"xai_state_reason,omitempty"`
-	XAIStateObservedAt              string              `json:"xai_state_observed_at,omitempty"`
-	XAIStateResetAt                 int64               `json:"xai_state_reset_at,omitempty"`
-	XAIStateResetAtText             string              `json:"xai_state_reset_at_text,omitempty"`
-	XAIStateSecondsRemaining        int64               `json:"xai_state_seconds_remaining,omitempty"`
-	XAILastStatusCode               int                 `json:"xai_last_status_code,omitempty"`
 	ProtectionPlan                  string              `json:"protection_plan,omitempty"`
 	ProtectionInFlight              int                 `json:"protection_in_flight,omitempty"`
 	ProtectionConcurrencyLimit      int                 `json:"protection_concurrency_limit,omitempty"`
@@ -1347,9 +1206,6 @@ type configuredAccount struct {
 	Disabled           bool
 	Expired            bool
 	PlanType           string
-	XAITier            string
-	XAITierSource      string
-	XAITierDetail      string
 	RuntimeStatus      string
 	RuntimeMessage     string
 	RuntimeUnavailable bool
@@ -1579,12 +1435,14 @@ func usageScopeSQL(scope string) string {
 	return usageScopeSQLWithEntries(scope, readConfiguredProviderEntries())
 }
 
-func usageScopeSQLWithEntries(scope string, entries []providerConfigEntry) string {
-	codexAccount := `((LOWER(COALESCE(NULLIF(provider,''), '')) = 'codex' OR LOWER(COALESCE(NULLIF(executor_type,''), '')) LIKE '%codex%')
+const codexOAuthUsageSQL = `((LOWER(COALESCE(NULLIF(provider,''), '')) = 'codex' OR LOWER(COALESCE(NULLIF(executor_type,''), '')) LIKE '%codex%')
 AND LOWER(COALESCE(NULLIF(auth_type,''), '')) NOT IN ('apikey', 'api_key', 'key')
 AND LOWER(COALESCE(NULLIF(auth_id,''), '')) NOT LIKE 'codex:apikey:%'
 AND COALESCE(NULLIF(source,''), '') NOT LIKE 'sk-%'
 AND COALESCE(NULLIF(source,''), '') NOT LIKE 'Bearer sk-%')`
+
+func usageScopeSQLWithEntries(scope string, entries []providerConfigEntry) string {
+	codexAccount := codexOAuthUsageSQL
 	codexAPIKey := codexAPIKeyProviderScopeSQL(entries)
 	xaiAccount := `(LOWER(COALESCE(NULLIF(provider,''), '')) = 'xai' OR LOWER(COALESCE(NULLIF(executor_type,''), '')) LIKE '%xai%')`
 	switch strings.ToLower(strings.TrimSpace(scope)) {
@@ -1718,22 +1576,6 @@ func readConfiguredAuthAccounts() []configuredAccount {
 	return out
 }
 
-func readConfiguredXAIAccounts() []configuredAccount {
-	accounts, err := globalXAIAuthSource.hostAccounts()
-	if err == nil {
-		return accounts
-	}
-	files := readConfiguredAuthFiles()
-	out := make([]configuredAccount, 0, len(files))
-	for _, file := range files {
-		if strings.EqualFold(strings.TrimSpace(file.Provider), "xai") {
-			out = append(out, file)
-		}
-	}
-	globalXAIAuthSource.markFilesystemFallback(out, err)
-	return out
-}
-
 type configuredAuthFilesCacheState struct {
 	mu       sync.Mutex
 	dir      string
@@ -1788,10 +1630,6 @@ func readConfiguredAuthFiles() []configuredAccount {
 		name := stringFromAny(doc["name"])
 		authFile := entry.Name()
 		source := firstNonEmptyString(email, name, authFile)
-		xaiTier := xaiTierClassification{}
-		if strings.EqualFold(authType, "xai") {
-			xaiTier = classifyXAITierDocument(doc)
-		}
 		planType := configuredAuthPlanType(doc)
 		out = append(out, configuredAccount{
 			AuthIndex:        authFile,
@@ -1807,9 +1645,6 @@ func readConfiguredAuthFiles() []configuredAccount {
 			Disabled:         boolFromAny(doc["disabled"]),
 			Expired:          boolFromAny(doc["expired"]),
 			PlanType:         planType,
-			XAITier:          xaiTier.Tier,
-			XAITierSource:    xaiTier.Source,
-			XAITierDetail:    xaiTier.Detail,
 			AccessToken: firstNonEmptyString(
 				stringFromAny(doc["access_token"]),
 				stringFromAny(doc["accessToken"]),
@@ -2367,9 +2202,6 @@ func mergeConfiguredAccounts(accounts []accountRow, configured []configuredAccou
 			Disabled:           cfg.Disabled,
 			Expired:            cfg.Expired,
 			PlanType:           cfg.PlanType,
-			XAITier:            cfg.XAITier,
-			XAITierSource:      cfg.XAITierSource,
-			XAITierDetail:      cfg.XAITierDetail,
 			RuntimeStatus:      cfg.RuntimeStatus,
 			RuntimeMessage:     cfg.RuntimeMessage,
 			RuntimeUnavailable: cfg.RuntimeUnavailable,
@@ -2454,9 +2286,6 @@ func enrichConfiguredAccount(row *accountRow, cfg configuredAccount) {
 	row.Disabled = cfg.Disabled
 	row.Expired = cfg.Expired
 	row.PlanType = firstNonEmptyString(row.PlanType, cfg.PlanType)
-	row.XAITier = firstNonEmptyString(row.XAITier, cfg.XAITier)
-	row.XAITierSource = firstNonEmptyString(row.XAITierSource, cfg.XAITierSource)
-	row.XAITierDetail = firstNonEmptyString(row.XAITierDetail, cfg.XAITierDetail)
 	row.RuntimeStatus = firstNonEmptyString(row.RuntimeStatus, cfg.RuntimeStatus)
 	row.RuntimeMessage = firstNonEmptyString(row.RuntimeMessage, cfg.RuntimeMessage)
 	row.RuntimeUnavailable = row.RuntimeUnavailable || cfg.RuntimeUnavailable

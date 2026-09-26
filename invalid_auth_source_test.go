@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"database/sql"
-	"fmt"
 	"net/http"
 	"path/filepath"
 	"testing"
@@ -88,96 +87,6 @@ UPDATE invalid_auths SET auth_source_kind='unknown' WHERE auth_id='old-id';`); e
 	}
 }
 
-func TestRuntimeInvalidAuthDoesNotAffectSameEmailSibling(t *testing.T) {
-	invalid := invalidAuthRow{
-		AuthID: "runtime-id", AuthIndex: "runtime-index", Source: "same@example.com",
-		AuthSourceKind: authSourceKindRuntimeOnly, LastStatusCode: http.StatusUnauthorized,
-	}
-	accounts := []accountRow{
-		{AuthID: "file-id", AuthIndex: "file-index", AuthFile: "file.json", Email: "same@example.com"},
-		{AuthID: "runtime-id", AuthIndex: "runtime-index", Email: "same@example.com"},
-	}
-	applyInvalidAuths(accounts, []invalidAuthRow{invalid})
-	if accounts[0].InvalidAuth {
-		t.Fatalf("same-email physical sibling was marked invalid: %+v", accounts[0])
-	}
-	if !accounts[1].InvalidAuth {
-		t.Fatalf("matching runtime account was not marked invalid: %+v", accounts[1])
-	}
-
-	physical := configuredAccount{AuthID: "file-id", AuthIndex: "file-index", AuthFile: "file.json", Email: "same@example.com"}
-	runtime := configuredAccount{AuthID: "runtime-id", AuthIndex: "runtime-index", Email: "same@example.com", AuthSourceKind: authSourceKindRuntimeOnly}
-	if configuredMatchesInvalidAuth(physical, []invalidAuthRow{invalid}) {
-		t.Fatal("quota trigger treated same-email physical sibling as invalid")
-	}
-	if !configuredMatchesInvalidAuth(runtime, []invalidAuthRow{invalid}) {
-		t.Fatal("quota trigger did not match the exact runtime identity")
-	}
-
-	physicalCandidate := schedulerAuthCandidate{ID: "file-id", Provider: "codex", Attributes: map[string]string{"auth_index": "file-index", "auth_file": "file.json", "email": "same@example.com"}}
-	runtimeCandidate := schedulerAuthCandidate{ID: "runtime-id", Provider: "codex", Attributes: map[string]string{"auth_index": "runtime-index", "email": "same@example.com"}}
-	if candidateMatchesInvalidAuth(physicalCandidate, []invalidAuthRow{invalid}) {
-		t.Fatal("scheduler blocked same-email physical sibling")
-	}
-	if !candidateMatchesInvalidAuth(runtimeCandidate, []invalidAuthRow{invalid}) {
-		t.Fatal("scheduler did not block the exact runtime identity")
-	}
-	available, filtered, filteredCount, _, matchedInvalids := filterCodexSchedulerCandidates(
-		[]schedulerAuthCandidate{physicalCandidate, runtimeCandidate}, nil, []invalidAuthRow{invalid},
-	)
-	if !filtered || filteredCount != 1 || len(available) != 1 || available[0].ID != "file-id" || len(matchedInvalids) != 1 {
-		t.Fatalf("scheduler filter result available=%+v filtered=%v count=%d matched=%v", available, filtered, filteredCount, matchedInvalids)
-	}
-}
-
-func TestFileInvalidAuthMatchesFilesystemShapedCandidateByAuthFile(t *testing.T) {
-	invalid := invalidAuthRow{
-		AuthID: "stable-host-id", AuthIndex: "opaque-host-index", AuthFile: "file.json",
-		AuthSourceKind: authSourceKindFile, LastStatusCode: http.StatusUnauthorized,
-	}
-	filesystem := configuredAccount{
-		AuthID: "same@example.com", AuthIndex: "file.json", AuthFile: "file.json", Email: "same@example.com", AuthSourceKind: authSourceKindFile,
-	}
-	if !configuredMatchesInvalidAuth(filesystem, []invalidAuthRow{invalid}) {
-		t.Fatal("quota trigger did not match host-recorded 401 to filesystem-shaped credential")
-	}
-	mixedInventory := []configuredAccount{
-		filesystem,
-		{AuthID: "unrelated-stable-id", AuthIndex: "unrelated-index", AuthFile: "other.json", AuthSourceKind: authSourceKindFile},
-	}
-	match, ok := matchCodexHostAuthInventoryExact(invalid, mixedInventory)
-	if !ok || match.AuthFile != "file.json" {
-		t.Fatalf("mixed filesystem/stable inventory match = %+v, %v", match, ok)
-	}
-	accounts := []accountRow{
-		{AuthID: "same@example.com", AuthIndex: "file.json", AuthFile: "file.json", Email: "same@example.com"},
-		{AuthID: "unrelated-stable-id", AuthIndex: "unrelated-index", AuthFile: "other.json"},
-	}
-	applyInvalidAuths(accounts, []invalidAuthRow{invalid})
-	if !accounts[0].InvalidAuth {
-		t.Fatal("summary did not apply host-recorded 401 to filesystem-shaped account")
-	}
-	if accounts[1].InvalidAuth {
-		t.Fatal("summary applied file 401 to unrelated stable sibling")
-	}
-}
-
-func TestFileInvalidAuthMatchesStableSchedulerIDWithFilenameAuthIndex(t *testing.T) {
-	invalid := invalidAuthRow{
-		AuthID: "stable-host-id", AuthIndex: "stable-host-index", AuthFile: "file.json",
-		AuthSourceKind: authSourceKindFile, LastStatusCode: http.StatusUnauthorized,
-	}
-	candidate := schedulerAuthCandidate{
-		ID: "stable-host-id", Provider: "codex", Attributes: map[string]string{
-			"auth_index": "file.json",
-			"auth_file":  "file.json",
-		},
-	}
-	if !candidateMatchesInvalidAuth(candidate, []invalidAuthRow{invalid}) {
-		t.Fatal("scheduler candidate did not match the same stable ID and physical file")
-	}
-}
-
 func TestClassifyAndFilterInvalidAuthRowsUsesExactHostInventory(t *testing.T) {
 	inventory := []configuredAccount{
 		{AuthID: "file-id", AuthIndex: "file-index", AuthFile: "file.json", AuthSourceKind: authSourceKindFile},
@@ -222,70 +131,5 @@ func TestInvalidAuthSummaryFilters401And403Separately(t *testing.T) {
 	applyInvalidAuthToAccount(&account, forbidden[0])
 	if !account.InvalidAuth || account.InvalidAuthStatusCode != http.StatusForbidden {
 		t.Fatalf("403 account state = %+v", account)
-	}
-}
-
-func TestActiveInvalidAuthQueryAndSchedulerCoverPoolsLargerThanTwoThousand(t *testing.T) {
-	s := newTestStore(t)
-	db, _, err := s.open(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	tx, err := db.Begin()
-	if err != nil {
-		t.Fatal(err)
-	}
-	stmt, err := tx.Prepare(`
-INSERT INTO invalid_auths (
-  auth_id,auth_index,source,provider,reason,invalidated_at,active,
-  last_status_code,auth_file,auth_source_kind
-) VALUES (?,?,?,?,?,?,1,?,?,?)`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for i := 0; i < 2105; i++ {
-		authID := fmt.Sprintf("inactive-%04d", i)
-		authIndex := fmt.Sprintf("inactive-index-%04d", i)
-		authFile := fmt.Sprintf("inactive-%04d.json", i)
-		if i == 0 {
-			authID = "target-id"
-			authIndex = "target-host-index"
-			authFile = "target.json"
-		}
-		if _, err := stmt.Exec(authID, authIndex, authFile, "codex", "401", int64(i), http.StatusUnauthorized, authFile, authSourceKindFile); err != nil {
-			_ = stmt.Close()
-			_ = tx.Rollback()
-			t.Fatal(err)
-		}
-	}
-	if err := stmt.Close(); err != nil {
-		_ = tx.Rollback()
-		t.Fatal(err)
-	}
-	if err := tx.Commit(); err != nil {
-		t.Fatal(err)
-	}
-
-	invalids, err := queryActiveInvalidAuths(context.Background(), db)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(invalids) != 2105 {
-		t.Fatalf("active invalid auth count = %d, want 2105", len(invalids))
-	}
-	available, filtered, filteredCount, _, matched := filterCodexSchedulerCandidates([]schedulerAuthCandidate{{
-		ID: "target-id", Provider: "codex", Attributes: map[string]string{
-			"auth_index": "target.json",
-			"auth_file":  "target.json",
-		},
-	}}, nil, invalids)
-	matchedTarget := false
-	for index := range matched {
-		if index >= 0 && index < len(invalids) && invalids[index].AuthID == "target-id" {
-			matchedTarget = true
-		}
-	}
-	if !filtered || filteredCount != 1 || len(available) != 0 || len(matched) != 1 || !matchedTarget {
-		t.Fatalf("large-pool scheduler result available=%+v filtered=%v count=%d matched=%+v", available, filtered, filteredCount, matched)
 	}
 }

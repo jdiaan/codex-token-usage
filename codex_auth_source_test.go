@@ -15,14 +15,11 @@ func withCodexHostAuthSource(t *testing.T, caller hostCallFunc) {
 	t.Helper()
 	oldCaller := hostAuthCaller
 	oldCodexSource := globalCodexAuthSource
-	oldXAISource := globalXAIAuthSource
 	hostAuthCaller = caller
 	globalCodexAuthSource = &codexAuthSourceManager{}
-	globalXAIAuthSource = &xaiAuthSourceManager{}
 	t.Cleanup(func() {
 		hostAuthCaller = oldCaller
 		globalCodexAuthSource = oldCodexSource
-		globalXAIAuthSource = oldXAISource
 	})
 }
 

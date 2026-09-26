@@ -11,14 +11,11 @@ import (
 
 func TestReloginRequiredAccountsManagementRoute(t *testing.T) {
 	oldStore := globalStore
-	oldConfig := globalAccountProtection.config()
 	store := newTestStore(t)
 	globalStore = store
-	globalAccountProtection.configure(defaultPluginConfig())
 	t.Cleanup(func() {
 		store.close()
 		globalStore = oldStore
-		globalAccountProtection.configure(oldConfig)
 	})
 
 	db, _, err := store.open(context.Background())
@@ -77,58 +74,4 @@ func TestReloginRequiredAccountsManagementRoute(t *testing.T) {
 			t.Fatalf("response leaked lifecycle internals %q: %s", forbidden, response.Body)
 		}
 	}
-}
-
-func TestReloginRequiredAccountsRouteErrorsAndRegistration(t *testing.T) {
-	oldStore := globalStore
-	oldConfig := globalAccountProtection.config()
-	t.Cleanup(func() {
-		globalStore = oldStore
-		globalAccountProtection.configure(oldConfig)
-	})
-
-	globalAccountProtection.configure(defaultPluginConfig())
-	path := "/v0/management/plugins/" + pluginID + "/relogin-required-accounts"
-	if response := handleManagement(managementRequest{Method: http.MethodPost, Path: path}); response.StatusCode != http.StatusMethodNotAllowed {
-		t.Fatalf("method status=%d body=%s", response.StatusCode, response.Body)
-	}
-
-	legacy := defaultPluginConfig()
-	legacy.SchedulingMode = "legacy"
-	globalAccountProtection.configure(legacy)
-	if response := handleManagement(managementRequest{Method: http.MethodGet, Path: path}); response.StatusCode != http.StatusConflict || !strings.Contains(string(response.Body), "unsupported_scheduling_mode") {
-		t.Fatalf("legacy response=%d %s", response.StatusCode, response.Body)
-	}
-
-	globalAccountProtection.configure(defaultPluginConfig())
-	db, err := openSQLiteDB(t.TempDir() + "/closed.db")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := db.Close(); err != nil {
-		t.Fatal(err)
-	}
-	globalStore = &store{db: db}
-	if response := handleManagement(managementRequest{Method: http.MethodGet, Path: path}); response.StatusCode != http.StatusInternalServerError || !strings.Contains(string(response.Body), "relogin_accounts_failed") {
-		t.Fatalf("database response=%d %s", response.StatusCode, response.Body)
-	}
-
-	raw, err := handleMethod("management.register", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var envelopeValue envelope
-	if err := json.Unmarshal(raw, &envelopeValue); err != nil {
-		t.Fatal(err)
-	}
-	var registration managementRegistrationResponse
-	if !envelopeValue.OK || json.Unmarshal(envelopeValue.Result, &registration) != nil {
-		t.Fatalf("bad registration envelope: %s", raw)
-	}
-	for _, route := range registration.Routes {
-		if route.Method == http.MethodGet && route.Path == "/plugins/"+pluginID+"/relogin-required-accounts" {
-			return
-		}
-	}
-	t.Fatalf("relogin route missing from registration: %+v", registration.Routes)
 }

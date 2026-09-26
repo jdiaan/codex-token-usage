@@ -34,7 +34,7 @@ type authLifecycleController struct {
 
 var globalAuthLifecycle = &authLifecycleController{store: globalStore, clock: realLifecycleClock{}, wake: make(chan struct{}, 1)}
 
-func nativeScheduling() bool { return globalAccountProtection.config().SchedulingMode != "legacy" }
+func nativeScheduling() bool { return true }
 
 func (c *authLifecycleController) stop() {
 	c.lifeMu.Lock()
@@ -92,11 +92,7 @@ func (c *authLifecycleController) status() map[string]any {
 	last := c.lastError
 	c.statusMu.Unlock()
 	config := globalManagementConfig.current()
-	mode := "native"
-	if !nativeScheduling() {
-		mode = "legacy"
-	}
-	return map[string]any{"scheduling_mode": mode, "management_configured": config.ready(), "management_config": config.status(), "last_error": last, "concurrency_enforced": mode == "legacy" && globalAccountProtection.enabled(), "token_demotion_enforced": mode == "legacy" && globalAccountProtection.enabled(), "reconcile_interval_seconds": 30}
+	return map[string]any{"management_configured": config.ready(), "management_config": config.status(), "last_error": last, "concurrency_enforced": false, "token_demotion_enforced": false, "obsolete_config_keys": obsoleteConfigKeys(), "reconcile_interval_seconds": 30}
 }
 
 type lifecycleExecer interface {
@@ -162,7 +158,7 @@ func isCodexUsage(rec usageRecord) bool {
 	// scope, otherwise those failures are visible as 401 rows but never reach
 	// the account-state controller.
 	isCodex := stringsEqualCodex(rec.Provider) || strings.Contains(strings.ToLower(trim(rec.ExecutorType)), "codex")
-	return isCodex && !isCodexAPIKeyUsageRecord(rec)
+	return isCodex && !isAPIKeyAuthType(rec.AuthType) && !isCodexAPIKeyUsageRecord(rec)
 }
 func stringsEqualCodex(provider string) bool { return strings.EqualFold(trim(provider), "codex") }
 

@@ -60,34 +60,6 @@ CREATE INDEX IF NOT EXISTS idx_usage_events_lower_auth_id_requested ON usage_eve
 CREATE INDEX IF NOT EXISTS idx_usage_events_lower_source_requested ON usage_events(lower(source), requested_at);
 CREATE INDEX IF NOT EXISTS idx_usage_events_provider_model_requested ON usage_events(provider, model, alias, requested_at);
 CREATE INDEX IF NOT EXISTS idx_usage_events_api_key_provider_requested ON usage_events(api_key, provider, requested_at);
-CREATE TABLE IF NOT EXISTS account_protection_reservations (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  auth_id TEXT NOT NULL DEFAULT '',
-  auth_index TEXT NOT NULL DEFAULT '',
-  source TEXT NOT NULL DEFAULT '',
-  plan_type TEXT NOT NULL DEFAULT '',
-  created_at INTEGER NOT NULL,
-  expires_at INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_account_protection_reservations_expiry ON account_protection_reservations(expires_at);
-CREATE INDEX IF NOT EXISTS idx_account_protection_reservations_auth ON account_protection_reservations(auth_index, auth_id, source, expires_at);
-CREATE TABLE IF NOT EXISTS xai_account_states (
-  state_key TEXT PRIMARY KEY,
-  auth_id TEXT NOT NULL DEFAULT '',
-  auth_index TEXT NOT NULL DEFAULT '',
-  source TEXT NOT NULL DEFAULT '',
-  provider TEXT NOT NULL DEFAULT 'xai',
-  state TEXT NOT NULL DEFAULT '',
-  reason TEXT NOT NULL DEFAULT '',
-  observed_at INTEGER NOT NULL,
-  reset_at INTEGER NOT NULL DEFAULT 0,
-  active INTEGER NOT NULL DEFAULT 1,
-  last_status_code INTEGER NOT NULL DEFAULT 0,
-  auth_file TEXT NOT NULL DEFAULT '',
-  auth_file_mtime INTEGER NOT NULL DEFAULT 0
-);
-CREATE INDEX IF NOT EXISTS idx_xai_account_states_active_reset ON xai_account_states(active, reset_at);
-CREATE INDEX IF NOT EXISTS idx_xai_account_states_auth ON xai_account_states(auth_index, auth_id, source);
 CREATE TABLE IF NOT EXISTS summary_cache (
   cache_key TEXT PRIMARY KEY,
   window TEXT NOT NULL DEFAULT '',

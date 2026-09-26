@@ -7,8 +7,8 @@ import (
 
 func TestDashboardRecentRequestsHaveSeparateTimeColumn(t *testing.T) {
 	const header = `<th>模型</th><th>时间</th><th>耗时</th><th>Tokens</th><th>费用</th><th>详情</th>`
-	if got := strings.Count(dashboardBody, header); got != 2 {
-		t.Fatalf("static recent request tables with time column = %d, want 2", got)
+	if got := strings.Count(dashboardBody, header); got != 1 {
+		t.Fatalf("static recent request tables with time column = %d, want 1", got)
 	}
 	for _, marker := range []string{
 		header,
@@ -113,63 +113,6 @@ func TestPoolTabSwitchReappliesLocale(t *testing.T) {
 	localeAt := strings.Index(switchPage, "applyLocale();")
 	if renderAt < 0 || localeAt < 0 || localeAt < renderAt {
 		t.Fatalf("pool tab switch must reapply locale after rendering: %q", switchPage)
-	}
-}
-
-func TestXAITabRequiresConfiguredAccount(t *testing.T) {
-	if !strings.Contains(dashboardBody, `data-target="xai" role="tab" aria-selected="false" hidden`) {
-		t.Fatal("xAI tab must start hidden until configured credentials are loaded")
-	}
-	if !strings.Contains(dashboardScripts, `const xaiVisible=(data.xai_accounts||[]).some(r=>r.configured);`) {
-		t.Fatal("xAI tab visibility must depend on configured xAI auth accounts")
-	}
-	if !strings.Contains(dashboardScripts, `if(!xaiVisible&&activePage==='xai')activePage='codex';`) {
-		t.Fatal("removed xAI auth must return the dashboard to Codex")
-	}
-}
-
-func TestXAITierDisplayUsesMetadataFields(t *testing.T) {
-	for _, marker := range []string{"r.xai_tier", "tier-free", "tier-super", "tier-heavy", "套餐分布"} {
-		if !strings.Contains(dashboardScripts+dashboardStyles, marker) {
-			t.Fatalf("xAI tier display marker %q not found", marker)
-		}
-	}
-}
-
-func TestXAIStateCardsOpenManagementViews(t *testing.T) {
-	for _, marker := range []string{
-		"function xaiManagementRows(states)",
-		"xai?'xAI 401 失效账号':'管理 401 失效账号'",
-		"xai?'xAI 权限拒绝账号':'管理 402 工作区失效账号'",
-		"xai?'xAI 429 状态':'管理 429 禁用账号'",
-		"function manageXAIStateRows(rows,prefix,confirmText,runningText)",
-		"function releaseXAIStateRows(rows,confirmText,runningText)",
-		"managementXAIStateResolveApi",
-		"processInvalidAuthFileRows(fileRows,key,'xai')",
-		"function xaiAuthFiles(files)",
-		"data-workspace-delete=",
-		"data-autoban-release-one=",
-		"document.getElementById('invalid-auth-card').disabled=false",
-		"document.getElementById('workspace-deactivated-card').disabled=false",
-		"document.getElementById('autoban-release-card').disabled=false",
-	} {
-		if !strings.Contains(dashboardScripts, marker) {
-			t.Fatalf("xAI state management marker %q not found", marker)
-		}
-	}
-	for _, forbidden := range []string{"这里只读显示", "if(xai)invalidAuthSelected=new Set()", "if(xai)workspaceDeactivatedSelected=new Set()", "if(xai)autobanReleaseSelected=new Set()"} {
-		if strings.Contains(dashboardScripts, forbidden) {
-			t.Fatalf("xAI state management is still read-only via %q", forbidden)
-		}
-	}
-	for _, forbidden := range []string{
-		"function openInvalidAuthModal(){\n  if(isXAIPool())return;",
-		"function openWorkspaceDeactivatedModal(){\n  if(isXAIPool())return;",
-		"function openAutobanReleaseModal(){\n  if(isXAIPool())return;",
-	} {
-		if strings.Contains(dashboardScripts, forbidden) {
-			t.Fatalf("xAI state card is still blocked by %q", forbidden)
-		}
 	}
 }
 

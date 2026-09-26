@@ -62,7 +62,10 @@ func TestAccountQuotaAliasSetsKeepUniqueAccountIdentity(t *testing.T) {
 }
 
 func TestAccountWindowTokensDeduplicatesEventsAcrossAliasChunks(t *testing.T) {
-	db := newProtectionTestDB(t)
+	db, _, err := newTestStore(t).open(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
 	now := time.Now().Unix()
 	aliases := make([]string, 0, 251)
 	for i := 0; i < 250; i++ {

@@ -5,7 +5,6 @@ const managementApi='/v0/management/plugins/__PLUGIN_ID__/summary';
 const managementExportApi='/v0/management/plugins/__PLUGIN_ID__/export';
 const managementAutobanReleaseApi='/v0/management/plugins/__PLUGIN_ID__/autobans/release';
 const managementInvalidAuthResolveApi='/v0/management/plugins/__PLUGIN_ID__/invalid-auths/resolve';
-const managementXAIStateResolveApi='/v0/management/plugins/__PLUGIN_ID__/xai-states/resolve';
 const managementAuthImportPreviewApi='/v0/management/plugins/__PLUGIN_ID__/auth-import/preview';
 const managementAuthImportCommitApi='/v0/management/plugins/__PLUGIN_ID__/auth-import/commit';
 const managementQuotaActivationPreviewApi='/v0/management/plugins/__PLUGIN_ID__/quota-activation/preview';
@@ -74,7 +73,6 @@ let summaryAbortController=null;
 let summaryStaleRefreshTimer=null;
 const summaryWindowCache=new Map();
 const saved=managementKey(); if(saved) keyEl.value=saved;
-selectedProviders=loadSelectedProviders();
 initLanguageControl();
 initAuthImportControl();
 initBatchProxyControl();
@@ -90,8 +88,6 @@ document.getElementById('refresh').onclick=load;
 document.getElementById('window').onchange=e=>{safeStorageSet(safeLocalStorage(),'cpa_token_usage_window',e.target.value);showCachedSummaryForWindow(e.target.value);load(false,false,{keepExisting:true,abortPrevious:true})};
 document.getElementById('export-logs').onclick=openLogExportModal;
 document.getElementById('tab-strip').addEventListener('click',e=>{const btn=e.target.closest('.tab[data-target]');if(btn)switchPage(btn.dataset.target)});
-document.getElementById('provider-picker-button').onclick=()=>document.getElementById('provider-picker').classList.toggle('open');
-document.addEventListener('click',e=>{const picker=document.getElementById('provider-picker');if(!picker.contains(e.target))picker.classList.remove('open')});
 document.getElementById('account-filter').oninput=()=>{accountPage=1;renderAccounts()};
 document.getElementById('account-sort').onchange=e=>{safeStorageSet(safeLocalStorage(),'cpa_token_usage_account_sort',e.target.value);accountPage=1;renderAccounts()};
 document.getElementById('account-page-size').onchange=(e)=>{accountPageSize=Number(e.target.value)||25;safeStorageSet(safeLocalStorage(),'cpa_token_usage_account_page_size',String(accountPageSize));accountPage=1;renderAccounts()};
@@ -100,7 +96,7 @@ document.getElementById('account-next').onclick=()=>{accountPage=accountPage+1;r
 document.getElementById('autoban-page-size').onchange=(e)=>{autobanPageSize=Number(e.target.value)||10;safeStorageSet(safeLocalStorage(),'cpa_token_usage_autoban_page_size',String(autobanPageSize));autobanPage=1;renderAutobans(poolData().autobans)};
 document.getElementById('autoban-prev').onclick=()=>{autobanPage=Math.max(1,autobanPage-1);renderAutobans(poolData().autobans)};
 document.getElementById('autoban-next').onclick=()=>{autobanPage=autobanPage+1;renderAutobans(poolData().autobans)};
-  setInterval(()=>{if(!document.hidden&&!loading&&!invalidAuthDeleting&&!workspaceDeactivatedDeleting&&!autobanReleaseBusy&&!quotaActivationBusy&&!document.getElementById('provider-picker').classList.contains('open'))load()},15000);
+  setInterval(()=>{if(!document.hidden&&!loading&&!invalidAuthDeleting&&!workspaceDeactivatedDeleting&&!autobanReleaseBusy&&!quotaActivationBusy)load()},15000);
 function initUIPreferences(){
   const savedWindow=safeStorageGet(safeLocalStorage(),'cpa_token_usage_window'); if(savedWindow&&selectHasValue('window',savedWindow))document.getElementById('window').value=savedWindow;
   const savedSort=safeStorageGet(safeLocalStorage(),'cpa_token_usage_account_sort'); if(savedSort&&selectHasValue('account-sort',savedSort))document.getElementById('account-sort').value=savedSort;
@@ -129,11 +125,7 @@ function applyAccountColumns(){
   });
 }
 function currentLogExportScope(){
-  if(activePage==='codex')return {scope:'codex',provider:''};
-  if(activePage==='xai')return {scope:'xai',provider:''};
-  if(activePage==='providers')return {scope:'providers',provider:''};
-  const page=document.querySelector('.tab[data-target="'+activePage+'"]');
-  return {scope:'provider',provider:page?firstText(page.childNodes[0]&&page.childNodes[0].nodeValue,page.textContent).replace(/\\s*[0-9.,KMB]+$/,''):''};
+	return {scope:'codex',provider:''};
 }
 function initLogExportControl(){
   document.getElementById('log-export-close').onclick=closeLogExportModal;
@@ -336,10 +328,8 @@ function logExportContextRows(){
 function populateLogExportFilters(){
   const rows=logExportContextRows();
   populateSelect('log-export-account',rows.accounts.map(r=>firstText(r.key_id,r.auth_file,r.auth_index,r.email,r.source,r.auth_id,r.name)), '全部账号');
-  populateSelect('log-export-provider',rows.providers.map(r=>r.provider).concat(rows.recent.map(r=>r.provider)), '全部接入点');
   populateSelect('log-export-model',rows.models.map(r=>r.model).concat(rows.recent.map(r=>firstText(r.alias,r.model))), '全部模型');
   const ctx=currentLogExportScope();
-  if(ctx.scope==='provider'&&ctx.provider)document.getElementById('log-export-provider').value=ctx.provider;
 }
 async function downloadLogExport(){
   const ctx=currentLogExportScope();
@@ -350,8 +340,6 @@ async function downloadLogExport(){
   params.set('type','logs');
   params.set('format',format);
   params.set('scope',ctx.scope);
-  const provider=firstText(document.getElementById('log-export-provider').value,ctx.provider);
-  if(provider)params.set('provider',provider);
   for(const pair of [['account','log-export-account'],['date','log-export-date'],['model','log-export-model'],['status','log-export-status']]){
     const value=document.getElementById(pair[1]).value;
     if(value)params.set(pair[0],value);
@@ -673,7 +661,7 @@ function invalidAuthRows(){
   });
   accounts.filter(r=>r.invalid_auth&&is401InvalidAuthRow(r)).forEach(row=>add(row,row));
   const controller=(lastData&&lastData.auth_controller)||{};
-  if(controller.scheduling_mode==='native')accounts.filter(lifecycleAuthInvalid).forEach(account=>add({
+  accounts.filter(lifecycleAuthInvalid).forEach(account=>add({
     auth_id:account.auth_id,auth_index:account.auth_index,source:account.source,auth_file:account.auth_file,
     invalidated_at_text:account.lifecycle&&account.lifecycle.updated_at?new Date(Number(account.lifecycle.updated_at)*1000).toISOString():account.last_seen,
     reason:firstText(account.lifecycle&&account.lifecycle.last_error_message,'401 authentication invalid'),
@@ -1789,7 +1777,7 @@ async function writeBatchProxy(proxy,donePrefix,failPrefix,progressPrefix){
 }
 function syncLanguageControl(){if(languageEl)languageEl.value=languageMode()}
 function switchPage(page){
-  activePage=page||'codex';
+  activePage='codex';
   document.querySelectorAll('.tab[data-target]').forEach(btn=>{
     const on=btn.dataset.target===activePage;
     btn.classList.toggle('active',on);
@@ -2617,9 +2605,9 @@ async function fetchSummary(win,key,forceRefresh=false,syncRefresh=false,signal=
   }
   const data=await res.json(); data._source='management'; return data;
 }
-function isXAIPool(){return activePage==='xai'}
+function isXAIPool(){return false}
 function xaiStateLabel(state){return state==='unauthorized'?'401 失效':state==='forbidden'?'403 拒绝':state==='free_usage_exhausted'?'免费额度耗尽':state==='rate_limited'?'短期限流':state||'-'}
-function isNativeLifecycle(){return !isXAIPool()&&((lastData||{}).auth_controller||{}).scheduling_mode==='native'}
+function isNativeLifecycle(){return true}
 function nativeLifecycleRows(){return [...((lastData||{}).autobans||[]),...((((lastData||{}).auth_controller||{}).pending_accounts)||[])].filter(r=>r.lifecycle)}
 function lifecycleCurrentState(r){const s=r&&r.lifecycle||{};return s.state==='MANUAL_DISABLED'&&s.blocked_state?s.blocked_state:s.state}
 function lifecycleAuthInvalid(r){return lifecycleCurrentState(r)==='AUTH_INVALID'}
@@ -2628,22 +2616,12 @@ function lifecycleRateLimited(r){return ['QUOTA_COOLDOWN','RATE_LIMITED'].includ
 function lifecycleRisk(r){const s=r&&r.lifecycle;if(!s)return false;return s.state!=='HEALTHY'||Boolean(s.paused||s.pending_action||s.sync_error)||(s.sync_status&&s.sync_status!=='synced')}
 function poolData(source){
   const data=source||lastData||{};
-  if(!isXAIPool())return {totals:data.totals||{},accounts:data.accounts||[],models:data.models||[],trend:data.trend||[],recent:data.recent||[],autobans:data.autobans||[],forbidden_auths:data.forbidden_auths||[],quota_trigger:data.quota_trigger||{},provider:'codex'};
-  const states=(data.xai_states||[]).map(r=>Object.assign({},r,{window:xaiStateLabel(r.state),banned_at_text:r.observed_at_text,reset_at_text:r.reset_at_text}));
-  return {totals:data.xai_totals||{},accounts:data.xai_accounts||[],models:data.xai_models||[],trend:data.xai_trend||[],recent:data.xai_recent||[],autobans:states,provider:'xai'};
+  return {totals:data.totals||{},accounts:data.accounts||[],models:data.models||[],trend:data.trend||[],recent:data.recent||[],autobans:data.autobans||[],forbidden_auths:data.forbidden_auths||[],quota_trigger:data.quota_trigger||{},provider:'codex'};
 }
 function renderAll(){
   const data=lastData||{};
-  const xaiTab=document.querySelector('.tab[data-target="xai"]');
-  const xaiVisible=(data.xai_accounts||[]).some(r=>r.configured);
-  if(xaiTab){xaiTab.hidden=!xaiVisible;xaiTab.setAttribute('aria-hidden',xaiVisible?'false':'true');xaiTab.tabIndex=xaiVisible?0:-1}
-  if(!xaiVisible&&activePage==='xai')activePage='codex';
   document.getElementById('tab-codex-count').textContent=fmt((data.accounts||[]).length);
-  document.getElementById('tab-xai-count').textContent=fmt((data.xai_accounts||[]).length);
-  document.getElementById('tab-provider-count').textContent=fmt((data.providers||[]).length);
   renderPoolPage(data);
-  renderProviderPage(data);
-  renderProviderTabsAndPages(data);
   renderOpenManagementModals();
   applyLocale();
 }
@@ -2660,7 +2638,7 @@ function renderPoolPage(source){
   if(!lifecycleBanner){lifecycleBanner=document.createElement('p');lifecycleBanner.id='lifecycle-banner';document.getElementById('pool-hero-hint').after(lifecycleBanner)}
   lifecycleBanner.hidden=data.provider==='xai';
   const recent401=((source&&source.recent)||[]).filter(r=>Number(r.status_code)===401).length;
-  lifecycleBanner.className=controller.scheduling_mode==='native'&&(!controller.management_configured||controller.last_error)?'lifecycle-danger':'lifecycle-ok';
+  lifecycleBanner.className=(!controller.management_configured||controller.last_error)?'lifecycle-danger':(controller.obsolete_config_keys||[]).length?'lifecycle-warning':'lifecycle-ok';
   lifecycleBanner.textContent=lifecycleBannerText(controller,recent401);
 
   document.getElementById('m-requests').textContent=fmt(t.requests);
@@ -2858,7 +2836,7 @@ function renderAccounts(){
   const allInvalidRows=invalidAuthRows();
   const allWorkspaceRows=workspaceDeactivatedRows();
   const controller=(lastData&&lastData.auth_controller)||{};
-  const nativeLifecycle=controller.scheduling_mode==='native'&&!isXAIPool();
+  const nativeLifecycle=true;
   const lifecycleAccounts=nativeLifecycleRows();
   const invalidCount=nativeLifecycle?lifecycleAccounts.filter(r=>lifecycleAuthInvalid(r)&&r.lifecycle.disabled).length:allInvalidRows.length;
   const workspaceDeactivatedCount=nativeLifecycle?lifecycleAccounts.filter(lifecycleWorkspaceBlocked).length:allWorkspaceRows.length;
@@ -2970,7 +2948,7 @@ document.addEventListener('click',async event=>{
   }
 });
 function accountStatus(r){
-  if(r.lifecycle&&((lastData||{}).auth_controller||{}).scheduling_mode==='native')return lifecycleStatusLabel(r.lifecycle);
+  if(r.lifecycle)return lifecycleStatusLabel(r.lifecycle);
   const ban=findBan(r);
   if(r.xai_state)return '<span class="status-pill danger" title="'+esc(r.xai_state_reason||xaiStateLabel(r.xai_state))+'">'+esc(xaiStateLabel(r.xai_state))+'</span>';
   if(r.invalid_auth){const forbidden=Number(r.invalid_auth_status_code)===403;return '<span class="status-pill danger" title="'+esc(r.invalid_auth_reason||(forbidden?'403 forbidden':'401 unauthorized'))+'">'+(forbidden?'403 拒绝':'401 失效')+'</span>'}
@@ -3060,8 +3038,7 @@ function quotaWindow2Cell(r){if(quotaPlanKind(r)==='free')return '';const missin
 function quotaSummaryText(r){const parts=[];if(quotaPlanKind(r)==='free'){const source=quotaDisplayPrefix(r);if(quotaWindowHasData(r,source))parts.push((quotaWindowLabel(r,source)||'窗口 1')+' '+pct(r[source+'_used_percent']));else parts.push('单窗口待刷新');return parts.join(' · ')}if(quotaWindowHasData(r,'primary'))parts.push((quotaWindowLabel(r,'primary')||'窗口 1')+' '+pct(r.primary_used_percent));else if(quotaWindowPresence(r,'primary')==='absent')parts.push('窗口 1 无');if(quotaWindowHasData(r,'secondary'))parts.push((quotaWindowLabel(r,'secondary')||'窗口 2')+' '+pct(r.secondary_used_percent));else if(quotaWindowPresence(r,'secondary')==='absent')parts.push('窗口 2 无');return parts.length?parts.join(' · '):'暂无额度快照'}
 function tokenCostStack(r,total){const cost=r.cost_available||Number(r.cost_usd||0)>0?money(r.cost_usd):'缺价格'; const cls=r.cost_available?'cost-line':'cost-weak'; return '<span class="metric-stack"><b>'+compact(r.total_tokens)+'</b><span>占 '+pct(ratio(r.total_tokens,total))+'</span><span class="'+cls+'">'+esc(cost)+'</span></span>'}
 function lifecycleBannerText(controller,recent401){
-  if(controller.scheduling_mode!=='native')return 'Legacy · 插件调度与原有账号保护。';
-  let text='Native · CPA 原生调度；Token 统计/告警保留，插件并发硬限制及 Token 降级未执行。';
+  let text='Codex 账号由 CPA 原生调度；插件负责用量统计和账号状态。插件不提供请求等待、并发或 Token 硬限制。';
   const config=controller.management_config||{};
   const reasons={not_initialized:'插件尚未初始化',file_missing:'未找到私密配置文件',invalid_path:'配置路径必须为绝对路径',file_unreadable:'无法读取私密配置文件',invalid_file:'私密配置文件类型或大小无效',unsafe_permissions:'私密配置文件权限过宽',invalid_yaml:'私密配置文件格式错误',unknown_field:'私密配置文件包含未知字段',duplicate_field:'私密配置文件包含重复字段',invalid_type:'私密配置字段必须为字符串',missing_fields:'私密配置缺少必填项',invalid_url:'管理地址无效',invalid_key:'管理密钥格式无效'};
   if(controller.management_configured){
@@ -3075,6 +3052,7 @@ function lifecycleBannerText(controller,recent401){
     if(missing)text+=' 缺少：'+missing+'。';
   }
   if(controller.last_error)text+=' 控制器错误：'+controller.last_error;
+  if((controller.obsolete_config_keys||[]).length)text+=' 请从插件配置中删除废弃项：'+controller.obsolete_config_keys.join('、')+'。';
   return text;
 }
 function renderProviders(rows,total){
@@ -3105,7 +3083,7 @@ function renderKeySummaries(rows){
 }
 function costCell(r){return r.cost_available||Number(r.cost_usd||0)>0?'<span class="'+(r.cost_available?'ok':'muted')+'">'+money(r.cost_usd)+'</span>':'<span class="muted">缺价格</span>'}
 function renderInsights(data){
-  const accounts=[...(data.accounts||[])]; const t=data.totals||{}; const total=t.total_tokens||0; const nativeLifecycle=((lastData||{}).auth_controller||{}).scheduling_mode==='native'; const bans=nativeLifecycle?(data.autobans||[]).filter(r=>r.lifecycle&&r.lifecycle.disabled):(data.autobans||[]);
+  const accounts=[...(data.accounts||[])]; const t=data.totals||{}; const total=t.total_tokens||0; const nativeLifecycle=true; const bans=nativeLifecycle?(data.autobans||[]).filter(r=>r.lifecycle&&r.lifecycle.disabled):(data.autobans||[]);
   if(data.provider==='xai'){
     const top=accounts[0]; const unauthorized=accounts.find(r=>r.xai_state==='unauthorized'); const forbidden=accounts.find(r=>r.xai_state==='forbidden'); const exhausted=accounts.find(r=>r.xai_state==='free_usage_exhausted'); const limited=accounts.find(r=>r.xai_state==='rate_limited'); const noisy=[...accounts].sort((a,b)=>(b.rate_limited||0)-(a.rate_limited||0))[0];const tierCounts={free:0,super:0,heavy:0};accounts.forEach(r=>{const tier=String(r.xai_tier||'free').toLowerCase();tierCounts[tier]=(tierCounts[tier]||0)+1});
     const items=[

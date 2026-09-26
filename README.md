@@ -1,8 +1,8 @@
 # CPA Token Usage
 
-CLIProxyAPI（CPA）的用量统计与账号管理插件，提供 Codex、xAI 账号看板及 AI 服务商用量分析。
+CLIProxyAPI（CPA）的 Codex OAuth 用量统计与账号状态管理插件。
 
-当前版本：`0.1.49`。原生调度接口测试基于 CPA `7.2.145`。
+Codex 账号由 CPA 选择；插件不接管调度。
 
 注意：当前正在修改原项目，有很多原项目功能没有测试过可能会有各种问题
 当前实现：
@@ -11,11 +11,11 @@ CLIProxyAPI（CPA）的用量统计与账号管理插件，提供 Codex、xAI �
 
 ## 主要功能
 
-- 按账号、服务商和模型统计请求数、Token、缓存命中率及估算费用，支持 CSV / JSON 导出。
+- 按 Codex OAuth 账号和模型统计请求数、Token、缓存命中率及估算费用，支持 CSV / JSON 导出。
 - 展示 Codex 额度窗口、恢复时间、账号异常及疑似外部额度消耗。
 - 自动禁用异常 Codex 账号，并在凭据更新或冷却结束后恢复。
 - 支持定时额度触发、一次性启动额度窗口和非标准 Codex 凭据导入。
-- 提供 xAI 账号看板、模型价格自动更新、中英文界面及深浅色主题。
+- 提供模型价格自动更新、中英文界面及深浅色主题。
 
 ## 安装与启用
 
@@ -37,7 +37,6 @@ CLIProxyAPI（CPA）的用量统计与账号管理插件，提供 Codex、xAI �
        codex-token-usage:
          enabled: true
          priority: 120
-         scheduling_mode: native
    ```
 
 4. 如需自动启停账号，按下文配置服务器私密文件。
@@ -47,7 +46,7 @@ CLIProxyAPI（CPA）的用量统计与账号管理插件，提供 Codex、xAI �
 
 **后台账号控制只从服务器本地文件读取管理地址和密钥。** 普通插件配置中的 `management_url`、`management_key`，以及旧环境变量 `CPA_TOKEN_USAGE_MANAGEMENT_URL`、`CPA_TOKEN_USAGE_MANAGEMENT_KEY` 均已停用。
 
-未配置或配置无效时，自动启停暂停，统计与原生调度继续工作。此改动只涉及后台凭据；CPA 登录和网页手动操作仍沿用原有认证方式。
+未配置或配置无效时，自动启停暂停，统计仍可使用。CPA 登录和网页手动操作仍沿用原有认证方式。
 
 ### 文件位置与内容
 
@@ -129,14 +128,9 @@ services:
 
 ## 调度与账号状态
 
-| 模式 | 行为 |
-| --- | --- |
-| `native`（默认） | Codex 调度交给 CPA，插件负责统计、告警和账号状态管理。优先级、权重、回退、模型排除及会话亲和在 CPA 中配置。 |
-| `legacy` | 使用旧版插件调度，可启用并发限制、Token 软降级和会话亲和。 |
+Codex 账号始终由 CPA 选择。CPA 的轮转、填充优选和其他选账号设置仍在 CPA 中配置。插件只统计 Codex OAuth 用量并管理明确不可用的账号。当前 CPA 插件接口无法可靠地等待已选账号再发送请求，因此插件不能保证请求等待、硬并发上限、Token 硬上限或同一任务的换号次数。
 
-`native` 不执行插件的并发硬限制和 Token 软降级。旧会话亲和配置仍适用于 `legacy` Codex 和现有 xAI 调度。
-
-### 原生模式的自动启停
+### 自动启停
 
 | 情况 | 处理方式 |
 | --- | --- |
@@ -150,7 +144,7 @@ services:
 
 网页提供“启用”和“重试同步”。启用后恢复调度，但不代表凭据已验证；后续请求仍可能触发禁用。普通浏览、账号状态轮询和重试同步不会发送模型探测请求，也不会主动查询上游额度。
 
-自动恢复只处理插件负责的禁用。切换到 `legacy` 后不再新增原生禁用，但会继续处理此前由插件负责的额度冷却恢复。
+自动恢复只处理插件负责的禁用。
 
 ## 常用设置
 
@@ -175,28 +169,9 @@ services:
 
 模型价格默认每 6 小时从 [LiteLLM 价格表](https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json)更新，也可通过“模型价格表地址”指定来源。插件内置少量回退价格；页面费用为估算值。
 
-### 旧版账号保护
+`最大并发账号数` 只限制定时额度探测任务，不限制用户请求并发。
 
-以下设置用于 `legacy` Codex 调度，默认关闭账号保护：
-
-```yaml
-同一个Session优先固定到同一个账号: true
-开启账号保护调度（可能会影响缓存）: false
-Free 并发上限: 2
-Plus 并发上限: 5
-K12 并发上限: 5
-Team 并发上限: 5
-Pro 并发上限: 10
-Free 5 分钟 Token 上限: 2000000
-Plus 5 分钟 Token 上限: 8000000
-K12 5 分钟 Token 上限: 8000000
-Team 5 分钟 Token 上限: 8000000
-Pro 5 分钟 Token 上限: 12000000
-账号保护 Token 窗口秒数: 300
-账号保护预约超时秒数: 900
-```
-
-普通设置仍支持原有英文键名，例如 `quota_trigger_enabled`、`model_price_auto_update_enabled`、`account_protection_enabled`。
+普通设置仍支持有效的英文键名，例如 `quota_trigger_enabled` 和 `model_price_auto_update_enabled`。
 
 ### 额度触发与一次性启动
 
@@ -229,6 +204,10 @@ CPA 主配置查找顺序：`CPA_CONFIG_PATH` → `CPA_CONFIG_FILE` → 进程 `
 
 ### 升级步骤
 
+本次升级会在首次启动时删除数据库中的 Codex API Key、xAI 和其他服务商历史用量、xAI 状态及旧汇总缓存；保留 Codex OAuth 用量、额度和插件自动禁用所有权记录。删除在单次数据库事务中完成，重启不会重复迁移。**插件不会自动备份，删除的历史记录无法从升级后的数据库恢复。** 如需保留原始数据，请在升级前自行备份。
+
+从 `plugins.configs.codex-token-usage` 删除 `scheduling_mode`、`scheduler_session_affinity_enabled`、`session_affinity_enabled`、`account_protection_*`，以及旧中文键 `同一个Session优先固定到同一个账号`、`开启账号保护调度`、`开启账号保护调度（可能会影响缓存）`、各套餐的 `并发上限` 与 `5 分钟 Token 上限`、`账号保护 Token 窗口秒数`、`账号保护预约超时秒数`。遗留键会被忽略，并在状态页仅显示键名。xAI 状态升级后不再由本插件执行。
+
 1. 准备私密配置文件及读取权限；旧网页配置和旧凭据环境变量不会自动迁移。
 2. 停止 CPA，备份 `usage.db` 及存在的 `usage.db-wal`、`usage.db-shm` 文件。
 3. 替换动态库并启动 CPA，核对汇总接口的 `version`、`db_path`，确认账号控制配置及实际请求结果。
@@ -245,7 +224,7 @@ CPA 主配置查找顺序：`CPA_CONFIG_PATH` → `CPA_CONFIG_FILE` → 进程 `
 | 方法与路径 | 用途 |
 | --- | --- |
 | `GET /summary` | 用量、账号状态和运行诊断。 |
-| `GET /export` | 导出账号、服务商、模型或请求统计。 |
+| `GET /export` | 导出 Codex OAuth 账号、模型或请求统计。 |
 | `GET /relogin-required-accounts` | 查询已确认由插件禁用、等待重新登录的 401、402 和账号级 403 账号。 |
 | `POST /auth-states/action` | 执行启用或重试同步等账号操作。 |
 | `POST /quota-activation/preview` | 创建额度启动预览。 |
@@ -259,9 +238,9 @@ CPA 主配置查找顺序：`CPA_CONFIG_PATH` → `CPA_CONFIG_FILE` → 进程 `
 {"auth_index":"目标账号索引","version":3,"action":"retry_sync"}
 ```
 
-`version` 必须取自最新汇总结果；版本过期返回 HTTP 409。`enable` 表示启用，`retry_sync` 表示重试同步。旧接口在原生模式下同样要求准确的账号索引与版本。
+`version` 必须取自最新汇总结果；版本过期返回 HTTP 409。`enable` 表示启用，`retry_sync` 表示重试同步。旧兼容接口同样要求准确的账号索引与版本。
 
-待重新登录接口返回 `generated_at`、`count` 和 `accounts`，排除人工禁用、429 冷却及未确认同步的账号；`legacy` 模式返回 `409 unsupported_scheduling_mode`。
+待重新登录接口返回 `generated_at`、`count` 和 `accounts`，排除人工禁用、429 冷却及未确认同步的账号。
 
 额度启动需先获取预览及一次性确认令牌，再提交预览内允许启动的账号。账号操作、导出和诊断不会返回账号访问令牌、刷新令牌或管理密钥；本地告警仅出现在汇总或导出结果中，不发送外部通知。
 
@@ -276,7 +255,7 @@ CPA 主配置查找顺序：`CPA_CONFIG_PATH` → `CPA_CONFIG_FILE` → 进程 `
 | 账号重新登录后仍禁用 | 检查是否同一账号、凭据是否更新及状态是否同步；缺少历史记录时可人工确认后启用。 |
 | 429 后何时恢复 | 有有效恢复时间时按时间恢复，否则冷却 60 秒；同步失败会显示原因并重试。 |
 | 列表显示“已启用”后又被禁用 | 启用仅恢复调度，新的账号请求失败仍会触发禁用。 |
-| 服务商未显示或模型缺少价格 | 检查 CPA 中对应服务商配置、模型价格更新状态和缓存文件。 |
+| 模型缺少价格 | 检查模型价格更新状态和缓存文件。 |
 
 ## 构建与验证
 

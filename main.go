@@ -67,7 +67,6 @@ import (
 	"math"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -98,7 +97,6 @@ var globalModelPriceUpdater = &modelPriceUpdateManager{}
 var globalRetentionCleaner = &retentionCleaner{}
 var globalDBHealth = &dbHealthMonitor{}
 var globalSummaryMaintenance = &summaryMaintenanceManager{}
-var globalSchedulerDiagnostics = &schedulerDiagnosticsTracker{}
 var globalSummaryPrecomputer = &summaryPrecomputeManager{}
 var codexQuotaURLOverrideForTest string
 var codexResponsesURLOverrideForTest string
@@ -147,27 +145,12 @@ type lifecycleRequest struct {
 }
 
 type pluginConfig struct {
-	SchedulingMode                          string
-	AccountProtectionEnabled                bool
-	AccountProtectionFreeConcurrency        int
-	AccountProtectionPlusConcurrency        int
-	AccountProtectionK12Concurrency         int
-	AccountProtectionTeamConcurrency        int
-	AccountProtectionProConcurrency         int
-	AccountProtectionFreeTokenLimit         int64
-	AccountProtectionPlusTokenLimit         int64
-	AccountProtectionK12TokenLimit          int64
-	AccountProtectionTeamTokenLimit         int64
-	AccountProtectionProTokenLimit          int64
-	AccountProtectionTokenWindowSeconds     int
-	AccountProtectionReservationTTLSeconds  int
 	QuotaTriggerEnabled                     bool
 	QuotaTriggerIntervalMinutes             int
 	QuotaTriggerMode                        string
 	QuotaTriggerMaxConcurrency              int
 	QuotaTriggerTimeoutSeconds              int
 	QuotaTriggerMinAccountCooldownMinutes   int
-	SchedulerSessionAffinityEnabled         bool
 	ModelPriceAutoUpdateEnabled             bool
 	ModelPriceUpdateIntervalHours           int
 	ModelPriceUpdateURL                     string
@@ -254,49 +237,10 @@ type invalidAuthResolveResult struct {
 	Message string `json:"message,omitempty"`
 }
 
-type schedulerPickRequest struct {
-	Provider   string                   `json:"Provider"`
-	Providers  []string                 `json:"Providers"`
-	Model      string                   `json:"Model"`
-	Stream     bool                     `json:"Stream"`
-	Options    schedulerOptions         `json:"Options"`
-	Candidates []schedulerAuthCandidate `json:"Candidates"`
-}
-
-type schedulerOptions struct {
-	Headers  map[string][]string `json:"Headers"`
-	Metadata map[string]any      `json:"Metadata"`
-}
-
-type schedulerAuthCandidate struct {
-	ID         string            `json:"ID"`
-	Provider   string            `json:"Provider"`
-	Priority   int               `json:"Priority"`
-	Status     string            `json:"Status"`
-	Attributes map[string]string `json:"Attributes"`
-	Metadata   map[string]any    `json:"Metadata"`
-}
-
 type schedulerPickResponse struct {
 	AuthID          string `json:"AuthID"`
 	DelegateBuiltin string `json:"DelegateBuiltin"`
 	Handled         bool   `json:"Handled"`
-}
-
-type schedulerRejectError struct {
-	Code       string
-	Message    string
-	HTTPStatus int
-}
-
-func (e *schedulerRejectError) Error() string {
-	if e == nil {
-		return ""
-	}
-	if e.Code == "" {
-		return e.Message
-	}
-	return e.Code + ": " + e.Message
 }
 
 type usageRecord struct {
@@ -457,7 +401,7 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 				Logo:             "",
 				ConfigFields:     pluginConfigFields(),
 			},
-			Capabilities: capabilities{UsagePlugin: true, ManagementAPI: true, Scheduler: true},
+			Capabilities: capabilities{UsagePlugin: true, ManagementAPI: true, Scheduler: false},
 		})
 	case "management.register":
 		return okJSON(managementRegistrationResponse{
@@ -468,7 +412,6 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 				{Method: "GET", Path: "/plugins/codex-token-usage/export", Description: "Token usage CSV/JSON export."},
 				{Method: "POST", Path: "/plugins/codex-token-usage/autobans/release", Description: "Manually release active Codex 429 auto-bans."},
 				{Method: "POST", Path: "/plugins/codex-token-usage/invalid-auths/resolve", Description: "Resolve deleted, replaced, or runtime-disabled Codex 401 records."},
-				{Method: "POST", Path: "/plugins/codex-token-usage/xai-states/resolve", Description: "Resolve deleted, replaced, runtime-disabled, or manually released xAI account states."},
 				{Method: "POST", Path: "/plugins/codex-token-usage/auth-import/preview", Description: "Preview non-standard Codex auth JSON imports."},
 				{Method: "POST", Path: "/plugins/codex-token-usage/auth-import/commit", Description: "Convert and save non-standard Codex auth JSON imports."},
 				{Method: "POST", Path: "/plugins/codex-token-usage/quota-activation/preview", Description: "Preview one-shot Codex quota-window activation eligibility."},
@@ -491,34 +434,15 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		if err := json.Unmarshal(request, &rec); err != nil {
 			return okJSON(map[string]any{"ignored": true, "error": err.Error()})
 		}
+		if !isCodexUsage(rec) {
+			return okJSON(map[string]any{"ignored": true})
+		}
 		if err := globalStore.recordUsage(context.Background(), rec); err != nil {
 			return okJSON(map[string]any{"stored": false, "error": err.Error()})
 		}
 		return okJSON(map[string]any{"stored": true})
 	case "scheduler.pick":
-		var req schedulerPickRequest
-		if err := json.Unmarshal(request, &req); err != nil {
-			return okJSON(schedulerPickResponse{Handled: false})
-		}
-		mustHandle := schedulerPickRequiresPlugin(req)
-		ctx, cancel := context.WithTimeout(context.Background(), 750*time.Millisecond)
-		defer cancel()
-		resp, err := globalStore.pickAuth(ctx, req)
-		if err != nil {
-			var reject *schedulerRejectError
-			if errors.As(err, &reject) && reject != nil {
-				return errorEnvelopeWithStatus(reject.Code, reject.Message, reject.HTTPStatus), nil
-			}
-			if mustHandle || schedulerPickRequiresPlugin(req) {
-				return errorEnvelopeWithStatus(
-					"scheduler_unavailable",
-					"account protection scheduler is temporarily unavailable",
-					http.StatusServiceUnavailable,
-				), nil
-			}
-			return okJSON(schedulerPickResponse{Handled: false})
-		}
-		return okJSON(resp)
+		return okJSON(schedulerPickResponse{Handled: false})
 	default:
 		return errorEnvelope("unknown_method", "unknown method: "+method), nil
 	}
@@ -526,14 +450,12 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 
 func pluginConfigFields() []configField {
 	return []configField{
-		{Name: "scheduling_mode", Type: "enum", Description: "native=CPA 原生调度及 API 账号管理（默认）；legacy=插件调度及强制账号保护。native 不执行插件并发硬限制或 Token 降级。"},
 		{Name: "开启定时额度触发（不建议账号多的情况下开启）", Type: "boolean", Description: "是否开启 Codex 账号定时额度触发。探测结果会参与 401、402、403、429 状态管理；已处于异常不可用状态的账号会跳过后续探测，429 到 reset_at 后再恢复探测。默认关闭。"},
 		{Name: "触发间隔分钟", Type: "number", Description: "每轮触发间隔，单位分钟。默认 10。"},
 		{Name: "触发模式", Type: "enum", Description: "probe=真实极小模型请求，会消耗少量 token；旧 quota 配置会自动按 probe 执行。默认 probe。"},
 		{Name: "最大并发账号数", Type: "number", Description: "每轮最大并发触发账号数。默认 1。"},
 		{Name: "单账号超时秒数", Type: "number", Description: "单个账号触发请求超时时间，单位秒。默认 20。"},
 		{Name: "单账号最小冷却分钟", Type: "number", Description: "同一账号两次触发的最小冷却时间，单位分钟。默认 10。"},
-		{Name: "同一个Session优先固定到同一个账号", Type: "boolean", Description: "是否让插件在接管 Codex/xAI 账号调度时保持同一 Session 的账号粘性；关闭或无法绑定时遵循 CPA routing.strategy。默认开启。"},
 		{Name: "自动更新模型价格表", Type: "boolean", Description: "是否自动下载并更新模型价格缓存。默认开启。"},
 		{Name: "模型价格更新间隔小时", Type: "number", Description: "模型价格缓存自动检查间隔，单位小时。默认 6。"},
 		{Name: "模型价格表地址", Type: "string", Description: "模型价格 JSON 下载地址。默认使用 LiteLLM 官方价格表。"},
@@ -547,19 +469,6 @@ func pluginConfigFields() []configField {
 		{Name: "summary_cache_max_age_seconds", Type: "number", Description: "summary 缓存直接复用秒数；revision 变化时会先返回短期旧缓存并异步刷新。默认 30。"},
 		{Name: "summary_maintenance_interval_seconds", Type: "number", Description: "后台状态维护间隔，单位秒；无数据变化会跳过。默认 180。"},
 		{Name: "summary_precompute_active_window_ttl_seconds", Type: "number", Description: "窗口被访问后保留为活跃预计算窗口的时间。默认 120。"},
-		{Name: "开启账号保护调度（可能会影响缓存）", Type: "boolean", Description: "按套餐并发保护和 Token 软降级；接管账号选择时可能降低长会话缓存命中率。默认关闭。"},
-		{Name: "Free 并发上限", Type: "number", Description: "Free 账号最大同时在途请求数。默认 2。"},
-		{Name: "Plus 并发上限", Type: "number", Description: "Plus 或未知套餐账号最大同时在途请求数。默认 5。"},
-		{Name: "K12 并发上限", Type: "number", Description: "K12 账号最大同时在途请求数。默认 5。"},
-		{Name: "Team 并发上限", Type: "number", Description: "Team 账号最大同时在途请求数。默认 5。"},
-		{Name: "Pro 并发上限", Type: "number", Description: "Pro 账号最大同时在途请求数。默认 10。"},
-		{Name: "Free 5 分钟 Token 上限", Type: "number", Description: "超过后仅降到候选末尾。默认 2000000。"},
-		{Name: "Plus 5 分钟 Token 上限", Type: "number", Description: "超过后仅降到候选末尾。默认 8000000。"},
-		{Name: "K12 5 分钟 Token 上限", Type: "number", Description: "超过后仅降到候选末尾。默认 8000000。"},
-		{Name: "Team 5 分钟 Token 上限", Type: "number", Description: "超过后仅降到候选末尾。默认 8000000。"},
-		{Name: "Pro 5 分钟 Token 上限", Type: "number", Description: "超过后仅降到候选末尾。默认 12000000。"},
-		{Name: "账号保护 Token 窗口秒数", Type: "number", Description: "滑动 Token 统计窗口。默认 300 秒。"},
-		{Name: "账号保护预约超时秒数", Type: "number", Description: "没有完成回调时自动释放并发名额。默认 900 秒。"},
 	}
 }
 
@@ -613,72 +522,6 @@ func handleManagement(req managementRequest) managementResponse {
 		format := firstQuery(req.Query, "format", "csv")
 		return handleExportWithFilters(context.Background(), window, kind, format, limit, req.Query)
 	}
-	if req.Path == "/v0/management/plugins/"+pluginID+"/autobans/release" {
-		if !strings.EqualFold(req.Method, http.MethodPost) {
-			return jsonResponse(http.StatusMethodNotAllowed, map[string]any{"error": "method_not_allowed"})
-		}
-		var body autobanReleaseRequest
-		if len(req.Body) > 0 {
-			if err := json.Unmarshal(req.Body, &body); err != nil {
-				return jsonResponse(http.StatusBadRequest, map[string]any{"error": "bad_request", "message": err.Error()})
-			}
-		}
-		db, _, err := globalStore.open(context.Background())
-		if err != nil {
-			return jsonResponse(http.StatusInternalServerError, map[string]any{"error": "release_failed", "message": err.Error()})
-		}
-		result, err := releaseAutobans(context.Background(), db, body)
-		if err != nil {
-			return jsonResponse(http.StatusBadRequest, map[string]any{"error": "release_failed", "message": err.Error()})
-		}
-		if result.Released > 0 {
-			// Manual release changes the database immediately. Invalidate the
-			// scheduler fast-path so the next pick cannot retain the old ban.
-			globalSchedulerState.invalidate()
-			if err := globalSchedulerState.refresh(context.Background(), db); err != nil {
-				globalSchedulerState.invalidate()
-			}
-		}
-		return jsonResponse(http.StatusOK, result)
-	}
-	if req.Path == "/v0/management/plugins/"+pluginID+"/invalid-auths/resolve" {
-		if !strings.EqualFold(req.Method, http.MethodPost) {
-			return jsonResponse(http.StatusMethodNotAllowed, map[string]any{"error": "method_not_allowed"})
-		}
-		var body invalidAuthResolveRequest
-		if err := json.Unmarshal(req.Body, &body); err != nil {
-			return jsonResponse(http.StatusBadRequest, map[string]any{"error": "bad_request", "message": err.Error()})
-		}
-		if len(body.Items) == 0 || len(body.Items) > 2000 {
-			return jsonResponse(http.StatusBadRequest, map[string]any{"error": "bad_request", "message": "items must contain between 1 and 2000 entries"})
-		}
-		result, err := globalStore.resolveInvalidAuths(context.Background(), body)
-		if err != nil {
-			return jsonResponse(http.StatusInternalServerError, map[string]any{"error": "resolve_failed", "message": err.Error()})
-		}
-		return jsonResponse(http.StatusOK, result)
-	}
-	if req.Path == "/v0/management/plugins/"+pluginID+"/xai-states/resolve" {
-		if !strings.EqualFold(req.Method, http.MethodPost) {
-			return jsonResponse(http.StatusMethodNotAllowed, map[string]any{"error": "method_not_allowed"})
-		}
-		var body xaiStateResolveRequest
-		if err := json.Unmarshal(req.Body, &body); err != nil {
-			return jsonResponse(http.StatusBadRequest, map[string]any{"error": "bad_request", "message": err.Error()})
-		}
-		if len(body.Items) == 0 || len(body.Items) > 2000 {
-			return jsonResponse(http.StatusBadRequest, map[string]any{"error": "bad_request", "message": "items must contain between 1 and 2000 entries"})
-		}
-		db, _, err := globalStore.open(context.Background())
-		if err != nil {
-			return jsonResponse(http.StatusInternalServerError, map[string]any{"error": "resolve_failed", "message": err.Error()})
-		}
-		result, err := resolveXAIStates(context.Background(), db, body)
-		if err != nil {
-			return jsonResponse(http.StatusInternalServerError, map[string]any{"error": "resolve_failed", "message": err.Error()})
-		}
-		return jsonResponse(http.StatusOK, result)
-	}
 	if req.Path == "/v0/management/plugins/"+pluginID+"/auth-import/preview" {
 		if !strings.EqualFold(req.Method, http.MethodPost) {
 			return jsonResponse(http.StatusMethodNotAllowed, map[string]any{"error": "method_not_allowed"})
@@ -692,318 +535,6 @@ func handleManagement(req managementRequest) managementResponse {
 		return handleAuthImportCommit(req.Body)
 	}
 	return jsonResponse(http.StatusNotFound, map[string]any{"error": "not_found"})
-}
-
-func (s *store) resolveInvalidAuths(ctx context.Context, req invalidAuthResolveRequest) (invalidAuthResolveResponse, error) {
-	db, _, err := s.open(ctx)
-	if err != nil {
-		return invalidAuthResolveResponse{}, err
-	}
-	// The native auth-file mutation happens before this callback. Drop the
-	// plugin-side three-second cache so validation always observes the newest
-	// host inventory instead of resurrecting a deleted row.
-	globalCodexAuthSource.invalidate()
-	inventory, inventoryErr := readCodexHostAuthInventory()
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		return invalidAuthResolveResponse{}, err
-	}
-	deactivated := 0
-	response := invalidAuthResolveResponse{Items: make([]invalidAuthResolveResult, 0, len(req.Items))}
-	for _, item := range req.Items {
-		result, changed, err := resolveInvalidAuthItem(ctx, tx, item, inventory, inventoryErr)
-		if err != nil {
-			_ = tx.Rollback()
-			return invalidAuthResolveResponse{}, err
-		}
-		if changed {
-			deactivated++
-		}
-		response.add(result)
-	}
-	if err := tx.Commit(); err != nil {
-		return invalidAuthResolveResponse{}, err
-	}
-	if deactivated > 0 {
-		// Force concurrent picks to consult SQLite until the refreshed snapshot is
-		// available. A refresh error is safe: leaving the cache invalidated keeps
-		// the database on the scheduling path.
-		globalSchedulerState.invalidate()
-		if err := globalSchedulerState.refresh(ctx, db); err != nil {
-			globalSchedulerState.invalidate()
-		}
-	}
-	return response, nil
-}
-
-func (r *invalidAuthResolveResponse) add(result invalidAuthResolveResult) {
-	r.Items = append(r.Items, result)
-	switch result.Status {
-	case "resolved":
-		r.Resolved++
-	case "already_resolved":
-		r.AlreadyResolved++
-	case "replacement_kept":
-		r.ReplacementKept++
-	default:
-		r.Failed++
-	}
-}
-
-func resolveInvalidAuthItem(ctx context.Context, tx *sql.Tx, item invalidAuthResolveRequestItem, inventory []configuredAccount, inventoryErr error) (invalidAuthResolveResult, bool, error) {
-	authID := strings.TrimSpace(item.AuthID)
-	result := invalidAuthResolveResult{AuthID: authID}
-	if authID == "" {
-		result.Status = "failed"
-		result.Message = "auth_id is required"
-		return result, false, nil
-	}
-	invalid, err := queryActiveInvalidAuthByID(ctx, tx, authID)
-	if errors.Is(err, sql.ErrNoRows) {
-		result.Status = "already_resolved"
-		return result, false, nil
-	}
-	if err != nil {
-		return invalidAuthResolveResult{}, false, err
-	}
-	if invalid.LastStatusCode != http.StatusUnauthorized {
-		result.Status = "failed"
-		result.Message = "only active 401 records can be resolved by this endpoint"
-		return result, false, nil
-	}
-	action := strings.ToLower(strings.TrimSpace(item.Action))
-	if action != "file_deleted" && action != "file_absent" && action != "runtime_disabled" {
-		result.Status = "failed"
-		result.Message = "unsupported action"
-		return result, false, nil
-	}
-	switch action {
-	case "file_deleted", "file_absent":
-		kind := normalizeAuthSourceKind(invalid.AuthSourceKind)
-		if kind == authSourceKindLegacy && fileBackedAuthState(invalid.AuthFile, invalid.AuthID, invalid.AuthIndex) {
-			kind = authSourceKindFile
-		}
-		if kind != authSourceKindFile {
-			result.Status = "failed"
-			result.Message = "record is not backed by a physical JSON auth file"
-			return result, false, nil
-		}
-		present, currentMTime, stateErr := invalidAuthFileOnDisk(invalid)
-		if stateErr != nil {
-			result.Status = "failed"
-			result.Message = stateErr.Error()
-			return result, false, nil
-		}
-		if present {
-			baseline := normalizeAuthFileMTimeMillis(invalid.AuthFileMTime)
-			if baseline <= 0 {
-				baseline = invalid.InvalidatedAt * 1000
-			}
-			if currentMTime <= 0 || currentMTime <= baseline {
-				result.Status = "still_present"
-				result.Message = "the original auth file is still present"
-				return result, false, nil
-			}
-			changed, err := deactivateInvalidAuth401(ctx, tx, invalid.AuthID)
-			if err != nil {
-				return invalidAuthResolveResult{}, false, err
-			}
-			if !changed {
-				result.Status = "already_resolved"
-				return result, false, nil
-			}
-			result.Status = "replacement_kept"
-			result.Message = "a newer auth file was preserved and the old 401 state was cleared"
-			return result, true, nil
-		}
-		changed, err := deactivateInvalidAuth401(ctx, tx, invalid.AuthID)
-		if err != nil {
-			return invalidAuthResolveResult{}, false, err
-		}
-		if !changed {
-			result.Status = "already_resolved"
-			return result, false, nil
-		}
-		result.Status = "resolved"
-		return result, true, nil
-	case "runtime_disabled":
-		if inventoryErr != nil {
-			result.Status = "failed"
-			result.Message = "fresh host auth inventory is unavailable: " + sanitizeTriggerError(inventoryErr)
-			return result, false, nil
-		}
-		current, present, ambiguous := currentInvalidAuthInventoryEntry(invalid, inventory)
-		if ambiguous {
-			changed, err := deactivateInvalidAuth401(ctx, tx, invalid.AuthID)
-			if err != nil {
-				return invalidAuthResolveResult{}, false, err
-			}
-			result.Status = "already_resolved"
-			result.Message = "stale runtime 401 state was cleared; the current conflicting credential was preserved"
-			return result, changed, nil
-		}
-		kind := effectiveInvalidAuthSourceKind(invalid, current, present)
-		if kind != authSourceKindRuntimeOnly {
-			result.Status = "failed"
-			result.Message = "record is not a runtime-only auth entry"
-			return result, false, nil
-		}
-		if present && !runtimeAuthEntryDisabled(current) {
-			result.Status = "still_present"
-			result.Message = "runtime auth is still enabled"
-			return result, false, nil
-		}
-		changed, err := deactivateInvalidAuth401(ctx, tx, invalid.AuthID)
-		if err != nil {
-			return invalidAuthResolveResult{}, false, err
-		}
-		if !changed {
-			result.Status = "already_resolved"
-			return result, false, nil
-		}
-		result.Status = "resolved"
-		return result, true, nil
-	default:
-		result.Status = "failed"
-		result.Message = "unsupported action"
-		return result, false, nil
-	}
-}
-
-func invalidAuthFileOnDisk(row invalidAuthRow) (bool, int64, error) {
-	authFile := fileNameIfJSON(row.AuthFile)
-	if authFile == "" {
-		return false, 0, fmt.Errorf("record has no safe physical JSON file name")
-	}
-	authDir := configuredAuthDir()
-	if authDir == "" {
-		return false, 0, fmt.Errorf("CPA auth directory is unavailable")
-	}
-	info, err := os.Stat(filepath.Join(authDir, authFile))
-	if err == nil {
-		return true, info.ModTime().UnixMilli(), nil
-	}
-	if os.IsNotExist(err) {
-		return false, 0, nil
-	}
-	return false, 0, fmt.Errorf("inspect auth file: %w", err)
-}
-
-func normalizeAuthFileMTimeMillis(value int64) int64 {
-	if value <= 0 {
-		return 0
-	}
-	switch {
-	case value >= 100000000000000000:
-		return value / 1000000
-	case value >= 100000000000000:
-		return value / 1000
-	case value >= 100000000000:
-		return value
-	default:
-		return value * 1000
-	}
-}
-
-func bestInvalidAuthFileMTimeMillis(authFile string, fallback int64) int64 {
-	fallback = normalizeAuthFileMTimeMillis(fallback)
-	if fileNameIfJSON(authFile) == "" {
-		return fallback
-	}
-	present, current, err := invalidAuthFileOnDisk(invalidAuthRow{AuthFile: authFile})
-	if err == nil && present && current > 0 {
-		return current
-	}
-	return fallback
-}
-
-func queryActiveInvalidAuthByID(ctx context.Context, tx *sql.Tx, authID string) (invalidAuthRow, error) {
-	var row invalidAuthRow
-	var active int
-	err := tx.QueryRowContext(ctx, `
-SELECT auth_id, auth_index, source, provider, reason, invalidated_at, active,
-  last_status_code, auth_file, auth_file_mtime, auth_source_kind
-FROM invalid_auths
-WHERE active=1 AND auth_id=?`, authID).Scan(
-		&row.AuthID, &row.AuthIndex, &row.Source, &row.Provider, &row.Reason,
-		&row.InvalidatedAt, &active, &row.LastStatusCode, &row.AuthFile,
-		&row.AuthFileMTime, &row.AuthSourceKind,
-	)
-	row.Active = active != 0
-	return row, err
-}
-
-func deactivateInvalidAuth401(ctx context.Context, tx *sql.Tx, authID string) (bool, error) {
-	result, err := tx.ExecContext(ctx, `
-UPDATE invalid_auths
-SET active=0
-WHERE active=1 AND auth_id=? AND last_status_code=?`, authID, http.StatusUnauthorized)
-	if err != nil {
-		return false, err
-	}
-	affected, err := result.RowsAffected()
-	return affected > 0, err
-}
-
-func currentInvalidAuthInventoryEntry(row invalidAuthRow, inventory []configuredAccount) (configuredAccount, bool, bool) {
-	if current, ok := matchCodexHostAuthInventoryExact(row, inventory); ok {
-		return current, true, false
-	}
-	matches := make([]configuredAccount, 0, 2)
-	for _, candidate := range inventory {
-		if invalidAuthInventoryIdentityOverlaps(row, candidate) {
-			matches = append(matches, candidate)
-		}
-	}
-	return configuredAccount{}, false, len(matches) > 0
-}
-
-func invalidAuthInventoryIdentityOverlaps(row invalidAuthRow, candidate configuredAccount) bool {
-	for _, pair := range [][2]string{
-		{row.AuthID, candidate.AuthID},
-		{row.AuthIndex, candidate.AuthIndex},
-	} {
-		if left, right := normalizeAccountAlias(pair[0]), normalizeAccountAlias(pair[1]); left != "" && left == right {
-			return true
-		}
-	}
-	candidateFile := normalizeAccountAlias(fileNameIfJSON(candidate.AuthFile))
-	if candidateFile == "" {
-		return false
-	}
-	for _, value := range []string{row.AuthFile, row.AuthID, row.AuthIndex, row.Source} {
-		if normalizeAccountAlias(fileNameIfJSON(value)) == candidateFile {
-			return true
-		}
-	}
-	return false
-}
-
-func effectiveInvalidAuthSourceKind(row invalidAuthRow, current configuredAccount, present bool) string {
-	if present {
-		if kind := normalizeAuthSourceKind(current.AuthSourceKind); kind != authSourceKindLegacy {
-			return kind
-		}
-	}
-	if kind := normalizeAuthSourceKind(row.AuthSourceKind); kind != authSourceKindLegacy {
-		return kind
-	}
-	if fileBackedAuthState(row.AuthFile, row.AuthID, row.AuthIndex, row.Source) {
-		return authSourceKindFile
-	}
-	return authSourceKindLegacy
-}
-
-func runtimeAuthEntryDisabled(account configuredAccount) bool {
-	if account.Disabled {
-		return true
-	}
-	switch strings.ToLower(strings.TrimSpace(account.RuntimeStatus)) {
-	case "disabled", "inactive":
-		return true
-	default:
-		return false
-	}
 }
 
 func firstQuery(query map[string][]string, key, fallback string) string {
@@ -1033,27 +564,12 @@ func parseInt(value string, fallback, min, max int) int {
 
 func defaultPluginConfig() pluginConfig {
 	return pluginConfig{
-		SchedulingMode:                          "native",
-		AccountProtectionEnabled:                false,
-		AccountProtectionFreeConcurrency:        2,
-		AccountProtectionPlusConcurrency:        5,
-		AccountProtectionK12Concurrency:         5,
-		AccountProtectionTeamConcurrency:        5,
-		AccountProtectionProConcurrency:         10,
-		AccountProtectionFreeTokenLimit:         2_000_000,
-		AccountProtectionPlusTokenLimit:         8_000_000,
-		AccountProtectionK12TokenLimit:          8_000_000,
-		AccountProtectionTeamTokenLimit:         8_000_000,
-		AccountProtectionProTokenLimit:          12_000_000,
-		AccountProtectionTokenWindowSeconds:     300,
-		AccountProtectionReservationTTLSeconds:  900,
 		QuotaTriggerEnabled:                     false,
 		QuotaTriggerIntervalMinutes:             10,
 		QuotaTriggerMode:                        "probe",
 		QuotaTriggerMaxConcurrency:              1,
 		QuotaTriggerTimeoutSeconds:              20,
 		QuotaTriggerMinAccountCooldownMinutes:   10,
-		SchedulerSessionAffinityEnabled:         true,
 		ModelPriceAutoUpdateEnabled:             true,
 		ModelPriceUpdateIntervalHours:           6,
 		ModelPriceUpdateURL:                     defaultModelPriceURL,
@@ -1086,15 +602,9 @@ func configurePlugin(request []byte) error {
 		cfg = parsePluginConfigYAML(raw, cfg)
 	}
 	cfg = normalizePluginConfig(cfg)
-	if cfg.SchedulingMode != "native" && cfg.SchedulingMode != "legacy" {
-		return errors.New("scheduling_mode must be native or legacy")
-	}
+	setObsoleteConfigKeys(raw)
 	globalManagementConfig.initialize()
 	globalAuthLifecycle.stop()
-	if !cfg.SchedulerSessionAffinityEnabled {
-		globalSchedulerAffinity.reset()
-	}
-	globalAccountProtection.configure(cfg)
 	globalQuotaActivation.configure(cfg)
 	globalQuotaTrigger.configure(cfg)
 	globalModelPriceUpdater.configure(cfg)
@@ -1103,9 +613,6 @@ func configurePlugin(request []byte) error {
 	globalSummaryMaintenance.configure(cfg)
 	globalSummaryPrecomputer.configure(cfg)
 	globalAuthLifecycle.configure(cfg)
-	if err := globalStore.refreshSchedulerState(context.Background()); err != nil {
-		globalSchedulerState.invalidate()
-	}
 	return nil
 }
 
@@ -1129,48 +636,6 @@ func lifecycleConfigYAML(raw json.RawMessage) ([]byte, error) {
 
 func parsePluginConfigYAML(raw []byte, cfg pluginConfig) pluginConfig {
 	values := yamlScalars(string(raw))
-	if value, ok := configValue(values, "scheduling_mode"); ok {
-		cfg.SchedulingMode = strings.ToLower(strings.TrimSpace(value))
-	}
-	if value, ok := configValue(values, "account_protection_enabled", "开启账号保护调度（可能会影响缓存）", "开启账号保护调度"); ok {
-		cfg.AccountProtectionEnabled = parseBoolString(value, cfg.AccountProtectionEnabled)
-	}
-	if value, ok := configValue(values, "account_protection_free_concurrency", "Free 并发上限"); ok {
-		cfg.AccountProtectionFreeConcurrency = parseInt(value, cfg.AccountProtectionFreeConcurrency, 1, 100)
-	}
-	if value, ok := configValue(values, "account_protection_plus_concurrency", "Plus 并发上限"); ok {
-		cfg.AccountProtectionPlusConcurrency = parseInt(value, cfg.AccountProtectionPlusConcurrency, 1, 100)
-	}
-	if value, ok := configValue(values, "account_protection_k12_concurrency", "K12 并发上限"); ok {
-		cfg.AccountProtectionK12Concurrency = parseInt(value, cfg.AccountProtectionK12Concurrency, 1, 100)
-	}
-	if value, ok := configValue(values, "account_protection_team_concurrency", "Team 并发上限"); ok {
-		cfg.AccountProtectionTeamConcurrency = parseInt(value, cfg.AccountProtectionTeamConcurrency, 1, 100)
-	}
-	if value, ok := configValue(values, "account_protection_pro_concurrency", "Pro 并发上限"); ok {
-		cfg.AccountProtectionProConcurrency = parseInt(value, cfg.AccountProtectionProConcurrency, 1, 100)
-	}
-	if value, ok := configValue(values, "account_protection_free_token_limit", "Free 5 分钟 Token 上限"); ok {
-		cfg.AccountProtectionFreeTokenLimit = int64(parseInt(value, int(cfg.AccountProtectionFreeTokenLimit), 1, 100_000_000))
-	}
-	if value, ok := configValue(values, "account_protection_plus_token_limit", "Plus 5 分钟 Token 上限"); ok {
-		cfg.AccountProtectionPlusTokenLimit = int64(parseInt(value, int(cfg.AccountProtectionPlusTokenLimit), 1, 100_000_000))
-	}
-	if value, ok := configValue(values, "account_protection_k12_token_limit", "K12 5 分钟 Token 上限"); ok {
-		cfg.AccountProtectionK12TokenLimit = int64(parseInt(value, int(cfg.AccountProtectionK12TokenLimit), 1, 100_000_000))
-	}
-	if value, ok := configValue(values, "account_protection_team_token_limit", "Team 5 分钟 Token 上限"); ok {
-		cfg.AccountProtectionTeamTokenLimit = int64(parseInt(value, int(cfg.AccountProtectionTeamTokenLimit), 1, 100_000_000))
-	}
-	if value, ok := configValue(values, "account_protection_pro_token_limit", "Pro 5 分钟 Token 上限"); ok {
-		cfg.AccountProtectionProTokenLimit = int64(parseInt(value, int(cfg.AccountProtectionProTokenLimit), 1, 100_000_000))
-	}
-	if value, ok := configValue(values, "account_protection_token_window_seconds", "账号保护 Token 窗口秒数"); ok {
-		cfg.AccountProtectionTokenWindowSeconds = parseInt(value, cfg.AccountProtectionTokenWindowSeconds, 30, 3600)
-	}
-	if value, ok := configValue(values, "account_protection_reservation_ttl_seconds", "账号保护预约超时秒数"); ok {
-		cfg.AccountProtectionReservationTTLSeconds = parseInt(value, cfg.AccountProtectionReservationTTLSeconds, 30, 7200)
-	}
 	if value, ok := configValue(values, "quota_trigger_enabled", "开启定时额度触发（不建议账号多的情况下开启）", "开启定时额度触发"); ok {
 		cfg.QuotaTriggerEnabled = parseBoolString(value, cfg.QuotaTriggerEnabled)
 	}
@@ -1188,9 +653,6 @@ func parsePluginConfigYAML(raw []byte, cfg pluginConfig) pluginConfig {
 	}
 	if value, ok := configValue(values, "quota_trigger_min_account_cooldown_minutes", "单账号最小冷却分钟"); ok {
 		cfg.QuotaTriggerMinAccountCooldownMinutes = parseInt(value, cfg.QuotaTriggerMinAccountCooldownMinutes, 1, 1440)
-	}
-	if value, ok := configValue(values, "scheduler_session_affinity_enabled", "session_affinity_enabled", "同一个Session优先固定到同一个账号"); ok {
-		cfg.SchedulerSessionAffinityEnabled = parseBoolString(value, cfg.SchedulerSessionAffinityEnabled)
 	}
 	if value, ok := configValue(values, "model_price_auto_update_enabled", "自动更新模型价格表"); ok {
 		cfg.ModelPriceAutoUpdateEnabled = parseBoolString(value, cfg.ModelPriceAutoUpdateEnabled)
@@ -1244,21 +706,6 @@ func configValue(values map[string]string, keys ...string) (string, bool) {
 }
 
 func normalizePluginConfig(cfg pluginConfig) pluginConfig {
-	if cfg.SchedulingMode == "" {
-		cfg.SchedulingMode = "native"
-	}
-	cfg.AccountProtectionFreeConcurrency = clampInt(cfg.AccountProtectionFreeConcurrency, 1, 100)
-	cfg.AccountProtectionPlusConcurrency = clampInt(cfg.AccountProtectionPlusConcurrency, 1, 100)
-	cfg.AccountProtectionK12Concurrency = clampInt(cfg.AccountProtectionK12Concurrency, 1, 100)
-	cfg.AccountProtectionTeamConcurrency = clampInt(cfg.AccountProtectionTeamConcurrency, 1, 100)
-	cfg.AccountProtectionProConcurrency = clampInt(cfg.AccountProtectionProConcurrency, 1, 100)
-	cfg.AccountProtectionFreeTokenLimit = int64(clampInt(int(cfg.AccountProtectionFreeTokenLimit), 1, 100_000_000))
-	cfg.AccountProtectionPlusTokenLimit = int64(clampInt(int(cfg.AccountProtectionPlusTokenLimit), 1, 100_000_000))
-	cfg.AccountProtectionK12TokenLimit = int64(clampInt(int(cfg.AccountProtectionK12TokenLimit), 1, 100_000_000))
-	cfg.AccountProtectionTeamTokenLimit = int64(clampInt(int(cfg.AccountProtectionTeamTokenLimit), 1, 100_000_000))
-	cfg.AccountProtectionProTokenLimit = int64(clampInt(int(cfg.AccountProtectionProTokenLimit), 1, 100_000_000))
-	cfg.AccountProtectionTokenWindowSeconds = clampInt(cfg.AccountProtectionTokenWindowSeconds, 30, 3600)
-	cfg.AccountProtectionReservationTTLSeconds = clampInt(cfg.AccountProtectionReservationTTLSeconds, 30, 7200)
 	cfg.QuotaTriggerIntervalMinutes = clampInt(cfg.QuotaTriggerIntervalMinutes, 1, 1440)
 	cfg.QuotaTriggerMaxConcurrency = clampInt(cfg.QuotaTriggerMaxConcurrency, 1, 32)
 	cfg.QuotaTriggerTimeoutSeconds = clampInt(cfg.QuotaTriggerTimeoutSeconds, 3, 300)
@@ -1456,7 +903,10 @@ func initializeSQLiteStore(ctx context.Context, db *sql.DB) error {
 	if err := cleanupExternalCodexInvalidAuths(ctx, db); err != nil {
 		return err
 	}
-	return migrateAuthLifecycle(ctx, db)
+	if err := migrateAuthLifecycle(ctx, db); err != nil {
+		return err
+	}
+	return migrateCodexOnly(ctx, db)
 }
 
 func ensureSummaryCacheColumns(ctx context.Context, db *sql.DB) error {
@@ -2179,76 +1629,20 @@ func (m *summaryMaintenanceManager) lightMaintenanceEnough(revision storeRevisio
 }
 
 func storeRevisionResetDue(revision storeRevision, now int64) bool {
-	return (revision.NextBanResetAt > 0 && revision.NextBanResetAt <= now) ||
-		(revision.NextXAIResetAt > 0 && revision.NextXAIResetAt <= now)
+	return revision.NextBanResetAt > 0 && revision.NextBanResetAt <= now
 }
 
 func (s *store) runSummaryMaintenance(ctx context.Context) error {
 	return s.runSummaryMaintenanceMode(ctx, "full")
 }
 
-func (s *store) runSummaryMaintenanceMode(ctx context.Context, mode string) error {
+func (s *store) runSummaryMaintenanceMode(ctx context.Context, _ string) error {
 	_, err := withSQLiteAutoRepair(ctx, s, "summary maintenance", func() (struct{}, error) {
 		db, _, err := s.open(ctx)
 		if err != nil {
 			return struct{}{}, err
 		}
-		now := time.Now().Unix()
-		if nativeScheduling() {
-			if err := expireXAIStates(ctx, db, now); err != nil {
-				return struct{}{}, err
-			}
-			if err := clearReplacedOrMissingXAIStates(ctx, db); err != nil {
-				return struct{}{}, err
-			}
-			return struct{}{}, globalSchedulerState.refresh(ctx, db)
-		}
-		if err := expireAutobans(ctx, db, now); err != nil {
-			return struct{}{}, err
-		}
-		if err := expireXAIStates(ctx, db, now); err != nil {
-			return struct{}{}, err
-		}
-		if err := backfillAutobansFromUsage(ctx, db, now); err != nil {
-			return struct{}{}, err
-		}
-		if err := backfillWorkspaceDeactivatedAuthsFromUsage(ctx, db); err != nil {
-			return struct{}{}, err
-		}
-		if err := backfillWorkspaceDeactivatedAuthsFromQuotaTriggerRuns(ctx, db); err != nil {
-			return struct{}{}, err
-		}
-		if err := reconcileAutobansWithQuotaSnapshots(ctx, db, now); err != nil {
-			return struct{}{}, err
-		}
-		if err := clearRecoveredAuthStatesFromUsage(ctx, db); err != nil {
-			return struct{}{}, err
-		}
-		if strings.EqualFold(mode, "light") {
-			if err := globalSchedulerState.refresh(ctx, db); err != nil {
-				return struct{}{}, err
-			}
-			return struct{}{}, nil
-		}
-		if err := reconcileInvalidAuthSourceKinds(ctx, db); err != nil {
-			return struct{}{}, err
-		}
-		if err := clearReplacedInvalidAuths(ctx, db); err != nil {
-			return struct{}{}, err
-		}
-		if err := clearReplacedAutobans(ctx, db); err != nil {
-			return struct{}{}, err
-		}
-		if err := clearReplacedOrMissingXAIStates(ctx, db); err != nil {
-			return struct{}{}, err
-		}
-		configuredAccounts := readConfiguredAuthAccounts()
-		if err := clearMissingConfiguredAuthState(ctx, db, configuredAccounts, globalCodexAuthSource.authoritative()); err != nil {
-			return struct{}{}, err
-		}
-		if err := globalSchedulerState.refresh(ctx, db); err != nil {
-			return struct{}{}, err
-		}
+		_ = db
 		return struct{}{}, nil
 	})
 	return err
@@ -2666,27 +2060,6 @@ func (s *store) recordUsage(ctx context.Context, rec usageRecord) error {
 	if insertedLifecycle {
 		globalAuthLifecycle.signal()
 	}
-	if err := releaseProtectionReservation(ctx, db, rec); err != nil {
-		return err
-	}
-	if err := recordXAIStateIfNeeded(ctx, db, rec, status); err != nil {
-		return err
-	}
-	if nativeScheduling() {
-		return nil
-	}
-	if err := recordInvalidAuthIfNeeded(ctx, db, rec, status); err != nil {
-		return err
-	}
-	if err := recordRepeatedForbiddenIfNeeded(ctx, db, rec, status); err != nil {
-		return err
-	}
-	if err := clearRecoveredAuthStateIfNeeded(ctx, db, rec, status); err != nil {
-		return err
-	}
-	if err := recordAutobanIfNeeded(ctx, db, rec, status, primaryPct, primaryReset, secondaryPct, secondaryReset); err != nil {
-		return err
-	}
 	return nil
 }
 
@@ -2760,7 +2133,6 @@ func exactInvalidAuthAccountForRecord(rec usageRecord) (configuredAccount, bool)
 
 func upsertInvalidAuth(ctx context.Context, db *sql.DB, rec usageRecord, status int, reason, authID, authFile string, authFileMTime int64, sourceKind string, invalidatedAt int64) error {
 	authFileMTime = bestInvalidAuthFileMTimeMillis(authFile, authFileMTime)
-	globalSchedulerState.beginRestrictionWrite("codex")
 	_, err := db.ExecContext(ctx, `
 INSERT INTO invalid_auths (
   auth_id, auth_index, source, provider, reason, invalidated_at, active,
@@ -2780,7 +2152,6 @@ ON CONFLICT(auth_id) DO UPDATE SET
 		trim(authID), trim(rec.AuthIndex), trim(rec.Source), trim(rec.Provider),
 		reason, invalidatedAt, status, authFile, authFileMTime, normalizeAuthSourceKind(sourceKind),
 	)
-	globalSchedulerState.finishRestrictionWrite("codex")
 	if err != nil {
 		return err
 	}
@@ -2926,7 +2297,6 @@ AND (
 		}
 	}
 	if changed {
-		globalSchedulerState.invalidate()
 	}
 	return nil
 }
@@ -3020,7 +2390,6 @@ func recordAutobanIfNeeded(ctx context.Context, db *sql.DB, rec usageRecord, sta
 	normalizeInt64Ptr(primaryReset)
 	normalizeInt64Ptr(secondaryReset)
 	resetAt, window, reason := classifyCodexBan(rec.ResponseHeaders, primaryPct, primaryReset, secondaryPct, secondaryReset, now)
-	globalSchedulerState.beginRestrictionWrite("codex")
 	_, err := db.ExecContext(ctx, `
 INSERT INTO autoban_bans (
   auth_id, auth_index, source, provider, window, reason, banned_at, reset_at, active,
@@ -3048,7 +2417,6 @@ ON CONFLICT(auth_id) DO UPDATE SET
 		trim(authID), trim(rec.AuthIndex), trim(rec.Source), trim(rec.Provider), window, reason, now, resetAt, status,
 		primaryPct, primaryReset, secondaryPct, secondaryReset, authFile, authFileMTime,
 	)
-	globalSchedulerState.finishRestrictionWrite("codex")
 	if err != nil {
 		return err
 	}
@@ -3085,46 +2453,6 @@ func isCodexAPIKeyUsageRecord(rec usageRecord) bool {
 			return true
 		}
 		for _, value := range []string{rec.AuthID, rec.AuthIndex, rec.Source} {
-			if normalizeAPIKeyIdentity(value) == key {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-func isCodexAPIKeySchedulerCandidate(candidate schedulerAuthCandidate) bool {
-	if !strings.EqualFold(strings.TrimSpace(candidate.Provider), "codex") {
-		return false
-	}
-	values := []string{
-		candidate.ID,
-		candidate.Attributes["auth_type"], candidate.Attributes["authType"],
-		candidate.Attributes["api_key"], candidate.Attributes["apiKey"],
-		candidate.Attributes["source"], candidate.Attributes["auth_index"],
-		stringFromAny(candidate.Metadata["auth_type"]), stringFromAny(candidate.Metadata["authType"]),
-		stringFromAny(candidate.Metadata["api_key"]), stringFromAny(candidate.Metadata["apiKey"]),
-		stringFromAny(candidate.Metadata["source"]), stringFromAny(candidate.Metadata["auth_index"]),
-	}
-	for _, value := range []string{
-		candidate.Attributes["auth_type"], candidate.Attributes["authType"],
-		stringFromAny(candidate.Metadata["auth_type"]), stringFromAny(candidate.Metadata["authType"]),
-	} {
-		if isAPIKeyAuthType(value) {
-			return true
-		}
-	}
-	for _, value := range values {
-		if isCodexAPIKeyIdentity(value) {
-			return true
-		}
-	}
-	for _, entry := range readConfiguredProviderEntries() {
-		if !strings.EqualFold(strings.TrimSpace(entry.Provider), "codex") || strings.TrimSpace(entry.APIKey) == "" {
-			continue
-		}
-		key := normalizeAPIKeyIdentity(entry.APIKey)
-		for _, value := range values {
 			if normalizeAPIKeyIdentity(value) == key {
 				return true
 			}
@@ -3481,7 +2809,6 @@ WHERE active=1 AND auth_id=?`, now, strings.TrimSpace(authID))
 		return false, err
 	}
 	if affected > 0 {
-		globalSchedulerState.invalidate()
 	}
 	return affected > 0, nil
 }
@@ -3927,26 +3254,9 @@ func applyQuotaTriggerAccountState(ctx context.Context, db *sql.DB, run quotaTri
 		RequestedAt:     time.Unix(requestedAt, 0),
 		ResponseHeaders: cloneHeaders(run.ResponseHeaders),
 	}
-	if nativeScheduling() {
-		rec.Failed = !successfulStatusCode(run.HTTPStatus)
-		rec.Failure = usageFailure{StatusCode: run.HTTPStatus, Body: run.FailureBody}
-		return observeAuthLifecycle(ctx, db, rec)
-	}
-	if successfulStatusCode(run.HTTPStatus) && strings.EqualFold(run.Status, "success") {
-		return clearRecoveredAuthStateIfNeeded(ctx, db, rec, run.HTTPStatus)
-	}
-	rec.Failed = true
-	rec.Failure = usageFailure{StatusCode: run.HTTPStatus, Body: run.Error}
-	switch run.HTTPStatus {
-	case http.StatusUnauthorized, http.StatusPaymentRequired:
-		return recordInvalidAuthIfNeeded(ctx, db, rec, run.HTTPStatus)
-	case http.StatusForbidden:
-		return recordRepeatedForbiddenIfNeeded(ctx, db, rec, run.HTTPStatus)
-	case http.StatusTooManyRequests:
-		return recordAutobanIfNeeded(ctx, db, rec, run.HTTPStatus, run.PrimaryUsedPercent, run.PrimaryResetAt, run.SecondaryUsedPercent, run.SecondaryResetAt)
-	default:
-		return nil
-	}
+	rec.Failed = !successfulStatusCode(run.HTTPStatus)
+	rec.Failure = usageFailure{StatusCode: run.HTTPStatus, Body: run.FailureBody}
+	return observeAuthLifecycle(ctx, db, rec)
 }
 
 func quotaTriggerRunFromAccount(account triggerAuthAccount, mode, status string, httpStatus int, message string) quotaTriggerRun {
@@ -4498,386 +3808,6 @@ func headerQuotaWindowSeconds(headers map[string][]string, prefix string) sql.Nu
 	return sql.NullInt64{Int64: minutes.Int64 * 60, Valid: true}
 }
 
-func (s *store) pickAuth(ctx context.Context, req schedulerPickRequest) (schedulerPickResponse, error) {
-	if nativeScheduling() && isCodexSchedulerRequest(req) && !isXAISchedulerRequest(req) {
-		return schedulerPickResponse{Handled: false}, nil
-	}
-	return withSQLiteAutoRepair(ctx, s, "pick auth", func() (schedulerPickResponse, error) {
-		return s.pickAuthOnce(ctx, req)
-	})
-}
-
-func (s *store) pickAuthOnce(ctx context.Context, req schedulerPickRequest) (schedulerPickResponse, error) {
-	if nativeScheduling() && isCodexSchedulerRequest(req) && !isXAISchedulerRequest(req) {
-		return schedulerPickResponse{Handled: false}, nil
-	}
-	if isXAISchedulerRequest(req) {
-		if s == globalStore && !globalSchedulerState.needsDatabase("xai", false) {
-			return schedulerPickResponse{Handled: false}, nil
-		}
-		return s.pickXAIAuthOnce(ctx, req)
-	}
-	if !isCodexSchedulerRequest(req) {
-		return schedulerPickResponse{Handled: false}, nil
-	}
-	// codex-api-key candidates are external provider endpoints. Let CPA's
-	// builtin picker handle them; this plugin only schedules OAuth accounts.
-	managedCandidates := make([]schedulerAuthCandidate, 0, len(req.Candidates))
-	for _, candidate := range req.Candidates {
-		if !isCodexAPIKeySchedulerCandidate(candidate) {
-			managedCandidates = append(managedCandidates, candidate)
-		}
-	}
-	if len(managedCandidates) == 0 {
-		return schedulerPickResponse{Handled: false}, nil
-	}
-	req.Candidates = managedCandidates
-	if len(req.Candidates) == 0 {
-		return schedulerPickResponse{Handled: false}, nil
-	}
-	protectionCfg := globalAccountProtection.config()
-	if s == globalStore && !globalSchedulerState.needsDatabase("codex", protectionCfg.AccountProtectionEnabled) {
-		return schedulerPickResponse{Handled: false}, nil
-	}
-	var stateGeneration uint64
-	if s == globalStore {
-		stateGeneration = globalSchedulerState.generation("codex")
-	}
-	db, _, err := s.open(ctx)
-	if err != nil {
-		return schedulerPickResponse{Handled: false}, err
-	}
-	now := time.Now().Unix()
-	configuredAccounts := readConfiguredAuthAccounts()
-	if err := clearReplacedInvalidAuthsForConfigured(ctx, db, configuredAccounts); err != nil {
-		return schedulerPickResponse{Handled: false}, err
-	}
-	if err := clearReplacedAutobansForConfigured(ctx, db, configuredAccounts); err != nil {
-		return schedulerPickResponse{Handled: false}, err
-	}
-	if err := clearMissingConfiguredAuthState(ctx, db, configuredAccounts, globalCodexAuthSource.authoritative()); err != nil {
-		return schedulerPickResponse{Handled: false}, err
-	}
-	bans, err := queryActiveAutobans(ctx, db, now)
-	if err != nil {
-		return schedulerPickResponse{Handled: false}, err
-	}
-	invalids, err := queryActiveInvalidAuths(ctx, db)
-	if err != nil {
-		return schedulerPickResponse{Handled: false}, err
-	}
-	if len(bans) == 0 && len(invalids) == 0 && !protectionCfg.AccountProtectionEnabled {
-		if s == globalStore {
-			globalSchedulerState.clearRestrictedIfGeneration("codex", stateGeneration)
-		}
-		return schedulerPickResponse{Handled: false}, nil
-	}
-	effectiveBans := mergeEffectiveAutobans(bans, invalids)
-	available, filtered, restrictionFilteredCandidates, matchedBanIndexes, matchedInvalidIndexes := filterCodexSchedulerCandidates(req.Candidates, bans, invalids)
-	recordSchedulerFilteringDiagnostics(bans, invalids, restrictionFilteredCandidates, matchedBanIndexes, matchedInvalidIndexes)
-	if filtered && len(available) == 0 {
-		globalCodexAuthSource.invalidate()
-		configuredAccounts = readConfiguredAuthAccounts()
-		if err := clearReplacedInvalidAuthsForConfigured(ctx, db, configuredAccounts); err != nil {
-			return schedulerPickResponse{Handled: false}, err
-		}
-		if err := clearReplacedAutobansForConfigured(ctx, db, configuredAccounts); err != nil {
-			return schedulerPickResponse{Handled: false}, err
-		}
-		if err := clearMissingConfiguredAuthState(ctx, db, configuredAccounts, globalCodexAuthSource.authoritative()); err != nil {
-			return schedulerPickResponse{Handled: false}, err
-		}
-		bans, err = queryActiveAutobans(ctx, db, now)
-		if err != nil {
-			return schedulerPickResponse{Handled: false}, err
-		}
-		invalids, err = queryActiveInvalidAuths(ctx, db)
-		if err != nil {
-			return schedulerPickResponse{Handled: false}, err
-		}
-		effectiveBans = mergeEffectiveAutobans(bans, invalids)
-		available, filtered, restrictionFilteredCandidates, matchedBanIndexes, matchedInvalidIndexes = filterCodexSchedulerCandidates(req.Candidates, bans, invalids)
-		recordSchedulerFilteringDiagnostics(bans, invalids, restrictionFilteredCandidates, matchedBanIndexes, matchedInvalidIndexes)
-	}
-	if !filtered && !protectionCfg.AccountProtectionEnabled {
-		globalSchedulerDiagnostics.recordCandidatePool(len(req.Candidates), highestSchedulerCandidatePriority(req.Candidates), 0)
-		if len(bans) == 0 && len(invalids) == 0 && s == globalStore {
-			globalSchedulerState.clearRestrictedIfGeneration("codex", stateGeneration)
-		}
-		return schedulerPickResponse{Handled: false}, nil
-	}
-	missingHealthyAccounts := 0
-	if len(available) == 0 {
-		if protectionCfg.SchedulerSessionAffinityEnabled {
-			globalSchedulerAffinity.unbind(schedulerAffinityKey(req, "codex"))
-		}
-		if inventory, inventoryErr := readCodexHostAuthInventory(); inventoryErr == nil {
-			missingHealthyAccounts = countMissingHealthySchedulerAccounts(req.Candidates, inventory, bans, invalids)
-		}
-		globalSchedulerDiagnostics.recordCandidatePool(len(req.Candidates), highestSchedulerCandidatePriority(req.Candidates), missingHealthyAccounts)
-		return schedulerPickResponse{}, newNoAvailableCodexAuthError(effectiveBans, now, missingHealthyAccounts)
-	}
-	globalSchedulerDiagnostics.recordCandidatePool(len(req.Candidates), highestSchedulerCandidatePriority(req.Candidates), 0)
-	rotationKey := schedulerRotationKey(req, "codex")
-	affinityKey := ""
-	if protectionCfg.SchedulerSessionAffinityEnabled {
-		affinityKey = schedulerAffinityKey(req, "codex")
-	}
-	if protectionCfg.AccountProtectionEnabled {
-		chosen, err := s.pickProtectedAuth(ctx, db, available, protectionCfg, rotationKey, affinityKey)
-		if err != nil {
-			return schedulerPickResponse{Handled: false}, err
-		}
-		return schedulerPickResponse{AuthID: chosen.ID, Handled: true}, nil
-	}
-	chosen := pickSchedulerCandidateWithStrategy(rotationKey, affinityKey, currentCPASchedulerStrategy(), available)
-	return schedulerPickResponse{AuthID: chosen.ID, Handled: true}, nil
-}
-
-func filterCodexSchedulerCandidates(candidates []schedulerAuthCandidate, bans []autobanRow, invalids []invalidAuthRow) ([]schedulerAuthCandidate, bool, int, map[int]bool, map[int]bool) {
-	available := make([]schedulerAuthCandidate, 0, len(candidates))
-	filtered := false
-	restrictionFilteredCandidates := 0
-	matchedBanIndexes := map[int]bool{}
-	matchedInvalidIndexes := map[int]bool{}
-	invalidCandidateIndexes := map[int]bool{}
-	if len(invalids) > 0 {
-		configured := make([]configuredAccount, 0, len(candidates))
-		originalIndexes := make([]int, 0, len(candidates))
-		for i, candidate := range candidates {
-			if !strings.EqualFold(candidate.Provider, "codex") {
-				continue
-			}
-			account := configuredAccountForSchedulerCandidate(candidate)
-			if normalizeAccountAlias(account.AuthID) == "" && normalizeAccountAlias(account.AuthIndex) == "" && normalizeAccountAlias(account.AuthFile) == "" {
-				continue
-			}
-			configured = append(configured, account)
-			originalIndexes = append(originalIndexes, i)
-		}
-		identityIndex := newCodexAuthIdentityIndex(configured)
-		for invalidIndex, invalid := range invalids {
-			for _, configuredIndex := range identityIndex.matchIndexes(invalid) {
-				if configuredIndex < 0 || configuredIndex >= len(originalIndexes) {
-					continue
-				}
-				invalidCandidateIndexes[originalIndexes[configuredIndex]] = true
-				matchedInvalidIndexes[invalidIndex] = true
-			}
-		}
-	}
-	for candidateIndex, candidate := range candidates {
-		if !strings.EqualFold(candidate.Provider, "codex") {
-			available = append(available, candidate)
-			continue
-		}
-		banMatched, banIndexes := candidateMatchesActiveBanIndexes(candidate, bans)
-		for _, index := range banIndexes {
-			matchedBanIndexes[index] = true
-		}
-		if banMatched || invalidCandidateIndexes[candidateIndex] {
-			filtered = true
-			restrictionFilteredCandidates++
-			continue
-		}
-		available = append(available, candidate)
-	}
-	return available, filtered, restrictionFilteredCandidates, matchedBanIndexes, matchedInvalidIndexes
-}
-
-func recordSchedulerFilteringDiagnostics(bans []autobanRow, invalids []invalidAuthRow, filteredCandidates int, matchedBanIndexes map[int]bool, matchedInvalidIndexes map[int]bool) {
-	if filteredCandidates <= 0 {
-		return
-	}
-	activeRestrictions := len(bans) + len(invalids)
-	unmatchedRestrictions := activeRestrictions - len(matchedBanIndexes) - len(matchedInvalidIndexes)
-	globalSchedulerDiagnostics.record(activeRestrictions, filteredCandidates, maxInt(0, unmatchedRestrictions))
-}
-
-func (s *store) pickXAIAuthOnce(ctx context.Context, req schedulerPickRequest) (schedulerPickResponse, error) {
-	if len(req.Candidates) == 0 {
-		return schedulerPickResponse{Handled: false}, nil
-	}
-	var stateGeneration uint64
-	if s == globalStore {
-		stateGeneration = globalSchedulerState.generation("xai")
-	}
-	db, _, err := s.open(ctx)
-	if err != nil {
-		return schedulerPickResponse{Handled: false}, err
-	}
-	if err := clearReplacedOrMissingXAIStates(ctx, db); err != nil {
-		return schedulerPickResponse{Handled: false}, err
-	}
-	now := time.Now().Unix()
-	states, err := queryActiveXAIStates(ctx, db, now)
-	if err != nil {
-		return schedulerPickResponse{Handled: false}, err
-	}
-	if len(states) == 0 {
-		if s == globalStore {
-			globalSchedulerState.clearRestrictedIfGeneration("xai", stateGeneration)
-		}
-		return schedulerPickResponse{Handled: false}, nil
-	}
-	available := make([]schedulerAuthCandidate, 0, len(req.Candidates))
-	filtered := false
-	for _, candidate := range req.Candidates {
-		if !strings.EqualFold(strings.TrimSpace(candidate.Provider), "xai") {
-			available = append(available, candidate)
-			continue
-		}
-		if candidateMatchesXAIState(candidate, states) {
-			filtered = true
-			continue
-		}
-		available = append(available, candidate)
-	}
-	if !filtered {
-		return schedulerPickResponse{Handled: false}, nil
-	}
-	if len(available) == 0 {
-		message := "no available xAI auth candidates: all candidates are unavailable by 401/403/429"
-		if resetAt := earliestXAIStateReset(states, now); resetAt > 0 {
-			message += "; earliest retry at " + unixTime(resetAt)
-		}
-		return schedulerPickResponse{}, &schedulerRejectError{Code: "auth_unavailable", Message: message, HTTPStatus: http.StatusServiceUnavailable}
-	}
-	affinityKey := ""
-	if globalAccountProtection.config().SchedulerSessionAffinityEnabled {
-		affinityKey = schedulerAffinityKey(req, "xai")
-	}
-	chosen := pickSchedulerCandidateWithStrategy(schedulerRotationKey(req, "xai"), affinityKey, currentCPASchedulerStrategy(), available)
-	return schedulerPickResponse{AuthID: chosen.ID, Handled: true}, nil
-}
-
-func newNoAvailableCodexAuthError(bans []autobanRow, now int64, missingHealthyAccounts int) error {
-	message := "no available Codex auth candidates: all candidates are auto-banned by 429/401/402/403"
-	if missingHealthyAccounts > 0 {
-		message += fmt.Sprintf("; CPA candidate pool omitted %d healthy registered Codex account(s); refresh CPA auth scheduling state", missingHealthyAccounts)
-	}
-	if resetAt := earliestActiveBanReset(bans, now); resetAt > 0 {
-		message += "; earliest autoban reset at " + unixTime(resetAt)
-	}
-	return &schedulerRejectError{
-		Code:       "auth_unavailable",
-		Message:    message,
-		HTTPStatus: http.StatusServiceUnavailable,
-	}
-}
-
-func highestSchedulerCandidatePriority(candidates []schedulerAuthCandidate) int {
-	if len(candidates) == 0 {
-		return 0
-	}
-	highest := candidates[0].Priority
-	for _, candidate := range candidates[1:] {
-		if candidate.Priority > highest {
-			highest = candidate.Priority
-		}
-	}
-	return highest
-}
-
-func countMissingHealthySchedulerAccounts(candidates []schedulerAuthCandidate, inventory []configuredAccount, bans []autobanRow, invalids []invalidAuthRow) int {
-	seenAccounts := make(map[string]bool, len(inventory))
-	missing := 0
-	for _, account := range inventory {
-		if !isCodexAuthProvider(account.Provider) || account.Disabled || account.Expired || account.RuntimeUnavailable {
-			continue
-		}
-		status := strings.ToLower(strings.TrimSpace(account.RuntimeStatus))
-		if status == "disabled" || status == "expired" || status == "unavailable" {
-			continue
-		}
-		if configuredMatchesAutoban(account, bans) || configuredMatchesInvalidAuth(account, invalids) {
-			continue
-		}
-		key := configuredAccountKey(account)
-		if key == "" {
-			key = strings.Join(configuredAliases(account), "\x00")
-		}
-		if key == "" || seenAccounts[key] {
-			continue
-		}
-		seenAccounts[key] = true
-		matched := false
-		for _, candidate := range candidates {
-			if schedulerCandidateMatchesConfiguredAccount(candidate, account) {
-				matched = true
-				break
-			}
-		}
-		if !matched {
-			missing++
-		}
-	}
-	return missing
-}
-
-func schedulerCandidateMatchesConfiguredAccount(candidate schedulerAuthCandidate, account configuredAccount) bool {
-	candidateStrict := schedulerCandidateStrictAliases(candidate)
-	accountStrict := normalizeAccountAliases(account.AuthFile, account.AuthIndex, account.ChatGPTAccountID)
-	if len(candidateStrict) > 0 && len(accountStrict) > 0 {
-		return aliasesIntersect(candidateStrict, accountStrict)
-	}
-	return aliasesIntersect(schedulerCandidateAliases(candidate), configuredAliases(account))
-}
-
-func aliasesIntersect(left, right []string) bool {
-	if len(left) == 0 || len(right) == 0 {
-		return false
-	}
-	set := make(map[string]struct{}, len(left))
-	for _, alias := range left {
-		if alias != "" {
-			set[alias] = struct{}{}
-		}
-	}
-	for _, alias := range right {
-		if _, ok := set[alias]; ok && alias != "" {
-			return true
-		}
-	}
-	return false
-}
-
-func earliestActiveBanReset(bans []autobanRow, now int64) int64 {
-	var earliest int64
-	for _, ban := range bans {
-		if !ban.Active || ban.ResetAt <= now {
-			continue
-		}
-		if earliest == 0 || ban.ResetAt < earliest {
-			earliest = ban.ResetAt
-		}
-	}
-	return earliest
-}
-
-func isCodexSchedulerRequest(req schedulerPickRequest) bool {
-	if strings.EqualFold(strings.TrimSpace(req.Provider), "codex") {
-		return true
-	}
-	if len(req.Providers) == 1 && strings.EqualFold(strings.TrimSpace(req.Providers[0]), "codex") {
-		return true
-	}
-	return false
-}
-
-func schedulerPickRequiresPlugin(req schedulerPickRequest) bool {
-	if nativeScheduling() && isCodexSchedulerRequest(req) && !isXAISchedulerRequest(req) {
-		return false
-	}
-	if isXAISchedulerRequest(req) {
-		return globalSchedulerState.needsDatabase("xai", false)
-	}
-	if isCodexSchedulerRequest(req) {
-		return globalSchedulerState.needsDatabase("codex", globalAccountProtection.config().AccountProtectionEnabled)
-	}
-	return false
-}
-
 func expireAutobans(ctx context.Context, db *sql.DB, now int64) error {
 	if nativeScheduling() {
 		return nil
@@ -4885,7 +3815,6 @@ func expireAutobans(ctx context.Context, db *sql.DB, now int64) error {
 	res, err := db.ExecContext(ctx, `UPDATE autoban_bans SET active=0, released_at=?, release_reason='reset_at reached' WHERE active=1 AND reset_at <= ?`, now, now)
 	if err == nil {
 		if affected, rowsErr := res.RowsAffected(); rowsErr == nil && affected > 0 {
-			globalSchedulerState.invalidate()
 		}
 	}
 	return err
@@ -5014,7 +3943,6 @@ LIMIT 1000`, now, now)
 		if hasLaterSuccessfulUsage(ctx, db, rec, requestedAt) {
 			continue
 		}
-		globalSchedulerState.beginRestrictionWrite("codex")
 		_, err := db.ExecContext(ctx, `
 INSERT INTO autoban_bans (
   auth_id, auth_index, source, provider, window, reason, banned_at, reset_at, active,
@@ -5047,7 +3975,6 @@ WHERE (autoban_bans.active=0 OR excluded.reset_at >= autoban_bans.reset_at)
 			key, authIndex, source, provider, window, reason, requestedAt, resetAt, status,
 			nullFloatPtr(pp), nullIntPtr(pr), nullFloatPtr(sp), nullIntPtr(sr), authFile, authFileMTime, now,
 		)
-		globalSchedulerState.finishRestrictionWrite("codex")
 		if err != nil {
 			return err
 		}
@@ -5302,7 +4229,6 @@ func clearRecoveredAuthStatesFromUsage(ctx context.Context, db *sql.DB) error {
 		changed = true
 	}
 	if changed {
-		globalSchedulerState.invalidate()
 	}
 	return nil
 }
@@ -5543,7 +4469,6 @@ WHERE active=1 AND auth_id=?`, invalid.AuthID)
 		changed = true
 	}
 	if changed {
-		globalSchedulerState.invalidate()
 	}
 	return nil
 }
@@ -5590,7 +4515,6 @@ WHERE active=1 AND auth_id=?`, now, ban.AuthID)
 		}
 	}
 	if changed {
-		globalSchedulerState.invalidate()
 	}
 	return nil
 }
@@ -5799,7 +4723,6 @@ func clearMissingInvalidAuths(ctx context.Context, db *sql.DB, configuredAliases
 		changed = true
 	}
 	if changed {
-		globalSchedulerState.invalidate()
 	}
 	return nil
 }
@@ -5839,7 +4762,6 @@ func clearMissingAutobans(ctx context.Context, db *sql.DB, configuredAliases map
 		changed = true
 	}
 	if changed {
-		globalSchedulerState.invalidate()
 	}
 	return nil
 }
@@ -5994,111 +4916,6 @@ ORDER BY invalidated_at DESC`)
 		out = append(out, r)
 	}
 	return out, rows.Err()
-}
-
-func candidateMatchesActiveBan(candidate schedulerAuthCandidate, bans []autobanRow) bool {
-	matched, _ := candidateMatchesActiveBanIndexes(candidate, bans)
-	return matched
-}
-
-func candidateMatchesActiveBanIndexes(candidate schedulerAuthCandidate, bans []autobanRow) (bool, []int) {
-	aliases := schedulerCandidateAliases(candidate)
-	strictAliases := schedulerCandidateStrictAliases(candidate)
-	if len(aliases) == 0 {
-		return false, nil
-	}
-	var indexes []int
-	for i, ban := range bans {
-		banAliases := normalizeAccountAliases(ban.AuthID, ban.AuthIndex, ban.Source, ban.AuthFile)
-		candidateAliases := aliases
-		if strict := strictAuthStateAliasesForValues(ban.AuthID, ban.AuthIndex, ban.Source, ban.AuthFile); len(strict) > 0 {
-			banAliases = strict
-			candidateAliases = strictAliases
-		}
-		for _, banAlias := range banAliases {
-			for _, alias := range candidateAliases {
-				if alias != "" && alias == banAlias {
-					indexes = append(indexes, i)
-					goto nextBan
-				}
-			}
-		}
-	nextBan:
-	}
-	return len(indexes) > 0, indexes
-}
-
-func candidateMatchesInvalidAuth(candidate schedulerAuthCandidate, invalids []invalidAuthRow) bool {
-	return len(candidateMatchesInvalidAuthIndexes(candidate, invalids)) > 0
-}
-
-func candidateMatchesInvalidAuthIndexes(candidate schedulerAuthCandidate, invalids []invalidAuthRow) []int {
-	configured := configuredAccountForSchedulerCandidate(candidate)
-	if normalizeAccountAlias(configured.AuthID) == "" && normalizeAccountAlias(configured.AuthIndex) == "" && normalizeAccountAlias(configured.AuthFile) == "" {
-		return nil
-	}
-	identityIndex := newCodexAuthIdentityIndex([]configuredAccount{configured})
-	var matched []int
-	for i, invalid := range invalids {
-		if len(identityIndex.matchIndexes(invalid)) > 0 {
-			matched = append(matched, i)
-		}
-	}
-	return matched
-}
-
-func configuredAccountForSchedulerCandidate(candidate schedulerAuthCandidate) configuredAccount {
-	authIndex := firstNonEmptyString(candidate.Attributes["auth_index"], stringFromAny(candidate.Metadata["auth_index"]))
-	authFile := firstNonEmptyString(
-		candidate.Attributes["auth_file"],
-		stringFromAny(candidate.Metadata["auth_file"]),
-		candidate.Attributes["path"],
-		candidate.Attributes["file"],
-		stringFromAny(candidate.Metadata["path"]),
-		stringFromAny(candidate.Metadata["file"]),
-	)
-	return configuredAccount{
-		AuthID:    candidate.ID,
-		AuthIndex: authIndex,
-		Source:    firstNonEmptyString(candidate.Attributes["source"], stringFromAny(candidate.Metadata["source"])),
-		Email:     firstNonEmptyString(candidate.Attributes["email"], stringFromAny(candidate.Metadata["email"])),
-		AuthFile:  fileNameIfJSON(authFile),
-		Provider:  candidate.Provider,
-	}
-}
-
-func schedulerCandidateAliases(candidate schedulerAuthCandidate) []string {
-	return accountIdentityAliases(accountIdentity{
-		AuthID:    candidate.ID,
-		AuthIndex: firstNonEmptyString(candidate.Attributes["auth_index"], stringFromAny(candidate.Metadata["auth_index"])),
-		Source:    firstNonEmptyString(candidate.Attributes["source"], stringFromAny(candidate.Metadata["source"])),
-		AuthFile:  firstNonEmptyString(candidate.Attributes["auth_file"], stringFromAny(candidate.Metadata["auth_file"])),
-		Email:     firstNonEmptyString(candidate.Attributes["email"], stringFromAny(candidate.Metadata["email"])),
-		Path: firstNonEmptyString(
-			candidate.Attributes["path"],
-			candidate.Attributes["file"],
-			stringFromAny(candidate.Metadata["path"]),
-			stringFromAny(candidate.Metadata["file"]),
-		),
-	})
-}
-
-func schedulerCandidateStrictAliases(candidate schedulerAuthCandidate) []string {
-	authID := candidate.ID
-	authIndex := firstNonEmptyString(candidate.Attributes["auth_index"], stringFromAny(candidate.Metadata["auth_index"]))
-	source := firstNonEmptyString(candidate.Attributes["source"], stringFromAny(candidate.Metadata["source"]))
-	authFile := firstNonEmptyString(
-		candidate.Attributes["auth_file"],
-		stringFromAny(candidate.Metadata["auth_file"]),
-		candidate.Attributes["path"],
-		candidate.Attributes["file"],
-		stringFromAny(candidate.Metadata["path"]),
-		stringFromAny(candidate.Metadata["file"]),
-	)
-	if file := fileNameIfJSON(authFile); file != "" {
-		return normalizeAccountAliases(file, authIndex)
-	}
-	return strictAuthStateAliasesForValues(authID, authIndex, source, authFile)
 }
 
 func writeResponse(response *C.cliproxy_buffer, raw []byte) {
